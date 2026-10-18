@@ -15,7 +15,7 @@ const input = await Actor.getInput<InputSchema>();
 if (!input) throw new Error("Missing input");
 const { runType, isFast, apiUrl, apiSecret, zhihuUsername, cookieString } = input;
 
-async function post(path: string, body: unknown) {
+async function post(path: string, body: unknown): Promise<any> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (apiSecret) headers["authorization"] = `Bearer ${apiSecret}`;
   
