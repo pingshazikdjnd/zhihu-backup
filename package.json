@@ -1,0 +1,22 @@
+{
+  "name": "zhihu-backup-local",
+  "private": true,
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "dev:api": "pnpm --filter api dev",
+    "dev:web": "pnpm --filter web dev",
+    "sync": "pnpm --filter collector sync",
+    "sync:upvotes": "pnpm --filter collector sync:upvotes",
+    "collector:sync:collections": "pnpm --filter collector sync:collections"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "playwright": "^1.49.1"
+  }
+}

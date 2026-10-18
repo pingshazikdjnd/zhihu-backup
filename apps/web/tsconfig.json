@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    // 浏览器项目：只需要 vite/client 类型（base 带了 ["node"]，本包没装 @types/node）
+    "types": ["vite/client"]
+  },
+  "include": ["src"]
+}

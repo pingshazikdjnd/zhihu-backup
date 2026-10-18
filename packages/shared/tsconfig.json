@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    // shared 是纯浏览器/跨平台代码，不需要 node 类型（base 带了 ["node"]，但本包没装 @types/node）
+    "types": []
+  },
+  "include": ["src"]
+}

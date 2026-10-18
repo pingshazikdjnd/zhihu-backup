@@ -1,0 +1,46 @@
+name = "gemini-zhihu-api"
+main = "src/index.ts"
+compatibility_date = "2024-02-23"
+compatibility_flags = ["nodejs_compat"]
+
+# ⚠️ 部署前必须替换：运行 `npx wrangler d1 create zhihu-backup`，
+#    把输出的 UUID（注意是 D1 库的 uuid，不是 account id）填到下面。
+#    全零 UUID 是模板占位符，deploy 不会报错但所有查询都会失败。
+[[d1_databases]]
+binding = "DB"
+database_name = "zhihu-backup"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "./migrations"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "zhihu-backup-storage"
+
+[vars]
+# Apify Actor 把数据 POST 回来的地址，必须是公网可达的 workers.dev 域名。
+# 部署后拿到真实域名，回填这里再 deploy 一次。
+WORKER_URL = "https://gemini-zhihu-api.example.workers.dev"
+
+# 你的知乎 url_token（个人主页 /people/<token> 里的那段）
+ZHIHU_USERNAME = "your_zhihu_token"
+
+# 前端域名白名单（CORS）。必须填真实域名，否则浏览器端所有请求会被拦。
+# 多个域名用英文逗号分隔。留空 = 只放行 localhost（本地开发）。
+# 同源访问（直接打开 worker 域名）不需要 CORS，不受此限制。
+ALLOWED_ORIGIN = "https://your-frontend.pages.dev"
+
+# 定时触发 Apify（UTC 时间）。0 2,14 * * * = 北京时间每天 10:00 / 22:00。
+# 注意：每次触发都是一次 Apify run，会产生费用，按需调整频率。
+[triggers]
+crons = ["0 2,14 * * *"]
+
+# 以下四项不要写在这里，用 secret 注入：
+#   npx wrangler secret put API_SECRET
+#   npx wrangler secret put APIFY_TOKEN
+#   npx wrangler secret put APIFY_ACTOR_ID
+#   npx wrangler secret put ZHIHU_COOKIE_STRING
+
+# 可选：给网页的「粘贴 cookie」表单加一道口令。
+# 不配置 = 网页打开就能直接提交（方便，但知道域名的人也能覆盖你的 cookie）。
+# 配置后 = 网页会提示填一次，填完记在 localStorage。
+#   npx wrangler secret put COOKIE_WRITE_TOKEN

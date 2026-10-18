@@ -1,0 +1,12 @@
+{
+  "actorSpecification": 1,
+  "name": "gemini-zhihu-crawler",
+  "title": "Gemini Zhihu Crawler",
+  "description": "Scrapes Zhihu answers and collections, pushing to Cloudflare Worker",
+  "version": "1.0",
+  "meta": {
+    "templateId": "ts-playwright"
+  },
+  "input": "./INPUT_SCHEMA.json",
+  "dockerfile": "./Dockerfile"
+}

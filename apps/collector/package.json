@@ -1,0 +1,24 @@
+{
+  "name": "collector",
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "sync": "tsx src/index.ts sync",
+    "sync:collections": "tsx src/index.ts sync:collections",
+    "start:cron": "tsx src/scheduler.ts",
+    "sync:upvotes": "tsx src/index.ts sync:upvotes"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "node-cron": "^3.0.3",
+    "playwright": "^1.49.1",
+    "shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/node-cron": "^3.0.11",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

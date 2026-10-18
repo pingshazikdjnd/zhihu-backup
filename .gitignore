@@ -1,0 +1,42 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 凭据（历史提交里若已有明文 cookie，必须轮换而不是只靠 ignore）
+.env
+.env.*
+!.env.example
+apps/worker/.dev.vars
+apps/apify-crawler/storage/
+apps/apify-crawler/.actor/state/
+
+# 数据库与运行时数据
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+
+# 构建产物与本地缓存
+apps/*/dist/
+apps/worker/.wrangler/
+apps/apify-crawler/dist/
+*.tsbuildinfo
+.backup-*/
+
+# 一次性调试脚本与样本（多数含正文或 cookie）
+test*.js
+test*.ts
+test*.mjs
+test.html
+test.json
+answer*.json
+api_out.json
+zhihu_api*.json
+apps/collector/*_raw.json
+v1.html
+v2.html
+dump.sql
+v.txt
+screenshot.png
+新建文本文档.txt

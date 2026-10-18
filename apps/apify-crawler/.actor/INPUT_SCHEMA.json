@@ -1,0 +1,48 @@
+{
+    "title": "Gemini Zhihu Crawler Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "runType": {
+            "title": "Run Type",
+            "type": "string",
+            "description": "What to synchronize",
+            "enum": ["all", "answers", "collections", "upvotes"],
+            "enumTitles": ["Sync All", "Sync Answers", "Sync Collections", "Sync Upvotes"],
+            "default": "all"
+        },
+        "isFast": {
+            "title": "Fast Sync",
+            "type": "boolean",
+            "description": "Only sync recent items to save time and API calls",
+            "default": false
+        },
+        "apiUrl": {
+            "title": "Cloudflare Worker API URL",
+            "type": "string",
+            "description": "The URL of the Cloudflare Worker to ingest data (e.g. https://my-worker.workers.dev)",
+            "editor": "textfield",
+            "prefill": "http://127.0.0.1:8787"
+        },
+        "zhihuUsername": {
+            "title": "Zhihu Username (URL Token)",
+            "type": "string",
+            "description": "Your Zhihu profile URL token",
+            "editor": "textfield"
+        },
+        "cookieString": {
+            "title": "Zhihu Cookie String",
+            "type": "string",
+            "description": "Your full Zhihu cookie string (including z_c0)",
+            "editor": "textarea"
+        },
+        "apiSecret": {
+            "title": "Ingest API Secret",
+            "type": "string",
+            "description": "Bearer token for the Cloudflare Worker /ingest endpoints. Must match API_SECRET in the Worker. Leave empty only for local testing.",
+            "editor": "textfield",
+            "isSecret": true
+        }
+    },
+    "required": ["apiUrl", "zhihuUsername", "cookieString"]
+}

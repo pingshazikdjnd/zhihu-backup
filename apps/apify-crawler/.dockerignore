@@ -1,0 +1,8 @@
+node_modules
+storage
+dist
+.env
+.env.*
+*.log
+tsconfig.tsbuildinfo
+package-lock.json

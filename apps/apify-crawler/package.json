@@ -1,0 +1,25 @@
+{
+  "name": "apify-crawler",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Apify actor for scraping Zhihu answers and collections",
+  "main": "src/main.ts",
+  "scripts": {
+    "start": "npm run start:dev",
+    "start:prod": "node dist/main.js",
+    "start:dev": "npx tsx src/main.ts",
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "apify": "^3.1.10",
+    "crawlee": "^3.5.8",
+    "playwright": "^1.39.0"
+  },
+  "devDependencies": {
+    "@apify/tsconfig": "^0.1.0",
+    "@types/node": "^20.8.9",
+    "tsx": "^4.7.1",
+    "typescript": "^5.2.2"
+  }
+}

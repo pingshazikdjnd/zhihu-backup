@@ -1,0 +1,80 @@
+const fs = require('fs');
+
+const originalCode = fs.readFileSync('apps/collector/src/jobs/sync.ts', 'utf8');
+
+// Replace imports and exports
+let newCode = originalCode.replace(
+  /import dotenv from "dotenv";[\s\S]*?import { sendComments, sendContent, sendCollectionSnapshot } from "..\/client\/api-client\.js";/,
+  `import { Actor } from "apify";
+import { chromium } from "playwright";
+
+interface InputSchema {
+    runType: "all" | "answers" | "collections" | "upvotes";
+    isFast: boolean;
+    apiUrl: string;
+    zhihuUsername: string;
+    cookieString: string;
+}
+
+await Actor.init();
+const input = await Actor.getInput<InputSchema>();
+if (!input) throw new Error("Missing input");
+const { runType, isFast, apiUrl, zhihuUsername, cookieString } = input;
+
+async function post(path: string, body: unknown) {
+  const res = await fetch(\`\${apiUrl}\${path}\`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error(\`\${path} -> \${res.status} \${await res.text()}\`);
+  return res.json();
+}
+
+const sendContent = (b: any) => post("/ingest/content", b);
+const sendComments = (b: any) => post("/ingest/comments", b);
+const sendCollectionSnapshot = (b: any) => post("/ingest/collection-snapshot", b);
+`
+);
+
+// Replace variables
+newCode = newCode.replace(/let ZHIHU_USERNAME[\s\S]*?function setupBrowser\(\) \{[\s\S]*?return chromium\.launch\(\{ headless: true \}\);\n\}/, 
+`const ZHIHU_USERNAME = zhihuUsername;
+const ZHIHU_COOKIE_STRING = cookieString;
+const ZHIHU_COOKIE_Z_C0 = undefined;
+
+async function setupBrowser() {
+  return chromium.launch({ headless: true });
+}`);
+
+// Replace fast sync logic
+newCode = newCode.replace(/process\.env\.FAST_SYNC === "true"/g, 'isFast');
+
+// Append Actor main logic
+newCode += `
+
+// --- Apify Entry Point ---
+try {
+  if (runType === "all" || runType === "answers") {
+    await runScraper();
+  }
+  if (runType === "all" || runType === "collections") {
+    // Note: The original export is runCollectionScraper
+    if (typeof runCollectionScraper === "function") {
+      await runCollectionScraper();
+    }
+  }
+  if (runType === "all" || runType === "upvotes") {
+    if (typeof runUpvotesScraper === "function") {
+      await runUpvotesScraper();
+    }
+  }
+} catch (e) {
+  Actor.log.error(e.message);
+} finally {
+  await Actor.exit();
+}
+`;
+
+fs.writeFileSync('apps/apify-crawler/src/main.ts', newCode);
+console.log("Converted sync.ts to main.ts");
