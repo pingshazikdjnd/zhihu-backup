@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 类型检查 + 前端构建：最快，先跑
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck worker
+        working-directory: apps/worker
+        run: pnpm exec tsc --noEmit
+
+      - name: Typecheck web
+        working-directory: apps/web
+        run: pnpm exec tsc --noEmit -p tsconfig.json
+
+      - name: Typecheck apify actor
+        working-directory: apps/apify-crawler
+        run: pnpm exec tsc --noEmit
+
+      - name: Build web
+        env:
+          VITE_API_BASE: https://example.workers.dev
+          VITE_ZHIHU_USERNAME: ci-placeholder
+        run: pnpm --filter web build
+
+  # 端到端接口冒烟：起本地 Worker + 本地 D1，跑真实请求
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare dev vars
+        run: echo "API_SECRET=test-secret" > apps/worker/.dev.vars
+
+      - name: Apply local D1 migrations
+        working-directory: apps/worker
+        run: pnpm exec wrangler d1 migrations apply zhihu-backup --local
+
+      - name: Start worker and smoke test
+        run: |
+          cd apps/worker
+          pnpm exec wrangler dev --local --port 8788 > /tmp/wrangler.log 2>&1 &
+          WPID=$!
+
+          ready=0
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8788/api/health > /dev/null; then ready=1; break; fi
+            sleep 1
+          done
+
+          if [ "$ready" != "1" ]; then
+            echo "::error::Worker 未能在 60 秒内启动"
+            tail -60 /tmp/wrangler.log
+            kill $WPID 2>/dev/null || true
+            exit 1
+          fi
+
+          cd ../..
+          bash scripts/smoke-test.sh
+          STATUS=$?
+
+          kill $WPID 2>/dev/null || true
+
+          if [ "$STATUS" != "0" ]; then
+            echo "::error::冒烟测试未通过"
+            echo "----- wrangler.log -----"
+            tail -60 /tmp/wrangler.log
+          fi
+          exit $STATUS
