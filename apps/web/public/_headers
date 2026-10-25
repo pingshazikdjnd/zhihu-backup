@@ -1,0 +1,8 @@
+# Cloudflare Pages 安全与缓存头（部署时自动拷入 dist 根）
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/*
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Content-Type-Options: nosniff

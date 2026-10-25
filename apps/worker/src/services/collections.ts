@@ -1,9 +1,15 @@
 import { db } from "../db.js";
 import { buildChangeStatement } from "./changes.js";
+import { withKeyLock } from "./lock.js";
 import type { IngestCollectionSnapshotInput } from "shared";
 
 // D1 单次 batch 的语句数不宜过大；100 条一批兼顾往返次数和单批体积（同 comments.ts）
 const BATCH_SIZE = 100;
+
+export function upsertCollectionSnapshot(input: IngestCollectionSnapshotInput) {
+  // 同收藏夹写串行化：并发快照的对账与复位互相干扰（详见 lock.ts）
+  return withKeyLock(`collection:${input.collection.id}`, () => upsertCollectionSnapshotInner(input));
+}
 
 /**
  * 收藏夹快照同步。
@@ -13,7 +19,7 @@ const BATCH_SIZE = 100;
  * 且 db.transaction 在 D1 上只是顺序执行、不回滚，batch() 才是唯一的原子手段。
  * 现在改成「先查后批」：SELECT 全部在 batch 之前完成，写语句统一收进 stmts 分批 batch。
  */
-export async function upsertCollectionSnapshot(input: IngestCollectionSnapshotInput) {
+async function upsertCollectionSnapshotInner(input: IngestCollectionSnapshotInput) {
   const now = new Date().toISOString();
   const collectionId = input.collection.id;
 
@@ -110,19 +116,31 @@ export async function upsertCollectionSnapshot(input: IngestCollectionSnapshotIn
       }));
 
       added++;
-    } else {
-      stmts.push(db.prepare(`
-        UPDATE collection_items
-        SET title = ?, author_name = ?, source_url = ?, last_seen_at = ?, is_removed = 0, removed_at = NULL
-        WHERE id = ?
-      `).raw(
-        item.title,
-        item.authorName,
-        item.sourceUrl,
-        now,
-        row.id
-      ));
-    }
+      } else {
+        stmts.push(db.prepare(`
+          UPDATE collection_items
+          SET title = ?, author_name = ?, source_url = ?, last_seen_at = ?, is_removed = 0, removed_at = NULL
+          WHERE id = ?
+        `).raw(
+          item.title,
+          item.authorName,
+          item.sourceUrl,
+          now,
+          row.id
+        ));
+        // 从"已移除"复活也要发事件：否则按事件流重放得不到库内状态
+        // （收条目 → 移除 → 再收回来，事件流里中间断了一截）
+        if (row.is_removed === 1) {
+          stmts.push(buildChangeStatement({
+            eventType: "collection.item_added",
+            entityType: "collection_item",
+            entityPk: `${collectionId}:${key}`,
+            contentPk,
+            summary: `${input.collection.title} + ${item.title}（重新加入）`,
+            payload: item
+          }));
+        }
+      }
   }
 
   if (!input.incremental) {
@@ -171,7 +189,9 @@ export async function listCollections() {
 }
 
 export async function listAllCollectionItems(params?: { page?: number }) {
-  const page = params?.page || 1;
+  // page 钳制：超大值会让 OFFSET 超出 SQLite int64 直接 500
+  const parsedPage = Number(params?.page ?? 1);
+  const page = Number.isFinite(parsedPage) ? Math.min(Math.max(Math.trunc(parsedPage), 1), 100000) : 1;
   const limit = 50;
   const offset = (page - 1) * limit;
 

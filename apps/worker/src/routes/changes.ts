@@ -10,8 +10,10 @@ changeRoutes.get("/", async c => {
   const limit = Number.isFinite(parsed) ? Math.min(Math.max(Math.trunc(parsed), 1), 500) : 100;
   const excludeComments = c.req.query("exclude_comments") === "true";
   const onlyComments = c.req.query("only_comments") === "true";
-  
-  let query = `SELECT * FROM change_events`;
+
+  let query = `SELECT id, event_type, entity_type, entity_pk, content_pk, summary, created_at FROM change_events`;
+  // 不返回 payload_json：评论事件会把整条原文（可到 10KB/条）存进 payload，
+  // 500 条事件就是 5MB+ 的匿名响应放大面；前端也从不消费这个字段
   if (excludeComments) {
     query += ` WHERE event_type NOT LIKE 'comment.%'`;
   } else if (onlyComments) {

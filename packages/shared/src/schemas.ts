@@ -2,11 +2,20 @@ import { z } from "zod";
 
 export const ContentTypeSchema = z.enum(["answer", "article", "pin"]);
 
+// zod 的 .url() 是宽松校验：javascript:/data:/file:/无主机 URL 都能过。
+// sourceUrl 会被读接口原样返回给前端渲染，非 http(s) 协议就是存储型 XSS 载荷
+const HttpUrl = z.string().url().refine(
+  (u) => {
+    try { const p = new URL(u).protocol; return p === "https:" || p === "http:"; } catch { return false; }
+  },
+  { message: "sourceUrl must be an http(s) URL" }
+);
+
 export const IngestContentSchema = z.object({
   sourceType: ContentTypeSchema,
   sourceId: z.string(),
   title: z.string().optional().default(""),
-  sourceUrl: z.string().url(),
+  sourceUrl: HttpUrl,
   author: z.object({
     name: z.string().optional().default(""),
     urlToken: z.string().nullable().optional().default(null),
@@ -49,8 +58,9 @@ export const IngestCommentSchema = z.object({
 
 export const IngestCommentsSchema = z.object({
   contentPk: z.string(),
-  // 单请求上限：热榜回答动辄数千评论，单请求会撞 Workers 子请求限制，抓取端须分批
-  comments: z.array(IngestCommentSchema).max(2000),
+  // 单请求上限 1500：×3 语句/条 ÷100 语句/批 = 45 个 D1 batch，
+  // 刚好压在 Workers 免费版 50 子请求限制之内（2000 条会到 61 批必炸）
+  comments: z.array(IngestCommentSchema).max(1500),
   // 分批提交时由最后一批附带本次抓取的全量评论 id：
   // 删除对账必须对全量做，否则前面批次刚插入的评论会被误判删除
   allIds: z.array(z.string()).optional(),
@@ -63,7 +73,7 @@ export const IngestCollectionItemSchema = z.object({
   sourceId: z.string(),
   title: z.string().optional().default(""),
   authorName: z.string().optional().default(""),
-  sourceUrl: z.string().url()
+  sourceUrl: HttpUrl
 });
 
 export const IngestCollectionSnapshotSchema = z.object({
@@ -74,7 +84,8 @@ export const IngestCollectionSnapshotSchema = z.object({
     updatedTime: z.string().optional().default("")
   }),
   incremental: z.boolean().optional().default(false),
-  items: z.array(IngestCollectionItemSchema)
+  // 单请求上限：5000 条实测会生成 101 个 batch（超免费版 50 子请求限制且半提交）
+  items: z.array(IngestCollectionItemSchema).max(1000)
 });
 
 export type IngestContentInput = z.infer<typeof IngestContentSchema>;

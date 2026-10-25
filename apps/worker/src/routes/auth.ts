@@ -34,7 +34,23 @@ function authorizeWrite(c: any): { ok: boolean } {
     return { ok: auth === `Bearer ${writeToken}` };
   }
 
-  // 没有配置写入口令 → 开放
+  // CSRF 防线：默认开放只对"无 Origin 的脚本调用"保留（curl/回传脚本）。
+  // 浏览器发起的跨站表单 POST 一定带 Origin 头，且 c.req.json() 不校验
+  // Content-Type，text/plain 表单就能拼出合法 JSON——Origin 不在白名单
+  // （ALLOWED_ORIGIN + localhost）时拒绝，跨站静默覆盖/清空 cookie 就不可行了。
+  const origin = c.req.header("origin");
+  if (origin) {
+    const allowed = String(c.env.ALLOWED_ORIGIN || "")
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean);
+    if (allowed.includes(origin) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+      return { ok: true };
+    }
+    return { ok: false };
+  }
+
+  // 没有配置写入口令、也没有 Origin（脚本直调）→ 开放
   return { ok: true };
 }
 

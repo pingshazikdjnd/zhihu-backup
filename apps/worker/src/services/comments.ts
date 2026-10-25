@@ -1,6 +1,7 @@
 import { db } from "../db.js";
 import { buildChangeStatement } from "./changes.js";
 import { normalizeForHash, sha256 } from "../utils/hash.js";
+import { withKeyLock } from "./lock.js";
 import type { IngestCommentsInput } from "shared";
 
 // D1 单次 batch 的语句数不宜过大；100 条一批兼顾往返次数和单批体积
@@ -15,7 +16,13 @@ const BATCH_SIZE = 100;
  *   - 每批内部是原子的（D1 batch 语义）
  *   - 往返次数从 O(n) 降到 O(n/100)
  */
-export async function replaceComments(input: IngestCommentsInput) {
+export function replaceComments(input: IngestCommentsInput) {
+  // 同 pk 写串行化：并发评论同步的对账互相看不见对方刚插入的行，
+  // 会产生批量假删除事件（详见 lock.ts）
+  return withKeyLock(`comments:${input.contentPk}`, () => replaceCommentsInner(input));
+}
+
+async function replaceCommentsInner(input: IngestCommentsInput) {
   const now = new Date().toISOString();
 
   const existingRows = await db.prepare(`

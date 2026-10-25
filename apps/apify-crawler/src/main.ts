@@ -520,12 +520,19 @@ export async function runCollectionScraper() {
       }
       
       if (items.length > 0) {
+        // schema 单请求上限 1000 条：超大的收藏夹截断提交并跳过移除对账
+        // （incremental=true），避免整个快照被 400 拒掉导致全部丢失
+        const MAX_ITEMS = 1000;
+        const overflow = items.length > MAX_ITEMS;
+        if (overflow) {
+          console.warn(`⚠️ 收藏夹 [${coll.title}] 共 ${items.length} 条超出单请求上限，本轮只提交前 ${MAX_ITEMS} 条并跳过移除对账`);
+        }
         try {
           await sendCollectionSnapshot({
             collection: { id: coll.id, title: coll.title, ownerToken: ZHIHU_USERNAME || "", updatedTime: coll.updatedTime },
             // 抓取中断时必须跳过移除检测，防止把未抓到的条目误标移除
-            incremental: cIncomplete || (cIsEnd && isFast),
-            items
+            incremental: cIncomplete || (cIsEnd && isFast) || overflow,
+            items: overflow ? items.slice(0, MAX_ITEMS) : items
           });
         } catch (e: any) {
            stats.failed++;
@@ -688,8 +695,8 @@ if (stats.saved === 0 && stats.failed > 0) {
   await Actor.fail(`ingest_failed: 回传 ${stats.failed} 次全部失败（检查 Worker 的 API_SECRET / WORKER_URL），本轮零数据入库`);
   process.exit(1);
 }
-if (stats.failed > 0 || stats.authRejected > 0) {
-  log.warning(`本轮完成：交付 ${stats.saved} 条数据，${stats.failed} 次入库失败，${stats.authRejected} 次被知乎拒绝`);
+if (stats.failed > 0 || stats.authRejected > 0 || stats.riskEmpty > 0) {
+  log.warning(`本轮完成：交付 ${stats.saved} 条数据，${stats.failed} 次入库失败，被知乎拒绝 ${stats.authRejected} 次，疑似风控空页 ${stats.riskEmpty} 次`);
 }
 
 await Actor.exit();

@@ -1,13 +1,19 @@
 import { db } from "../db.js";
 import { emitChange } from "./changes.js";
 import { normalizeForHash, sha256 } from "../utils/hash.js";
+import { withKeyLock } from "./lock.js";
 import { buildSearchText } from "shared";
 import type { IngestContentInput } from "shared";
 
 // D1 单行正文上限：正文原文存 R2，D1 只留纯文本供检索
 const SEARCH_TEXT_LIMIT = 4000;
 
-export async function upsertContent(input: IngestContentInput) {
+export function upsertContent(input: IngestContentInput) {
+  // 同 pk 写串行化：消除读-比-写的并发覆盖窗口（详见 lock.ts）
+  return withKeyLock(`${input.sourceType}:${input.sourceId}`, () => upsertContentInner(input));
+}
+
+async function upsertContentInner(input: IngestContentInput) {
   const now = new Date().toISOString();
   const pk = `${input.sourceType}:${input.sourceId}`;
   // 保存原始正文：清空入库前，版本快照必须留有真实内容
@@ -65,8 +71,10 @@ export async function upsertContent(input: IngestContentInput) {
         input.title,
         input.author?.name ?? "",
         input.author?.urlToken ?? null,
-        input.author?.avatarUrl ?? null,
-        input.author?.headline ?? null,
+        // 空串头像/简介存 null 而不是 ""：UPDATE 路径的 safe* 会把空串折叠成
+        // null，首存 "" 与后续 null 比较恒不等，每次重同步都发一条假"头像更新"事件
+        input.author?.avatarUrl || null,
+        input.author?.headline || null,
         input.question?.id ?? null,
         input.question?.title ?? null,
         "",           // content_html 清空，原文在 R2
@@ -163,6 +171,10 @@ export async function upsertContent(input: IngestContentInput) {
     const changes: string[] = [];
     let isBodyChanged = false;
 
+    // title 参与变更检测：否则"仅改标题"的更新走零事件分支，标题根本不落库
+    if (existing.title !== safeTitle) {
+      changes.push(`标题(${existing.title || "无"} -> ${safeTitle || "无"})`);
+    }
     if (existing.content_hash !== contentHash) {
       changes.push("正文已更新");
       isBodyChanged = true;
@@ -314,7 +326,9 @@ export async function listContents(params: { type?: string; q?: string; author?:
   }
 
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  const page = params.page || 1;
+  // page 钳制：NaN/负数回落第 1 页；超大值会让 OFFSET 超出 SQLite int64 直接 500
+  const parsedPage = Number(params.page ?? 1);
+  const page = Number.isFinite(parsedPage) ? Math.min(Math.max(Math.trunc(parsedPage), 1), 100000) : 1;
   const limit = 50;
   const offset = (page - 1) * limit;
 

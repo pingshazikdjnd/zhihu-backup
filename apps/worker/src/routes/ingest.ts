@@ -9,6 +9,7 @@ import { replaceComments } from "../services/comments.js";
 import { upsertCollectionSnapshot } from "../services/collections.js";
 import { upsertUpvote } from "../services/upvotes.js";
 import { requireSecret } from "../middleware/require-secret.js";
+import { db } from "../db.js";
 import type { Bindings } from "../types.js";
 
 export const ingestRoutes = new Hono<{ Bindings: Bindings }>();
@@ -67,6 +68,12 @@ ingestRoutes.post("/comments", async c => {
 
   const parsed = IngestCommentsSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  // comments 有外键约束：悬空 contentPk 会在 batch 阶段撞外键变 500，
+  // 提前查存在性给个明确的 404（对齐 /ingest/upvote 的做法）
+  const contentExists = await db.prepare(`SELECT 1 FROM contents WHERE pk = ?`).get(parsed.data.contentPk);
+  if (!contentExists) {
+    return c.json({ error: `content not found: ${parsed.data.contentPk}` }, 404);
+  }
   const result = await replaceComments(parsed.data);
   return c.json(result);
 });

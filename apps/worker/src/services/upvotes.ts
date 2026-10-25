@@ -22,7 +22,9 @@ export async function upsertUpvote(contentPk: string, upvoteTime: string) {
 }
 
 export async function listUpvotes(params?: { page?: number }) {
-  const page = params?.page || 1;
+  // page 钳制：超大值会让 OFFSET 超出 SQLite int64 直接 500
+  const parsedPage = Number(params?.page ?? 1);
+  const page = Number.isFinite(parsedPage) ? Math.min(Math.max(Math.trunc(parsedPage), 1), 100000) : 1;
   const limit = 50;
   const offset = (page - 1) * limit;
 
