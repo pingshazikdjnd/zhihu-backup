@@ -49,7 +49,11 @@ export const IngestCommentSchema = z.object({
 
 export const IngestCommentsSchema = z.object({
   contentPk: z.string(),
-  comments: z.array(IngestCommentSchema),
+  // 单请求上限：热榜回答动辄数千评论，单请求会撞 Workers 子请求限制，抓取端须分批
+  comments: z.array(IngestCommentSchema).max(2000),
+  // 分批提交时由最后一批附带本次抓取的全量评论 id：
+  // 删除对账必须对全量做，否则前面批次刚插入的评论会被误判删除
+  allIds: z.array(z.string()).optional(),
   // true = 本次抓取不完整（中途失败），跳过删除检测，避免误标删除
   partial: z.boolean().optional().default(false)
 });

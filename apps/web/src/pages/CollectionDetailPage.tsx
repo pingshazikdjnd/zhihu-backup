@@ -16,18 +16,28 @@ export default function CollectionDetailPage() {
   const cached = collectionsStore[id] || { data: null, scrollPosition: 0, visibleCount: 50 };
   
   const [detail, setDetail] = useState<any>(cached.data);
+  const [loadError, setLoadError] = useState("");
+  const [retryKey, setRetryKey] = useState(0);
   const [visibleCount, setVisibleCount] = useState(cached.visibleCount);
 
   useEffect(() => {
     if (!id) return;
     if (!detail) {
-      api(`/api/collections/${id}`).then(data => {
+      api<{ collection: any; items: any[]; snapshots: any[] }>(`/api/collections/${id}`).then(data => {
+        // Worker 对未知 id 返回 { collection: null, ...}：与网络错误区分开
+        if (!data?.collection) {
+          setLoadError("收藏夹不存在或已被删除");
+          return;
+        }
         setDetail(data);
+        setLoadError("");
         setVisibleCount(50);
         collectionsStore[id] = { data, scrollPosition: 0, visibleCount: 50 };
+      }).catch((e: any) => {
+        setLoadError(e?.message || "收藏夹加载失败");
       });
     }
-  }, [id, detail]);
+  }, [id, detail, retryKey]);
 
   useEffect(() => {
     if (cached.scrollPosition > 0 && detail) {
@@ -49,7 +59,22 @@ export default function CollectionDetailPage() {
     return () => window.removeEventListener('scroll', handleScroll);
   }, [id, detail?.items?.length]);
 
-  if (!detail?.collection) return <div className="loading-state">加载中...</div>;
+  if (!detail?.collection) {
+    if (loadError) {
+      return (
+        <div className="loading-state">
+          <p style={{ marginBottom: 12 }}>{loadError}</p>
+          <button
+            onClick={() => { setLoadError(""); setRetryKey(k => k + 1); }}
+            style={{ padding: "8px 20px", border: "none", borderRadius: 6, background: "var(--zhihu-blue)", color: "#fff", cursor: "pointer" }}
+          >
+            重试
+          </button>
+        </div>
+      );
+    }
+    return <div className="loading-state">加载中...</div>;
+  }
 
   return (
     <>

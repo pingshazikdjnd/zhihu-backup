@@ -29,7 +29,8 @@ export async function replaceComments(input: IngestCommentsInput) {
   }>;
 
   const existingMap = new Map(existingRows.map(row => [row.id, row]));
-  const incomingIds = new Set(input.comments.map(c => c.id));
+  // 分批提交时对账基准是 allIds（全量），单发时是本批 comments 的 id
+  const incomingIds = new Set(input.allIds ?? input.comments.map(c => c.id));
 
   let added = 0;
   let updated = 0;

@@ -15,17 +15,29 @@ const input = await Actor.getInput<InputSchema>();
 if (!input) throw new Error("Missing input");
 const { runType, isFast, apiUrl, apiSecret, zhihuUsername, cookieString } = input;
 
+// 失败上报：所有异常都被吞掉的爬虫在 Apify 上永远显示 SUCCEEDED，
+// cookie 失效后零数据入库也毫无感知。这里集中统计，结束时据此决定 run 状态。
+const stats = { saved: 0, failed: 0, authRejected: 0, riskEmpty: 0 };
+
 async function post(path: string, body: unknown): Promise<any> {
+  // apiUrl 尾斜杠归一，避免拼出 //ingest/content 的 404
+  const base = apiUrl.endsWith("/") ? apiUrl.slice(0, -1) : apiUrl;
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (apiSecret) headers["authorization"] = `Bearer ${apiSecret}`;
-  
-  const res = await fetch(`${apiUrl}${path}`, {
+
+  const res = await fetch(`${base}${path}`, {
     method: "POST",
     headers,
     body: JSON.stringify(body)
   });
-  if (!res.ok) throw new Error(`${path} -> ${res.status} ${await res.text()}`);
-  return res.json();
+  if (!res.ok) {
+    stats.failed++;
+    throw new Error(`${path} -> ${res.status} ${await res.text()}`);
+  }
+  // 成功计数放在 JSON 解析之后：200+非 JSON 体时避免 saved/failed 双计
+  const json = await res.json();
+  stats.saved++;
+  return json;
 }
 
 const sendContent = (b: any) => post("/ingest/content", b);
@@ -41,26 +53,39 @@ async function setupBrowser() {
   return chromium.launch({ headless: true });
 }
 
+// 已知内容类型：收藏夹里会出现 zvideo 等未知类型，直接透传会被服务端
+// zod enum 拒掉（400），映射到 pin 又会写出错误的 URL——两处必须用同一映射
+const KNOWN_TYPES = new Set(["answer", "article", "pin"]);
+
+// 秒级时间戳转 ISO；缺失时返回空串而不是 1970-01-01 哨兵
+// （哨兵入库会污染排序，服务端也会把 1970 视为无效值回退旧数据）
+const toIsoOrNull = (sec?: number) => (sec ? new Date(sec * 1000).toISOString() : "");
+
 function getCookiesArray() {
   const cookies: Array<{name: string, value: string, domain: string, path: string}> = [];
-  
-  // 如果用户粘贴了全量 Cookie 字符串，自动拆解
+
+  // 如果用户粘贴了全量 Cookie 字符串，自动拆解。
+  // 逐条过滤而不是整串直接交给 addCookies：Playwright 遇到含控制字符
+  // （换行粘贴很常见）的值或 __Host-/__Secure- 前缀（要求 secure:true）
+  // 会直接 throw，一条脏 cookie 就炸掉整轮抓取。
   if (ZHIHU_COOKIE_STRING) {
     const pairs = ZHIHU_COOKIE_STRING.split(";").map(s => s.trim()).filter(Boolean);
     for (const pair of pairs) {
-      const [name, ...rest] = pair.split("=");
-      cookies.push({
-        name: name.trim(),
-        value: rest.join("=").trim(),
-        domain: ".zhihu.com",
-        path: "/"
-      });
+      const eq = pair.indexOf("=");
+      if (eq <= 0) continue;
+      const name = pair.slice(0, eq).trim();
+      const value = pair.slice(eq + 1).trim();
+      if (/[\x00-\x1f\x7f]/.test(value) || name.startsWith("__Host-") || name.startsWith("__Secure-")) continue;
+      cookies.push({ name, value, domain: ".zhihu.com", path: "/" });
     }
   } else if (ZHIHU_COOKIE_Z_C0) {
     // 兼容只填了 z_c0 的情况
     cookies.push({ name: "z_c0", value: ZHIHU_COOKIE_Z_C0, domain: ".zhihu.com", path: "/" });
   }
-  
+
+  if (cookies.length === 0) {
+    throw new Error("cookieString 里没有可用的知乎 cookie（解析结果为空）");
+  }
   return cookies;
 }
 
@@ -70,11 +95,11 @@ function cleanHtml(html: any) {
      const realSrc = attrs.match(/data-(?:original|actualsrc)="([^"]+)"/);
      if (!realSrc) return match;
      const src = realSrc[1];
-     // 懒加载图常见 src="" 或没有 src 属性，原来的 replace 匹配不到非空 src，
-     // 结果 data-original 被后端清洗器剥掉、图片永久空白。
-     if (/src="[^"]*"/.test(attrs)) {
-        return `<img${attrs.replace(/src="[^"]*"/, `src="${src}"`)}>`;
-     }
+      // 懒加载图常见 src="" 或没有 src 属性；注意 \s 前缀——不带的话正则会
+      // 误配到 data-actualsrc 属性名内部的 "src="，替换错位置后图片仍空白
+      if (/\ssrc="[^"]*"/.test(attrs)) {
+        return `<img${attrs.replace(/\ssrc="[^"]*"/, ` src="${src}"`)}>`;
+      }
      return `<img${attrs} src="${src}">`;
   });
   // Remove data-pid to prevent spurious text updates
@@ -103,6 +128,7 @@ export async function runScraper() {
     
     if (!res.ok()) {
       console.error(`❌ 获取回答失败: API 返回状态码 ${res.status()}`);
+      if (res.status() === 401 || res.status() === 403) stats.authRejected++;
       break;
     }
     
@@ -111,6 +137,8 @@ export async function runScraper() {
       // 回答列表没有删除检测，空页不会误删；但被风控时静默漏抓，
       // 至少要让日志能看出来本轮结果不完整。
       if (!json.paging?.is_end) {
+        // 计入终态判定：风控空页 + 零成功同样要把 run 标失败
+        stats.riskEmpty++;
         console.warn("⚠️ 回答列表返回空页但未到末尾，可能被风控，本轮结果不完整");
       }
       break;
@@ -153,8 +181,8 @@ export async function runScraper() {
         isCollapsed: item.is_collapsed,
         isLabeled: item.is_labeled,
         labelInfo: item.label_info ? JSON.stringify(item.label_info) : "",
-        createdTime: new Date((item.created_time || 0) * 1000).toISOString(),
-        updatedTime: new Date((item.updated_time || 0) * 1000).toISOString()
+        createdTime: toIsoOrNull(item.created_time),
+        updatedTime: toIsoOrNull(item.updated_time)
       };
 
       try {
@@ -177,6 +205,7 @@ export async function runScraper() {
           pendingCommentsQueue.push({ answerId: String(item.id), url: contentInput.sourceUrl });
         }
       } catch (err: any) {
+        stats.failed++;
         console.error(`❌ 保存回答失败: ${err.message}`);
       }
     }
@@ -215,7 +244,7 @@ export async function runScraper() {
             beReplied: c.reply_to_author?.member?.name || null,
             content: cleanHtml(c.content),
             img: "",
-            time: new Date((c.created_time || 0) * 1000).toISOString(),
+            time: toIsoOrNull(c.created_time),
             location: c.address_text || "",
             likes: c.vote_count || c.reaction?.statistics?.like_count || 0,
             isAuthor: c.is_author === true || c.is_author === 1 || c.author?.role === "author",
@@ -246,7 +275,7 @@ export async function runScraper() {
                  beReplied: child.reply_to_author?.member?.name || null,
                  content: cleanHtml(child.content),
                  img: "",
-                 time: new Date((child.created_time || 0) * 1000).toISOString(),
+                 time: toIsoOrNull(child.created_time),
                  location: child.address_text || "",
                  likes: child.vote_count || child.reaction?.statistics?.like_count || 0,
                  isAuthor: child.is_author === true || child.is_author === 1 || child.author?.role === "author",
@@ -268,7 +297,7 @@ export async function runScraper() {
                  beReplied: child.reply_to_author?.member?.name || null,
                  content: cleanHtml(child.content),
                  img: "",
-                 time: new Date((child.created_time || 0) * 1000).toISOString(),
+                 time: toIsoOrNull(child.created_time),
                  location: child.address_text || "",
                  likes: child.vote_count || child.reaction?.statistics?.like_count || 0,
                  isAuthor: child.is_author === true || child.is_author === 1 || child.author?.role === "author",
@@ -286,11 +315,31 @@ export async function runScraper() {
       
       if (allComments.length > 0) {
         try {
-          // 有数据就提交，用 partial 告诉服务端「本轮不完整，跳过删除检测」。
-          // 之前 cIncomplete 时整轮不提交，已抓到的更新也一起丢了。
-          await sendComments({ contentPk: `answer:${task.answerId}`, comments: allComments, partial: cIncomplete });
+          // 分批提交：热榜回答动辄数千评论，单请求会撞 Workers 子请求限制。
+          // 中间批 partial=true（跳过删除对账），最后一批带全量 allIds 供对账，
+          // 否则前面批次刚插入的评论会被误判删除
+          const CHUNK = 500;
+          for (let i = 0; i < allComments.length; i += CHUNK) {
+            const isLast = i + CHUNK >= allComments.length;
+            const payload = {
+              contentPk: `answer:${task.answerId}`,
+              comments: allComments.slice(i, i + CHUNK),
+              partial: isLast ? cIncomplete : true,
+              ...(isLast ? { allIds: allComments.map(c => c.id) } : {})
+            };
+            try {
+              await sendComments(payload);
+            } catch (e: any) {
+              // 瞬时失败重试一次：分批一旦断在中间，content 的 comment_count 已是
+              // 全量值，下轮不会再进评论抓取队列，缺口会挂到该回答有新评论为止。
+              // 幂等可重发：已入库批次会被 replaceComments 识别为 UPDATE
+              console.warn(`⚠️ 评论批次失败，重试一次 (第 ${Math.floor(i / CHUNK) + 1} 批): ${e?.message || e}`);
+              await sendComments(payload);
+            }
+          }
           console.log(`✅ 保存评论: ${allComments.length} 条 (回答 ID: ${task.answerId})${cIncomplete ? " [partial]" : ""}`);
         } catch (err: any) {
+           stats.failed++;
            console.error(`❌ 保存评论失败: ${err.message}`);
         }
       } else if (cIncomplete) {
@@ -320,10 +369,19 @@ export async function runCollectionScraper() {
     const res = await context.request.get(`https://www.zhihu.com/api/v4/members/${ZHIHU_USERNAME}/favlists?limit=20&offset=${offset}`);
     if (!res.ok()) {
        console.error(`❌ 获取收藏夹列表失败: API 返回状态码 ${res.status()}`);
+       if (res.status() === 401 || res.status() === 403) stats.authRejected++;
        break;
     }
     const json = await res.json();
-    if (!json.data || json.data.length === 0) break;
+    // 与 answers/upvotes 对齐：空页且未到 is_end 是风控信号，计入终态判定，
+    // 否则收藏夹定向风控时 run 依然全绿、收藏静默停止更新
+    if (!json.data || json.data.length === 0) {
+      if (!json.paging?.is_end) {
+        stats.riskEmpty++;
+        console.warn("⚠️ 收藏夹列表返回空页但未到末尾，可能被风控，本轮结果不完整");
+      }
+      break;
+    }
     
     for (const item of json.data) {
        if (item.id && item.title) {
@@ -367,16 +425,30 @@ export async function runCollectionScraper() {
          for (const row of cJson.data) {
             const item = row.content;
             if (!item || !item.type) continue;
-            
-            const sourceType = item.type === "answer" ? "answer" : (item.type === "article" ? "article" : "pin");
-            // pin/article 的 item.url 可能为空，构造兜底 URL，避免 zod .url() 拒绝整个快照
-            const sourceUrl = item.type === "answer"
+
+            const sourceType = KNOWN_TYPES.has(item.type) ? item.type : "pin";
+            // item.url 可能为空串或相对路径，zod .url() 会拒掉整个快照（不是丢一条）。
+            // 拼接 URL 永远语法合法，item.url 仅在通过 URL 校验时才采用。
+            const fallbackUrl = item.type === "answer"
                  ? `https://www.zhihu.com/question/${item.question?.id}/answer/${item.id}`
-                 : item.url || (item.type === "article" ? `https://zhuanlan.zhihu.com/p/${item.id}` : `https://www.zhihu.com/pin/${item.id}`);
+                 : item.type === "article" ? `https://zhuanlan.zhihu.com/p/${item.id}` : `https://www.zhihu.com/pin/${item.id}`;
+            let sourceUrl = fallbackUrl;
+            if (typeof item.url === "string" && item.url) {
+              try {
+                const u = new URL(item.url);
+                if (u.protocol === "http:" || u.protocol === "https:") sourceUrl = item.url;
+              } catch { /* item.url 非法则用拼接值 */ }
+            }
             const title = item.question?.title || item.title || "无标题";
-            
-            // 如果拉到了内容，同时把它存进 contents 表供用户阅读
-            if (item.content) {
+
+            // 如果拉到了内容，同时把它存进 contents 表供用户阅读。
+            // 未知类型（zvideo 等）不透传：服务端 enum 会拒，写进去的数据也是错的
+            if (item.content && KNOWN_TYPES.has(item.type)) {
+              // pin 的 content 是块数组 [{type:"text",content:"..."}] 而非 HTML 字符串，
+              // 直接给 cleanHtml 会因非字符串返回空串——想法正文就全丢了
+              const rawContent = Array.isArray(item.content)
+                ? (item.content as any[]).map(b => (typeof b?.content === "string" ? b.content : "")).filter(Boolean).join("\n")
+                : item.content;
               const contentInput = {
                 sourceType: item.type as "answer" | "article" | "pin",
                 sourceId: String(item.id),
@@ -384,7 +456,7 @@ export async function runCollectionScraper() {
                 sourceUrl,
                 author: { name: item.author?.name, urlToken: item.author?.url_token, avatarUrl: item.author?.avatar_url, headline: item.author?.headline },
                 question: item.question ? { id: String(item.question.id), title: item.question.title } : undefined,
-                contentHtml: cleanHtml(item.content),
+                contentHtml: cleanHtml(rawContent),
                 contentMd: "",
                 excerpt: item.excerpt || "",
                 voteupCount: item.voteup_count || item.reaction?.statistics?.like_count || item.reaction?.statistics?.upvote_count || 0,
@@ -394,8 +466,8 @@ export async function runCollectionScraper() {
                 isCollapsed: item.is_collapsed,
                 isLabeled: item.is_labeled,
                 labelInfo: item.label_info ? JSON.stringify(item.label_info) : "",
-                createdTime: new Date((item.created_time || 0) * 1000).toISOString(),
-                updatedTime: new Date((item.updated_time || 0) * 1000).toISOString()
+                createdTime: toIsoOrNull(item.created_time),
+                updatedTime: toIsoOrNull(item.updated_time)
               };
               try {
                 const dbRes = await sendContent(contentInput);
@@ -409,7 +481,11 @@ export async function runCollectionScraper() {
                 } else {
                   existingCount = 0;
                 }
-              } catch(e) {}
+              } catch (e: any) {
+                // 之前是空 catch：收藏条目入库失败连日志都没有，问题完全不可见
+                stats.failed++;
+                console.error(`❌ 收藏条目入库失败: ${title}`, e?.message || e);
+              }
             }
 
             items.push({
@@ -435,6 +511,7 @@ export async function runCollectionScraper() {
             items
           });
         } catch (e: any) {
+           stats.failed++;
            console.error(`❌ 收藏夹保存失败: ${e.message}`);
         }
       } else {
@@ -463,11 +540,13 @@ export async function runUpvotesScraper() {
     const res = await context.request.get(nextUrl);
     if (!res.ok()) {
       console.error(`❌ 获取动态失败: API 返回状态码 ${res.status()}`);
+      if (res.status() === 401 || res.status() === 403) stats.authRejected++;
       break;
     }
     const json = await res.json();
     if (!json.data || json.data.length === 0) {
       if (!json.paging?.is_end) {
+        stats.riskEmpty++;
         console.warn("⚠️ 赞同列表返回空页但未到末尾，可能被风控，本轮结果不完整");
       }
       break;
@@ -515,29 +594,34 @@ export async function runUpvotesScraper() {
         isCollapsed: target.is_collapsed,
         isLabeled: target.is_labeled,
         labelInfo: target.label_info ? JSON.stringify(target.label_info) : "",
-        createdTime: new Date((target.created_time || 0) * 1000).toISOString(),
-        updatedTime: new Date((target.updated_time || 0) * 1000).toISOString()
+        createdTime: toIsoOrNull(target.created_time),
+        updatedTime: toIsoOrNull(target.updated_time)
       };
 
       try {
         const pk = await sendContent(contentInput);
         if (pk) {
-           const upvoteTime = new Date((item.created_time || 0) * 1000).toISOString();
-           const upRes = await post(`/ingest/upvote`, { contentPk: pk.pk, upvoteTime });
-           count++;
-           
-           if (!upRes.created) {
-             existingCount++;
-             if (existingCount >= 20 && isFast) {
-               console.log("🛑 连续20个赞同记录无更新，停止本轮极速同步。");
-               isEnd = true;
-               break;
+           const upvoteTime = toIsoOrNull(item.created_time);
+           // created_time 缺失时为空串：/ingest/upvote 对空串返回 400，
+           // 整条赞同上报会失败——内容已入库，跳过时间戳上报即可
+           if (upvoteTime) {
+             const upRes = await post(`/ingest/upvote`, { contentPk: pk.pk, upvoteTime });
+             count++;
+
+             if (!upRes.created) {
+               existingCount++;
+               if (existingCount >= 20 && isFast) {
+                 console.log("🛑 连续20个赞同记录无更新，停止本轮极速同步。");
+                 isEnd = true;
+                 break;
+               }
+             } else {
+               existingCount = 0;
              }
-           } else {
-             existingCount = 0;
            }
         }
       } catch (err: any) {
+        stats.failed++;
         console.error(`❌ 保存赞同失败: ${title}`, err.message);
       }
     }
@@ -546,8 +630,12 @@ export async function runUpvotesScraper() {
 
     if (!isEnd) isEnd = json.paging?.is_end;
     nextUrl = json.paging?.next;
-    
+
     if (json.data.length === 0) break;
+
+    // 与其他三段对齐的节流：老账号动态可达数千页，背靠背请求极易触发 429
+    // 并升级为账号级风控，连坐 answers/collections 两段
+    await new Promise(r => setTimeout(r, 500));
   }
 
   await browser.close();
@@ -556,23 +644,34 @@ export async function runUpvotesScraper() {
 
 
 // --- Apify Entry Point ---
+// 失败必须让 run 状态可见。之前所有异常都被吞掉后正常 exit，
+// cookie 失效后 run 依然 SUCCEEDED，Worker /auth 页据此误报"一切正常"。
 try {
   if (runType === "all" || runType === "answers") {
     await runScraper();
   }
   if (runType === "all" || runType === "collections") {
-    // Note: The original export is runCollectionScraper
-    if (typeof runCollectionScraper === "function") {
-      await runCollectionScraper();
-    }
+    await runCollectionScraper();
   }
   if (runType === "all" || runType === "upvotes") {
-    if (typeof runUpvotesScraper === "function") {
-      await runUpvotesScraper();
-    }
+    await runUpvotesScraper();
   }
 } catch (e: any) {
-  log.error(e.message || String(e));
-} finally {
-  await Actor.exit();
+  log.error(e?.message || String(e));
+  await Actor.fail(`crawler_error: ${e?.message || String(e)}`);
+  process.exit(1);
 }
+
+if ((stats.authRejected > 0 || stats.riskEmpty > 0) && stats.saved === 0) {
+  await Actor.fail(`zhihu_auth_failed: 被知乎 401/403 拒绝 ${stats.authRejected} 次、疑似风控空页 ${stats.riskEmpty} 次（cookie 可能已失效或被风控），本轮零数据入库`);
+  process.exit(1);
+}
+if (stats.saved === 0 && stats.failed > 0) {
+  await Actor.fail(`ingest_failed: 回传 ${stats.failed} 次全部失败（检查 Worker 的 API_SECRET / WORKER_URL），本轮零数据入库`);
+  process.exit(1);
+}
+if (stats.failed > 0 || stats.authRejected > 0) {
+  log.warning(`本轮完成：交付 ${stats.saved} 条数据，${stats.failed} 次入库失败，${stats.authRejected} 次被知乎拒绝`);
+}
+
+await Actor.exit();

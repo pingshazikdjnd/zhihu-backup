@@ -15,7 +15,7 @@ export async function upsertContent(input: IngestContentInput) {
   const rawMd = input.contentMd ?? "";
   // 可搜索正文（HTML 原文存 R2，D1 保留纯文本，否则 content_md LIKE 永远匹配不到）
   const searchText = buildSearchText(rawMd, rawHtml, SEARCH_TEXT_LIMIT);
-  const contentHash = await sha256(
+  const rawContentHash = await sha256(
     normalizeForHash(rawMd || rawHtml || input.excerpt || "")
   );
 
@@ -37,7 +37,8 @@ export async function upsertContent(input: IngestContentInput) {
   // 只要某次 ingest 不带正文（例如只更新点赞数），content_md（D1 里唯一的可搜索文本）
   // 就会被清空，全文搜索逐步失效且不可逆。
   const existing = await db.prepare(`
-    SELECT pk, content_hash, voteup_count, comment_count, favorite_count, visit_count,
+    SELECT pk, title, source_url, excerpt, question_id, question_title, author_url_token, created_time, updated_time,
+           content_hash, voteup_count, comment_count, favorite_count, visit_count,
            author_name, author_avatar, author_headline,
            content_html, content_md,
            is_collapsed, is_labeled, label_info
@@ -80,7 +81,7 @@ export async function upsertContent(input: IngestContentInput) {
         input.labelInfo || null,
         input.createdTime || null,
         input.updatedTime || null,
-        contentHash,
+        rawContentHash,
         now,
         now
       );
@@ -95,7 +96,7 @@ export async function upsertContent(input: IngestContentInput) {
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           pk,
-          contentHash,
+          rawContentHash,
           input.title,
           "", // 版本正文不写进 D1（原文在 R2 的 versions/{pk}/{hash}）
           "",
@@ -115,8 +116,35 @@ export async function upsertContent(input: IngestContentInput) {
         payload: { pk, sourceUrl: input.sourceUrl }
       });
 
-      return { pk, changed: true, created: true, prevCommentCount: 0, hash: contentHash };
+      return { pk, changed: true, created: true, prevCommentCount: 0, hash: rawContentHash };
     }
+
+    // 无正文的更新（如赞同动态里 target.content 为空）不能覆盖正文哈希：
+    // 空串哈希在 R2 里永远没有对应对象，详情读路径会指向不存在的键，
+    // 正文会空窗到下次全量同步。计数仍正常更新，哈希沿用库里的旧值。
+    const contentHash = (rawHtml || rawMd) ? rawContentHash : existing.content_hash;
+
+    // 弱数据源（赞同动态等）常缺 question / 时间戳，且抓取端缺字段时会写
+    // 1970-01-01 哨兵：空值与哨兵都不得覆盖库里的旧值（同 safeVoteupCount 思路）。
+    // 1970 哨兵还会让 ORDER BY COALESCE(updated_time, ...) 恒命中假时间、排序跌底。
+    const isRealTime = (s?: string | null) => !!s && !s.startsWith("1970-01-01");
+    // moments 等弱载荷缺 question 时会带非空占位串（"未知问题"、/question/undefined/）：
+    // 非空但错误，同样不能覆盖库里的真实值，且这三个字段不参与 changes[] 比较、
+    // 后续正确数据不会主动修复，必须在写入侧挡住
+    const PLACEHOLDER_TITLES = new Set(["未知问题", "未知文章", "无标题"]);
+    const safeTitle = (input.title && !PLACEHOLDER_TITLES.has(input.title))
+      ? input.title
+      : (existing.title || input.title || "");
+    const safeSourceUrl = input.sourceUrl.includes("undefined")
+      ? (existing.source_url || input.sourceUrl)
+      : input.sourceUrl;
+    const safeExcerpt = input.excerpt || existing.excerpt || "";
+    const safeQuestionId = input.question?.id || existing.question_id;
+    const safeQuestionTitle = input.question?.title || existing.question_title;
+    const safeUrlToken = input.author?.urlToken || existing.author_url_token;
+    const safeLabelInfo = input.labelInfo || existing.label_info;
+    const safeCreatedTime = isRealTime(input.createdTime) ? input.createdTime : existing.created_time;
+    const safeUpdatedTime = isRealTime(input.updatedTime) ? input.updatedTime : existing.updated_time;
 
     // Preserve existing stats if incoming are 0 to prevent data loss from faulty API responses
     const safeVoteupCount = (input.voteupCount === 0 && existing.voteup_count > 0) ? existing.voteup_count : input.voteupCount;
@@ -180,26 +208,26 @@ export async function upsertContent(input: IngestContentInput) {
             created_time = ?, updated_time = ?, content_hash = ?, last_seen_at = ?, is_deleted = 0, deleted_at = NULL
         WHERE pk = ?
       `).raw(
-        input.title,
+        safeTitle,
         safeAuthorName,
-        input.author?.urlToken ?? null,
+        safeUrlToken ?? null,
         safeAuthorAvatar,
         safeAuthorHeadline,
-        input.sourceUrl,
-        input.question?.id ?? null,
-        input.question?.title ?? null,
+        safeSourceUrl,
+        safeQuestionId ?? null,
+        safeQuestionTitle ?? null,
         safeContentHtml,
         safeContentMd,
-        input.excerpt,
+        safeExcerpt,
         safeVoteupCount,
         safeCommentCount,
         safeFavoriteCount,
         safeVisitCount,
         input.isCollapsed ? 1 : 0,
         input.isLabeled ? 1 : 0,
-        input.labelInfo || null,
-        input.createdTime || null,
-        input.updatedTime || null,
+        safeLabelInfo ?? null,
+        safeCreatedTime ?? null,
+        safeUpdatedTime ?? null,
         contentHash,
         now,
         pk
@@ -215,7 +243,7 @@ export async function upsertContent(input: IngestContentInput) {
         `).raw(
           pk,
           contentHash,
-          input.title,
+          safeTitle,
           "", // 版本正文不写进 D1（原文在 R2 的 versions/{pk}/{hash}）
           "",
           input.excerpt,

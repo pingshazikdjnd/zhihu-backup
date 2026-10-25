@@ -135,16 +135,20 @@ export default function ContentsPage() {
     if (isLoading) return;
     if (observer.current) observer.current.disconnect();
     observer.current = new IntersectionObserver(entries => {
-      if (entries[0].isIntersecting) {
+      if (entries[0].isIntersecting && !isLoading) {
+        // 页码只在请求成功后由 fetchAnswers/fetchUpvotes 提交。
+        // 之前在 setState updater 里 +1 并顺带 fetch：updater 同步执行而
+        // 页码回滚只在成功时——一次网络失败就永久跳过那一页（50 条无感丢失），
+        // StrictMode 下 updater 双调用还会同页抓两次
         if (activeTab === "answers" && hasMoreAnswers) {
-          setAnswersPage(p => { const next = p + 1; fetchAnswers(next); return next; });
+          fetchAnswers(answersPage + 1);
         } else if (activeTab === "upvotes" && hasMoreUpvotes) {
-          setUpvotesPage(p => { const next = p + 1; fetchUpvotes(next); return next; });
+          fetchUpvotes(upvotesPage + 1);
         }
       }
     });
     if (node) observer.current.observe(node);
-  }, [isLoading, hasMoreAnswers, hasMoreUpvotes, activeTab]);
+  }, [isLoading, hasMoreAnswers, hasMoreUpvotes, activeTab, answersPage, upvotesPage]);
 
   const currentItems = searchResults !== null ? searchResults : (activeTab === "answers" ? answersData : upvotesData);
 

@@ -48,13 +48,19 @@ export async function triggerApifyRun(
     return { ok: false, error: "WORKER_URL is not configured with a public workers.dev URL" };
   }
 
+  // 占位符/空值会让三段抓取全部 404 并静默空跑（run 显示成功、零数据入库）
+  const zhihuUser = env.ZHIHU_USERNAME || "";
+  if (!zhihuUser || zhihuUser === "your_zhihu_token") {
+    return { ok: false, error: "ZHIHU_USERNAME is not configured" };
+  }
+
   const payload = {
     runType,
     isFast,
     apiUrl,
     // Actor 的 INPUT_SCHEMA 必须声明 apiSecret，否则 Apify 会剥掉该字段
     apiSecret: env.API_SECRET,
-    zhihuUsername: env.ZHIHU_USERNAME || "",
+    zhihuUsername: zhihuUser,
     cookieString: cookieStr
   };
 

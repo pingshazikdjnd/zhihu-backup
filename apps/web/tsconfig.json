@@ -2,6 +2,10 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "jsx": "react-jsx",
+    // noEmit 必须显式声明：vite 负责产物，tsc 只做类型检查。
+    // 否则 tsc -b 会在 src/ 旁散落 .js 产物，而 import "./App.js" 这种
+    // 说明符会让 vite 优先解析到产物而非 .tsx 源码，开发时改代码"毫无反应"
+    "noEmit": true,
     // 浏览器项目：只需要 vite/client 类型（base 带了 ["node"]，本包没装 @types/node）
     "types": ["vite/client"]
   },
