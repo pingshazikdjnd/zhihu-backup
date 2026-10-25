@@ -1,141 +1,163 @@
 import { db } from "../db.js";
-import { emitChange } from "./changes.js";
+import { buildChangeStatement } from "./changes.js";
 import type { IngestCollectionSnapshotInput } from "shared";
 
+// D1 单次 batch 的语句数不宜过大；100 条一批兼顾往返次数和单批体积（同 comments.ts）
+const BATCH_SIZE = 100;
+
+/**
+ * 收藏夹快照同步。
+ *
+ * 原来套在 db.transaction 里逐条 await（collections upsert + 每条 item 的 SELECT/INSERT/UPDATE
+ * + 每条事件一次独立 emitChange），几十条收藏就是几十上百次 D1 往返，会撞 Workers 子请求上限；
+ * 且 db.transaction 在 D1 上只是顺序执行、不回滚，batch() 才是唯一的原子手段。
+ * 现在改成「先查后批」：SELECT 全部在 batch 之前完成，写语句统一收进 stmts 分批 batch。
+ */
 export async function upsertCollectionSnapshot(input: IngestCollectionSnapshotInput) {
   const now = new Date().toISOString();
   const collectionId = input.collection.id;
 
+  // 一次性查全量（不过滤 is_removed=0）：已移除的行也要查出来，
+  // 命中时走「更新并复位」，与旧版逐条 SELECT（无 is_removed 过滤）→ 无行才 INSERT 的判断等价
   const existingItems = await db.prepare(`
-    SELECT collection_id, source_type, source_id, is_removed
+    SELECT id, source_type, source_id, is_removed
     FROM collection_items
-    WHERE collection_id = ? AND is_removed = 0
+    WHERE collection_id = ?
   `).all(collectionId) as Array<{
-    collection_id: string;
+    id: number;
     source_type: string;
     source_id: string;
     is_removed: number;
   }>;
 
-  const existingKeys = new Set(existingItems.map(i => `${i.source_type}:${i.source_id}`));
+  const existingByKey = new Map(existingItems.map(i => [`${i.source_type}:${i.source_id}`, i]));
+  // 对账基准与旧版一致：只有此快照前仍处于未移除状态的行参与删除对账
+  const existingKeys = new Set(
+    existingItems.filter(i => i.is_removed === 0).map(i => `${i.source_type}:${i.source_id}`)
+  );
   const incomingKeys = new Set(input.items.map(i => `${i.sourceType}:${i.sourceId}`));
+
+  // 同一批 payload 里重复出现的 key，旧版逐条查询天然是「先插后更、末次值生效」；
+  // 批量路径下重复 INSERT 会造出脏行，这里先按 key 去重、保留最后一次出现的值
+  const uniqueItems = new Map<string, IngestCollectionSnapshotInput["items"][number]>();
+  for (const item of input.items) {
+    uniqueItems.set(`${item.sourceType}:${item.sourceId}`, item);
+  }
 
   let added = 0;
   let removed = 0;
 
-  await db.transaction(async () => {
-    const existsCollection = await db.prepare(`SELECT id FROM collections WHERE id = ?`).get(collectionId);
-    if (!existsCollection) {
-      await db.prepare(`
-        INSERT INTO collections (id, title, owner_token, first_seen_at, last_seen_at, updated_time)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(
+  const existsCollection = await db.prepare(`SELECT id FROM collections WHERE id = ?`).get(collectionId);
+
+  const stmts: any[] = [];
+
+  if (!existsCollection) {
+    stmts.push(db.prepare(`
+      INSERT INTO collections (id, title, owner_token, first_seen_at, last_seen_at, updated_time)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).raw(
+      collectionId,
+      input.collection.title,
+      input.collection.ownerToken || null,
+      now,
+      now,
+      input.collection.updatedTime || now
+    ));
+  } else {
+    stmts.push(db.prepare(`
+      UPDATE collections
+      SET title = ?, owner_token = ?, last_seen_at = ?, updated_time = ?
+      WHERE id = ?
+    `).raw(
+      input.collection.title,
+      input.collection.ownerToken || null,
+      now,
+      input.collection.updatedTime || now,
+      collectionId
+    ));
+  }
+
+  for (const item of uniqueItems.values()) {
+    const contentPk = `${item.sourceType}:${item.sourceId}`;
+    const key = `${item.sourceType}:${item.sourceId}`;
+    const row = existingByKey.get(key);
+
+    if (!row) {
+      stmts.push(db.prepare(`
+        INSERT INTO collection_items (
+          collection_id, content_pk, source_type, source_id,
+          title, author_name, source_url, first_seen_at, last_seen_at, is_removed, removed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+      `).raw(
         collectionId,
-        input.collection.title,
-        input.collection.ownerToken || null,
+        contentPk,
+        item.sourceType,
+        item.sourceId,
+        item.title,
+        item.authorName,
+        item.sourceUrl,
         now,
-        now,
-        input.collection.updatedTime || now
-      );
+        now
+      ));
+
+      stmts.push(buildChangeStatement({
+        eventType: "collection.item_added",
+        entityType: "collection_item",
+        entityPk: `${collectionId}:${key}`,
+        contentPk,
+        summary: `${input.collection.title} + ${item.title}`,
+        payload: item
+      }));
+
+      added++;
     } else {
-      await db.prepare(`
-        UPDATE collections
-        SET title = ?, owner_token = ?, last_seen_at = ?, updated_time = ?
+      stmts.push(db.prepare(`
+        UPDATE collection_items
+        SET title = ?, author_name = ?, source_url = ?, last_seen_at = ?, is_removed = 0, removed_at = NULL
         WHERE id = ?
-      `).run(
-        input.collection.title,
-        input.collection.ownerToken || null,
+      `).raw(
+        item.title,
+        item.authorName,
+        item.sourceUrl,
         now,
-        input.collection.updatedTime || now,
-        collectionId
-      );
+        row.id
+      ));
     }
+  }
 
-    for (const item of input.items) {
-      const contentPk = `${item.sourceType}:${item.sourceId}`;
-      const key = `${item.sourceType}:${item.sourceId}`;
+  if (!input.incremental) {
+    for (const key of existingKeys) {
+      if (!incomingKeys.has(key)) {
+        const [sourceType, sourceId] = key.split(":");
+        stmts.push(db.prepare(`
+          UPDATE collection_items
+          SET is_removed = 1, removed_at = ?, last_seen_at = ?
+          WHERE collection_id = ? AND source_type = ? AND source_id = ?
+        `).raw(now, now, collectionId, sourceType, sourceId));
 
-      const row = await db.prepare(`
-        SELECT id, is_removed
-        FROM collection_items
-        WHERE collection_id = ? AND source_type = ? AND source_id = ?
-      `).get(collectionId, item.sourceType, item.sourceId) as
-        | { id: number; is_removed: number }
-        | undefined;
-
-      if (!row) {
-        await db.prepare(`
-          INSERT INTO collection_items (
-            collection_id, content_pk, source_type, source_id,
-            title, author_name, source_url, first_seen_at, last_seen_at, is_removed, removed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
-        `).run(
-          collectionId,
-          contentPk,
-          item.sourceType,
-          item.sourceId,
-          item.title,
-          item.authorName,
-          item.sourceUrl,
-          now,
-          now
-        );
-
-        await emitChange({
-          eventType: "collection.item_added",
+        stmts.push(buildChangeStatement({
+          eventType: "collection.item_removed",
           entityType: "collection_item",
           entityPk: `${collectionId}:${key}`,
-          contentPk,
-          summary: `${input.collection.title} + ${item.title}`,
-          payload: item
-        });
+          contentPk: key,
+          summary: `${input.collection.title} - ${key}`,
+          payload: { collectionId, sourceType, sourceId }
+        }));
 
-        added++;
-      } else {
-        await db.prepare(`
-          UPDATE collection_items
-          SET title = ?, author_name = ?, source_url = ?, last_seen_at = ?, is_removed = 0, removed_at = NULL
-          WHERE id = ?
-        `).run(
-          item.title,
-          item.authorName,
-          item.sourceUrl,
-          now,
-          row.id
-        );
+        removed++;
       }
     }
+  }
 
-    if (!input.incremental) {
-      for (const key of existingKeys) {
-        if (!incomingKeys.has(key)) {
-          const [sourceType, sourceId] = key.split(":");
-          await db.prepare(`
-            UPDATE collection_items
-            SET is_removed = 1, removed_at = ?, last_seen_at = ?
-            WHERE collection_id = ? AND source_type = ? AND source_id = ?
-          `).run(now, now, collectionId, sourceType, sourceId);
+  stmts.push(db.prepare(`
+    INSERT INTO collection_snapshots (
+      collection_id, snapshot_at, item_count, added_count, removed_count
+    ) VALUES (?, ?, ?, ?, ?)
+  `).raw(collectionId, now, input.items.length, added, removed));
 
-          await emitChange({
-            eventType: "collection.item_removed",
-            entityType: "collection_item",
-            entityPk: `${collectionId}:${key}`,
-            contentPk: key,
-            summary: `${input.collection.title} - ${key}`,
-            payload: { collectionId, sourceType, sourceId }
-          });
-
-          removed++;
-        }
-      }
-    }
-
-    await db.prepare(`
-      INSERT INTO collection_snapshots (
-        collection_id, snapshot_at, item_count, added_count, removed_count
-      ) VALUES (?, ?, ?, ?, ?)
-    `).run(collectionId, now, input.items.length, added, removed);
-  });
+  for (let i = 0; i < stmts.length; i += BATCH_SIZE) {
+    await db.batch(stmts.slice(i, i + BATCH_SIZE));
+  }
 
   return { added, removed, count: input.items.length };
 }

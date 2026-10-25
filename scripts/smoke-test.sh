@@ -88,28 +88,56 @@ expect_contains "计数已更新" "$R" '"voteup_count":42'
 expect_contains "产生版本快照" "$R" 'snapshot_at'
 
 echo "== 6. 评论批量与 partial 防误删 =="
-CM5=$(python3 - "$STAMP" <<'PY'
-import json, sys
-s = sys.argv[1]
-cs = [{"id": f"smoke-{s}-c{i}", "parentId": None, "author": f"u{i}", "authorAvatar": "",
-       "beReplied": None, "content": f"comment-{i}", "img": "",
-       "time": "2026-10-18T00:00:00.000Z", "location": "", "likes": i,
-       "isAuthor": False, "isTop": False, "isFeatured": False} for i in range(1, 6)]
-print(json.dumps({"contentPk": f"answer:smoke-{s}", "comments": cs, "partial": False}))
-PY
+CM5=$(node - "$STAMP" <<'JS'
+// 不用 python3：Windows 上它常是 Store 假 stub，跑起来无输出导致 curl 发空请求。
+// 注意：这里刻意复刻 python json.dumps 的默认分隔符（", " / ": "），
+// 输出须与旧版逐字节一致——下方 sed 按 '"partial": true'（带空格）精确匹配。
+const dumps = (v) => {
+  if (Array.isArray(v)) return `[${v.map(dumps).join(", ")}]`;
+  if (v !== null && typeof v === "object") {
+    return `{${Object.entries(v).map(([k, x]) => `${JSON.stringify(k)}: ${dumps(x)}`).join(", ")}}`;
+  }
+  return JSON.stringify(v);
+};
+
+const s = process.argv[2];
+const cs = [];
+for (let i = 1; i <= 5; i++) {
+  cs.push({
+    id: `smoke-${s}-c${i}`, parentId: null, author: `u${i}`, authorAvatar: "",
+    beReplied: null, content: `comment-${i}`, img: "",
+    time: "2026-10-18T00:00:00.000Z", location: "", likes: i,
+    isAuthor: false, isTop: false, isFeatured: false
+  });
+}
+console.log(dumps({ contentPk: `answer:smoke-${s}`, comments: cs, partial: false }));
+JS
 )
 R=$(curl -s -X POST "$BASE_URL/ingest/comments" "${json[@]}" "${auth[@]}" -d "$CM5")
 expect_contains "首次写入 added:5" "$R" '"added":5'
 
-CM2_PARTIAL=$(python3 - "$STAMP" <<'PY'
-import json, sys
-s = sys.argv[1]
-cs = [{"id": f"smoke-{s}-c{i}", "parentId": None, "author": f"u{i}", "authorAvatar": "",
-       "beReplied": None, "content": f"comment-{i}", "img": "",
-       "time": "2026-10-18T00:00:00.000Z", "location": "", "likes": i,
-       "isAuthor": False, "isTop": False, "isFeatured": False} for i in range(1, 3)]
-print(json.dumps({"contentPk": f"answer:smoke-{s}", "comments": cs, "partial": True}))
-PY
+CM2_PARTIAL=$(node - "$STAMP" <<'JS'
+// 同上：node 替代 python3，分隔符保持与 json.dumps 一致，sed 才能命中
+const dumps = (v) => {
+  if (Array.isArray(v)) return `[${v.map(dumps).join(", ")}]`;
+  if (v !== null && typeof v === "object") {
+    return `{${Object.entries(v).map(([k, x]) => `${JSON.stringify(k)}: ${dumps(x)}`).join(", ")}}`;
+  }
+  return JSON.stringify(v);
+};
+
+const s = process.argv[2];
+const cs = [];
+for (let i = 1; i <= 2; i++) {
+  cs.push({
+    id: `smoke-${s}-c${i}`, parentId: null, author: `u${i}`, authorAvatar: "",
+    beReplied: null, content: `comment-${i}`, img: "",
+    time: "2026-10-18T00:00:00.000Z", location: "", likes: i,
+    isAuthor: false, isTop: false, isFeatured: false
+  });
+}
+console.log(dumps({ contentPk: `answer:smoke-${s}`, comments: cs, partial: true }));
+JS
 )
 R=$(curl -s -X POST "$BASE_URL/ingest/comments" "${json[@]}" "${auth[@]}" -d "$CM2_PARTIAL")
 expect_contains "partial=true 不删任何评论" "$R" '"deleted":0'
