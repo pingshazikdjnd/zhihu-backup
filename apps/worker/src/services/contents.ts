@@ -307,8 +307,9 @@ export async function listContents(params: { type?: string; q?: string; author?:
   }
 
   if (params.q) {
-    conditions.push(`(c.title LIKE ? OR c.question_title LIKE ? OR c.content_md LIKE ?)`);
-    const kw = `%${params.q}%`;
+    conditions.push(`(c.title LIKE ? ESCAPE '\\' OR c.question_title LIKE ? ESCAPE '\\' OR c.content_md LIKE ? ESCAPE '\\')`);
+    // 转义 LIKE 通配符：否则搜 "%" 会全表命中、"50%" 按 50* 通配匹配
+    const kw = `%${params.q.replace(/[\\%_]/g, m => "\\" + m)}%`;
     values.push(kw, kw, kw);
   }
 
@@ -329,7 +330,9 @@ export async function listContents(params: { type?: string; q?: string; author?:
     FROM contents c
     LEFT JOIN upvotes u ON u.content_pk = c.pk
     ${where}
-    ORDER BY COALESCE(c.updated_time, c.last_seen_at) DESC
+    -- 排序用同步时间（last_seen_at）：updated_time 是知乎侧编辑时间，
+    -- 从不编辑的老内容首次备份后会按编辑时间沉到列表最底部，用户翻不到刚备份的东西
+    ORDER BY c.last_seen_at DESC
     LIMIT ${limit} OFFSET ${offset}
   `).all(...values);
 

@@ -29,6 +29,13 @@ export async function replaceComments(input: IngestCommentsInput) {
   }>;
 
   const existingMap = new Map(existingRows.map(row => [row.id, row]));
+  // 知乎评论按点赞序+offset 分页，抓取期间点赞变化会让同一条评论漂移到
+  // 相邻页，payload 里出现重复 id：不去重的话两条同 id INSERT 撞主键，
+  // 整批原子失败且重试（同 payload）必然再失败（同 collections 的去重方案）
+  const uniqueComments = new Map<string, typeof input.comments[number]>();
+  for (const c of input.comments) {
+    uniqueComments.set(c.id, c);
+  }
   // 分批提交时对账基准是 allIds（全量），单发时是本批 comments 的 id
   const incomingIds = new Set(input.allIds ?? input.comments.map(c => c.id));
 
@@ -39,7 +46,7 @@ export async function replaceComments(input: IngestCommentsInput) {
   // 语句顺序很重要：comments 必须先于 comment_versions（外键）
   const stmts: any[] = [];
 
-  for (const c of input.comments) {
+  for (const c of uniqueComments.values()) {
     const hash = await sha256(normalizeForHash(`${c.content}|${c.img}|${c.likes}`));
     const exists = existingMap.get(c.id);
 

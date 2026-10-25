@@ -13,7 +13,39 @@ syncRoutes.use("*", requireSecret);
  * 记录一次同步尝试，并在触发后立即把结果写回。
  * 之前只插入 status='running' 就再不更新，列表里永远是 running。
  */
+/**
+ * 防重入锁：cron 与手动触发重叠会并发起两个 Actor run，
+ * 同 pk 的评论对账互相看不见对方刚插入的行，产生批量假删除事件。
+ * 锁 TTL 10 分钟（一次 run 触发到跑完的量级），过期自动放行。
+ */
+async function acquireSyncLock(): Promise<boolean> {
+  const TTL_MS = 10 * 60_000;
+  const now = new Date().toISOString();
+  try {
+    const row = await db.prepare(
+      `SELECT updated_at FROM app_settings WHERE key = 'sync_lock'`
+    ).get() as { updated_at: string } | undefined;
+    if (row?.updated_at) {
+      const age = Date.now() - Date.parse(row.updated_at);
+      if (Number.isFinite(age) && age >= 0 && age < TTL_MS) return false;
+    }
+    await db.prepare(`
+      INSERT INTO app_settings (key, value, updated_at) VALUES ('sync_lock', ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run(Date.now().toString(), now);
+    return true;
+  } catch {
+    // app_settings 表不存在（migration 未 apply）时不挡同步
+    return true;
+  }
+}
+
 async function runAndRecord(c: any, jobType: string, runType: string, isFast: boolean) {
+  const lockAcquired = await acquireSyncLock();
+  if (!lockAcquired) {
+    return { ok: false, error: "已有同步在进行中（10 分钟内重复触发被拒绝）" };
+  }
+
   const now = new Date().toISOString();
 
   const insert = await db.prepare(`

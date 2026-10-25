@@ -4,7 +4,10 @@ import { db } from "../db.js";
 export const changeRoutes = new Hono();
 
 changeRoutes.get("/", async c => {
-  const limit = Number(c.req.query("limit") || 100);
+  // 公开无鉴权端点：limit 必须钳制。NaN 会把绑定参数变非法（500），
+  // 负数在 SQLite 里 LIMIT -1 = 无上限，一次请求就能拉全表
+  const parsed = Number(c.req.query("limit") || 100);
+  const limit = Number.isFinite(parsed) ? Math.min(Math.max(Math.trunc(parsed), 1), 500) : 100;
   const excludeComments = c.req.query("exclude_comments") === "true";
   const onlyComments = c.req.query("only_comments") === "true";
   

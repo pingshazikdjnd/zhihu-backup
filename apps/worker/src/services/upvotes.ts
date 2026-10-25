@@ -2,7 +2,14 @@ import { db } from "../db.js";
 
 export async function upsertUpvote(contentPk: string, upvoteTime: string) {
   const now = new Date().toISOString();
-  
+
+  // upvotes 表没有外键：悬空 contentPk 会写入永久不可见的僵尸行
+  // （listUpvotes 的 INNER JOIN 读不到它，也无任何清理路径）
+  const contentExists = await db.prepare(`SELECT 1 FROM contents WHERE pk = ?`).get(contentPk);
+  if (!contentExists) {
+    return { created: false, skipped: true };
+  }
+
   const existing = await db.prepare(`SELECT 1 FROM upvotes WHERE content_pk = ?`).get(contentPk);
 
   await db.prepare(`

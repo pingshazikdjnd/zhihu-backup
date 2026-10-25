@@ -129,6 +129,7 @@ export async function runScraper() {
     if (!res.ok()) {
       console.error(`❌ 获取回答失败: API 返回状态码 ${res.status()}`);
       if (res.status() === 401 || res.status() === 403) stats.authRejected++;
+      else stats.failed++; // 中途 429/5xx 也计入终态，不再静默截断
       break;
     }
     
@@ -315,17 +316,21 @@ export async function runScraper() {
       
       if (allComments.length > 0) {
         try {
+          // 知乎按点赞序 + offset 分页，抓取期间点赞变化会让同一条评论漂移到
+          // 相邻页：重复 id 不去掉会在服务端撞主键、整批失败（服务端也有同样去重）
+          const uniqueMap = new Map(allComments.map(c => [c.id, c] as const));
+          const finalComments = [...uniqueMap.values()];
           // 分批提交：热榜回答动辄数千评论，单请求会撞 Workers 子请求限制。
           // 中间批 partial=true（跳过删除对账），最后一批带全量 allIds 供对账，
           // 否则前面批次刚插入的评论会被误判删除
           const CHUNK = 500;
-          for (let i = 0; i < allComments.length; i += CHUNK) {
-            const isLast = i + CHUNK >= allComments.length;
+          for (let i = 0; i < finalComments.length; i += CHUNK) {
+            const isLast = i + CHUNK >= finalComments.length;
             const payload = {
               contentPk: `answer:${task.answerId}`,
-              comments: allComments.slice(i, i + CHUNK),
+              comments: finalComments.slice(i, i + CHUNK),
               partial: isLast ? cIncomplete : true,
-              ...(isLast ? { allIds: allComments.map(c => c.id) } : {})
+              ...(isLast ? { allIds: finalComments.map(c => c.id) } : {})
             };
             try {
               await sendComments(payload);
@@ -370,6 +375,7 @@ export async function runCollectionScraper() {
     if (!res.ok()) {
        console.error(`❌ 获取收藏夹列表失败: API 返回状态码 ${res.status()}`);
        if (res.status() === 401 || res.status() === 403) stats.authRejected++;
+      else stats.failed++; // 中途 429/5xx 也计入终态，不再静默截断
        break;
     }
     const json = await res.json();
@@ -541,6 +547,7 @@ export async function runUpvotesScraper() {
     if (!res.ok()) {
       console.error(`❌ 获取动态失败: API 返回状态码 ${res.status()}`);
       if (res.status() === 401 || res.status() === 403) stats.authRejected++;
+      else stats.failed++; // 中途 429/5xx 也计入终态，不再静默截断
       break;
     }
     const json = await res.json();
