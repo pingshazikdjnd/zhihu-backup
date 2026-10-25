@@ -40,3 +40,6 @@ dump.sql
 v.txt
 screenshot.png
 新建文本文档.txt
+
+# 运行日志（wrangler dev 重定向输出，历史上误提交过一次）
+*.log

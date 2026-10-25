@@ -3,11 +3,7 @@
   "private": true,
   "packageManager": "pnpm@10.0.0",
   "scripts": {
-    "dev:api": "pnpm --filter api dev",
-    "dev:web": "pnpm --filter web dev",
-    "sync": "pnpm --filter collector sync",
-    "sync:upvotes": "pnpm --filter collector sync:upvotes",
-    "collector:sync:collections": "pnpm --filter collector sync:collections"
+    "dev:web": "pnpm --filter web dev"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
@@ -18,5 +14,7 @@
   "dependencies": {
     "better-sqlite3": "^12.11.1",
     "playwright": "^1.49.1"
-  }
+  },
+  "version": "0.1.0",
+  "description": "知乎个人内容备份：回答/文章/想法/评论/收藏/赞同 → Cloudflare Workers + D1 + R2，Apify 抓取"
 }

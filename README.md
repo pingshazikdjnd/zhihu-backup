@@ -187,7 +187,11 @@ curl -X POST "https://<worker>/api/sync/full?target=all" \
   -H "authorization: Bearer <API_SECRET>"
 ```
 
+10 分钟内重复触发（比如 cron 和手动撞在一起）会被防重入锁拒绝，返回「已有同步在进行中」。
+
 **定时抓取**：在 `wrangler.toml` 的 `[triggers]` 里改，默认 `0 2,14 * * *`（UTC，即北京 10:00 / 22:00）。每次触发都是一次真实 Apify run，会产生费用。
+
+**本地冒烟测试**：在 `apps/worker` 下建 `.dev.vars` 写入 `API_SECRET=test-secret`，`npx wrangler dev --port 8788` 起本地 Worker，然后跑 `bash scripts/smoke-test.sh`。测试数据用 node 生成（不依赖 python3），Windows Git Bash 也能直接跑，结束时自动清理。
 
 ---
 
@@ -198,13 +202,13 @@ curl -X POST "https://<worker>/api/sync/full?target=all" \
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/health` | 健康检查 |
-| GET | `/api/contents?page=&q=&type=&author=` | 内容列表（分页 50） |
+| GET | `/api/contents?page=&q=&type=&author=` | 内容列表（分页 50，按同步时间倒序） |
 | GET | `/api/contents/:pk` | 详情（正文从 R2 注入） |
 | GET | `/api/contents/:pk/comments` | 评论树数据 |
 | GET | `/api/collections` | 收藏夹列表 |
 | GET | `/api/collections/items?page=` | 收藏条目 |
 | GET | `/api/collections/:id` | 收藏夹详情 |
-| GET | `/api/changes?limit=&exclude_comments=&only_comments=` | 变更时间线 |
+| GET | `/api/changes?limit=&exclude_comments=&only_comments=` | 变更时间线（limit 钳制 1–500，默认 100） |
 | GET | `/api/changes/sync-runs` | 同步记录 |
 | GET | `/api/upvotes?page=` | 赞同记录 |
 | GET | `/api/stats` | 汇总统计 |
@@ -233,6 +237,7 @@ curl -X POST "https://<worker>/api/sync/full?target=all" \
 | `APIFY_TOKEN` | secret | ✅ | Apify API token |
 | `APIFY_ACTOR_ID` | secret | ✅ | `username~actor-name` |
 | `ZHIHU_COOKIE_STRING` | secret | ❌ | 兜底用；D1 里有 cookie 时优先用 D1 |
+| `ZHIHU_COOKIE_Z_C0` | secret | ❌ | 更早的兜底：只填 z_c0 值时的回落项，一般不用配 |
 | `COOKIE_WRITE_TOKEN` | secret | ❌ | 配了之后 `/auth` 需要填口令才能提交 |
 
 前端只需要 `VITE_API_BASE` 和 `VITE_ZHIHU_USERNAME`。
@@ -246,10 +251,10 @@ curl -X POST "https://<worker>/api/sync/full?target=all" \
 | 网页提交 cookie 返回 500 | `d1 migrations apply` 没跑，`app_settings` 表不存在 |
 | 页面所有请求被浏览器拦 | `ALLOWED_ORIGIN` 没填或填错（不带协议/多了斜杠都算错） |
 | 触发同步报 `WORKER_URL is not configured` | `wrangler.toml` 里还是 `example.workers.dev` 占位符 |
-| Apify 显示成功但库里没数据 | Actor 拿不到 `apiSecret`，回传全 401。检查 `INPUT_SCHEMA.json` 是否声明了该字段，以及 Worker 是否配了 `API_SECRET` |
+| Apify run 失败，状态信息含 `ingest_failed` | 回传全部失败、零数据入库：多半是 Actor 拿不到 `apiSecret` 或鉴权被拒。检查 `INPUT_SCHEMA.json` 是否声明了该字段，以及 Worker 是否配了 `API_SECRET` / `WORKER_URL` |
 | 详情页正文空白 | R2 没绑定，或历史数据的 key 还是旧的 `html/{pk}`（代码有回落，理论不会空） |
-| 数据一直不更新 | cookie 过期。看 `/auth` 页的「上次 Apify 同步」状态 |
-| 评论被大量标记删除 | 不该发生。抓取不完整时会带 `partial`，服务端会跳过删除检测；若出现请检查 Actor 的 `paging.is_end` 判断 |
+| 数据一直不更新 | cookie 过期或被风控：Actor 被 401/403 拒绝或拿到空页，本轮零数据入库时 run 会直接 FAILED。看 `/auth` 页的「上次 Apify 同步」状态 |
+| 评论被大量标记删除 | 不该发生。抓取不完整时会带 `partial`，服务端会跳过删除检测；评论按 500 条分批提交，最后一批带全量 id 对账，分页漂移产生的重复 id 会先去重。若出现请检查 Actor 的 `paging.is_end` 判断 |
 
 ---
 
@@ -258,7 +263,7 @@ curl -X POST "https://<worker>/api/sync/full?target=all" \
 - 正文版本快照存在 R2 的 `versions/` 下，前端暂时**没有**历史版本对比界面
 - 收藏夹被彻底清空时，本地不会把旧条目标记为移除（避免权限异常导致误删）
 - Apify run 失败只在 `/auth` 页显示状态，没有主动告警
-- 搜索是 `LIKE '%keyword%'`，数据量到十万级会慢，届时需要换 FTS5
+- 搜索是 `LIKE '%keyword%'`（`%`/`_` 按字面匹配，不做通配符），数据量到十万级会慢，届时需要换 FTS5
 - `apps/api` 与 `apps/collector` 是早期实现，已不在链路里，保留只为参考
 
 ---
