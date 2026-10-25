@@ -2,7 +2,7 @@ import { db } from "../db.js";
 import { emitChange } from "./changes.js";
 import { normalizeForHash, sha256 } from "../utils/hash.js";
 import { withKeyLock } from "./lock.js";
-import { buildSearchText } from "shared";
+import { buildSearchText, safeTruncate } from "shared";
 import type { IngestContentInput } from "shared";
 
 // D1 单行正文上限：正文原文存 R2，D1 只留纯文本供检索
@@ -29,7 +29,7 @@ async function upsertContentInner(input: IngestContentInput) {
   if (!input.excerpt || input.excerpt === "null" || input.excerpt.trim() === "") {
     const raw = (rawMd || rawHtml).replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
     if (raw) {
-      input.excerpt = raw.slice(0, 300);
+      input.excerpt = safeTruncate(raw, 300);
     }
   }
 

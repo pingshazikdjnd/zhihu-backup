@@ -232,7 +232,7 @@ curl -X POST "https://<worker>/api/sync/full?target=all" \
 | `database_id` | `wrangler.toml` | ✅ | `d1 create` 返回的 UUID |
 | `WORKER_URL` | `[vars]` | ✅ | Worker 公网地址，Apify 回传用 |
 | `ZHIHU_USERNAME` | `[vars]` | ✅ | 知乎 url_token |
-| `ALLOWED_ORIGIN` | `[vars]` | 线上必填 | 前端域名，逗号分隔；留空只放行 localhost |
+| `ALLOWED_ORIGIN` | `[vars]` | 线上必填 | 前端域名，逗号分隔；留空只放行 localhost。**也是 `/auth` 保存 cookie 的硬依赖**：跨站表单写入会被 CSRF 防线拒绝，Origin 不在白名单内连自己前端也保存不了 |
 | `API_SECRET` | secret | ✅ | Apify 回传、手动触发的 Bearer |
 | `APIFY_TOKEN` | secret | ✅ | Apify API token |
 | `APIFY_ACTOR_ID` | secret | ✅ | `username~actor-name` |
@@ -275,6 +275,24 @@ curl -X POST "https://<worker>/api/sync/full?target=all" \
 - 知乎 cookie 只存在 D1，`/api/auth/zhihu-status` 只返回项数和时间，**不返回明文**
 - `/api/auth/zhihu-cookie` 默认允许网页直接提交（方便你随时换 cookie）。介意的话配一个 `COOKIE_WRITE_TOKEN`，之后需要口令才能写入
 - 如果 cookie 曾经明文落在磁盘或截图里，去知乎「退出所有设备」轮换一次，比改代码更有效
+
+---
+
+## 数据备份与恢复
+
+备份工具自己也需要备份。所有数据都可通过 CLI 完整导出（无 API 级导出端点）：
+
+```bash
+# D1 全量（schema + 数据，建议 cron 化定期执行）
+npx wrangler d1 export zhihu-backup --remote --output=backups/d1-$(date +%F).sql
+
+# R2 全量（正文原文唯一真源）：CF 后台建 R2 API Token 后用 rclone
+rclone config create r2 s3 provider=Cloudflare \
+  access_key_id=<AK> secret_access_key=<SK> endpoint=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+rclone sync r2:zhihu-backup-storage backups/r2-$(date +%F)/
+```
+
+恢复：D1 丢了就 `d1 create` 新库 → 回填 database_id → `migrations apply --remote` → `d1 execute --file=dump.sql` 回放；R2 丢了就 `rclone sync` 推回去（对象 key 可从 D1 的 content_hash/version_hash 派生，两边互为索引）。
 
 ---
 

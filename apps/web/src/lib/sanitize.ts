@@ -22,7 +22,10 @@ const CONFIG = {
 
 export function sanitizeHtml(html?: string | null): string {
   if (!html) return "";
+  // DOMPurify 不剥双向控制符（实测文本与属性双路径都原样穿透），
+  // U+202E 等可把 "gnp.exe" 视觉翻转成 "exe.png" 做展示欺骗，先剥掉再清洗
+  const stripped = html.replace(/[\u202A-\u202E\u2066-\u2069\u200E\u200F]/g, "");
   // dompurify 在启用 Trusted Types 的环境下返回 TrustedHTML，统一收敛成 string
-  const out = DOMPurify.sanitize(html, CONFIG as any);
+  const out = DOMPurify.sanitize(stripped, CONFIG as any);
   return typeof out === "string" ? out : String(out);
 }

@@ -1,5 +1,16 @@
 # 更新日志
 
+## 0.1.1（2026-10-25，未发布 tag）
+
+- **修复 Docker 构建链（P0）**：基础镜像换 `apify/actor-node-playwright:24-1.61.1`（原 `:20` 为非 root 用户，`WORKDIR /usr/src/app` 以 root 属主创建导致 npm install 必败）；`package-lock.json` 进镜像 + `npm ci`（原被 .dockerignore 排除导致 playwright 浮动漂移、镜像内浏览器下载 EACCES）；playwright 精确锁定 1.61.1（Apify 要求 tag 与依赖版本严格一致）
+- **并发正确性（P1）**：新增按 key 的进程内串行化锁接入三个写服务，消除同 pk 并发写入的静默覆盖（实测 60 并发曾丢失 48 条更新且全部响应 200）
+- **安全**：cookie 端点 CSRF 防线（跨站表单 Origin 校验）；sourceUrl 限定 http(s) 协议（zod `.url()` 原放行 `javascript:` 伪协议）；`/api/changes` 剥离 payload_json（5.4MB 匿名响应放大面）；评论悬空 contentPk 返回 404；page/limit 全量钳制
+- **数据一致性**：仅改标题的更新会真正落库；收藏项复活补发事件；空头像不再产生假更新事件；检索文本截断改为代理对安全（4 字节 emoji 在 4000 字边界不再被切裂成非法代理）
+- **性能**：新增 7 个索引（migration 0002），type 过滤深分页从 3.57s 降至 ~220ms，stats 从全表扫描降至 52ms
+- **前端**：窄屏溢出修复、错误提示提取、快照时间本地化、DOMPurify 前剥离双向控制符（RTLO 视觉欺骗面）、favicon、Pages 安全头
+- **依赖**：crawler npm 依赖 audit 修复（high 漏洞 15→5，余 5 为上游无解链且不可达）
+- **文档**：环境变量表补 CSRF 硬依赖说明；新增「数据备份与恢复」章节（D1/R2 导出与灾难恢复命令）
+
 ## 0.1.0（2026-10-25）
 
 首个交付版本。
