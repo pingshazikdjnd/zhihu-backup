@@ -590,3 +590,11 @@ button { font-family: inherit; }
   .back-fab { position: static; margin-bottom: 10px; }
   .card { padding: 14px 16px; }
 }
+
+/* ===== 窄屏适配：搜索框固定 min-width 曾把 .tab-bar 撑出 108px 横向溢出 ===== */
+@media (max-width: 640px) {
+  .tab-bar { flex-wrap: wrap; gap: 8px; padding: 8px 12px; }
+  .tab-bar .tab { white-space: nowrap; padding: 6px 10px; }
+  .tab-bar .tab-right { margin-left: 0; width: 100%; }
+  .search-input { min-width: 0; flex: 1 1 auto; }
+}

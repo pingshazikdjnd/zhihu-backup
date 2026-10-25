@@ -80,7 +80,17 @@ export default function AuthPage() {
         setNeedToken(true);
         setMsg({ type: "err", text: "这个 Worker 配置了写入口令，填上 COOKIE_WRITE_TOKEN 再提交。" });
       } else {
-        setMsg({ type: "err", text: m.slice(0, 200) || "保存失败" });
+        // api() 的错误 message 是 "400 {json}"：尽量提取里面的 error 字段，
+        // 提不到再退回原文截断
+        let text = m.slice(0, 200) || "保存失败";
+        const jsonStart = m.indexOf("{");
+        if (jsonStart >= 0) {
+          try {
+            const parsed = JSON.parse(m.slice(jsonStart));
+            if (parsed?.error) text = String(parsed.error);
+          } catch { /* 非 JSON 就用原文 */ }
+        }
+        setMsg({ type: "err", text });
       }
     } finally {
       setSaving(false);

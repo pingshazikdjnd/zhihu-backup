@@ -5,6 +5,11 @@ import { collectionsStore } from "../lib/store.js";
 
 const stripHtml = (html: string) => html ? html.replace(/<[^>]+>/g, '').substring(0, 150) + '...' : '';
 
+const fmtTime = (iso: string) => {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString("zh-CN", { hour12: false });
+};
+
 const fmtNum = (n: any) => {
   const num = Number(n) || 0;
   if (num >= 10000) return (num / 10000).toFixed(1).replace(/\.0$/, "") + " 万";
@@ -128,7 +133,7 @@ export default function CollectionDetailPage() {
           <ul className="version-list">
             {detail.snapshots.map((s: any) => (
               <li key={s.id}>
-                {s.snapshot_at} · 共 {s.item_count} 项 · <span style={{ color: "#2e7d32" }}>+{s.added_count}</span> / <span style={{ color: "var(--zhihu-red)" }}>-{s.removed_count}</span>
+                {fmtTime(s.snapshot_at)} · 共 {s.item_count} 项 · <span style={{ color: "#2e7d32" }}>+{s.added_count}</span> / <span style={{ color: "var(--zhihu-red)" }}>-{s.removed_count}</span>
               </li>
             ))}
           </ul>

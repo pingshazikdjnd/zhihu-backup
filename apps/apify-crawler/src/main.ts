@@ -417,14 +417,25 @@ export async function runCollectionScraper() {
 
       while (!cIsEnd) {
          const cRes = await context.request.get(`https://www.zhihu.com/api/v4/collections/${coll.id}/items?include=${collIncludeStr}&limit=20&offset=${cOffset}`);
-         if (!cRes.ok()) { cIncomplete = true; break; }
-         
+         if (!cRes.ok()) {
+           // 与三个成员级列表端点对齐：失败计入终态统计（此前只标 cIncomplete，
+           // items 接口被单独风控时 run 依然全绿）
+           if (cRes.status() === 401 || cRes.status() === 403) stats.authRejected++;
+           else stats.failed++;
+           cIncomplete = true;
+           break;
+         }
+
          const cJson = await cRes.json();
          // 同上：空数组不等于翻页结束，未到 is_end 时标记不完整。
          // 否则 cIsEnd 保持 false、cIncomplete 也保持 false，
          // incremental 会被算成 false，服务端就把未出现的条目全部标记移除。
          if (!cJson.data || cJson.data.length === 0) {
-           if (!cJson.paging?.is_end) cIncomplete = true;
+           if (!cJson.paging?.is_end) {
+             stats.riskEmpty++;
+             console.warn(`⚠️ 收藏夹 [${coll.title}] 条目返回空页但未到末尾，可能被风控`);
+             cIncomplete = true;
+           }
            break;
          }
          

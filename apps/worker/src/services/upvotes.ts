@@ -31,7 +31,9 @@ export async function listUpvotes(params?: { page?: number }) {
            c.voteup_count, c.comment_count, c.favorite_count, c.visit_count, c.updated_time, c.last_seen_at, c.is_deleted, u.upvote_time
     FROM upvotes u
     JOIN contents c ON u.content_pk = c.pk
-    ORDER BY u.upvote_time DESC, u.rowid DESC
+    ORDER BY u.upvote_time DESC
+    -- 不加 u.rowid DESC 次序项：它会破坏 idx_upvotes_time 的索引序、触发整段排序；
+    -- 同 upvote_time 的行间顺序无业务意义
     LIMIT ${limit} OFFSET ${offset}
   `).all();
 }
