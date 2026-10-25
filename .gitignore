@@ -20,6 +20,7 @@ data/
 # 构建产物与本地缓存
 apps/*/dist/
 apps/worker/.wrangler/
+.wrangler/
 apps/apify-crawler/dist/
 *.tsbuildinfo
 .backup-*/
