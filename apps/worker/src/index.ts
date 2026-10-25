@@ -57,8 +57,10 @@ app.route("/api/auth", authRoutes);
 // Cloudflare Cron 定时触发 Apify。
 // 这样「谁负责爬」这件事完全落在 Apify + CF 自身，前端不需要持有任何 secret。
 // 时间在 wrangler.toml 的 [triggers] 里配置（UTC）。
+// 日常定时用快速模式（isFast=true：连续 20 条无更新即停，几分钟内完成）；
+// 全量模式（从头翻完所有历史）数据量大的账号会跑几小时，只在手动触发时用。
 async function scheduledHandler(_event: any, env: Bindings, _ctx: any) {
-  const res = await triggerApifyRun(env, "all", false);
+  const res = await triggerApifyRun(env, "all", true);
   console.log("cron sync:", res.ok ? `apify run ${res.runId}` : `failed: ${res.error}`);
 }
 
