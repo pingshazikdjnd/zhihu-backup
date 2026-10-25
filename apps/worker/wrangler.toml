@@ -9,7 +9,7 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "zhihu-backup"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "bbb2772e-3921-4d73-8423-9e3eceda1157"
 migrations_dir = "./migrations"
 
 [[r2_buckets]]
@@ -19,15 +19,15 @@ bucket_name = "zhihu-backup-storage"
 [vars]
 # Apify Actor 把数据 POST 回来的地址，必须是公网可达的 workers.dev 域名。
 # 部署后拿到真实域名，回填这里再 deploy 一次。
-WORKER_URL = "https://gemini-zhihu-api.example.workers.dev"
+WORKER_URL = "https://gemini-zhihu-api.1490262644.workers.dev"
 
 # 你的知乎 url_token（个人主页 /people/<token> 里的那段）
-ZHIHU_USERNAME = "your_zhihu_token"
+ZHIHU_USERNAME = "yang-xu-heng-94"
 
 # 前端域名白名单（CORS）。必须填真实域名，否则浏览器端所有请求会被拦。
 # 多个域名用英文逗号分隔。留空 = 只放行 localhost（本地开发）。
 # 同源访问（直接打开 worker 域名）不需要 CORS，不受此限制。
-ALLOWED_ORIGIN = "https://your-frontend.pages.dev"
+ALLOWED_ORIGIN = "https://zhihu-backup.pages.dev"
 
 # 定时触发 Apify（UTC 时间）。0 2,14 * * * = 北京时间每天 10:00 / 22:00。
 # 注意：每次触发都是一次 Apify run，会产生费用，按需调整频率。
