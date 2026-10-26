@@ -650,13 +650,13 @@ export async function runUpvotesScraper() {
 
              if (!upRes.created) {
                existingCount++;
-               if (existingCount >= 20 && isFast) {
+               if (existingCount >= 20 && isFast && !upvotesCursor) {
                  console.log("🛑 连续20个赞同记录无更新，停止本轮极速同步。");
                  isEnd = true;
                  break;
                }
-               // 全量模式 + 有断点：新增段撞到已入库的，标记切换到断点
-               // （实际跳转在页尾统一处理，避免被页尾的 nextUrl 赋值覆盖）
+               // 有断点：新增段撞到已入库的，标记切换到断点继续补历史
+               // （快速/全量都走这条路径，实际跳转在页尾统一处理）
                if (existingCount >= 20 && upvotesCursor && !resuming) {
                  console.log("🔁 新增段完成（连续 20 条已存在），跳到上次断点继续补历史");
                  wantResume = true;
@@ -685,9 +685,9 @@ export async function runUpvotesScraper() {
       resuming = true;
     } else {
       nextUrl = json.paging?.next || "";
-      // 快速模式不上报：它只翻新增段，上报会把"新增段的下一页"覆盖成
-      // 历史断点，丢失补历史进度。全量模式翻到底（is_end）时清游标
-      if (!isFast) reportCursor(isEnd ? null : nextUrl);
+      // 新增段不上报（不论快速/全量）：上报会把"新增段的下一页"覆盖成
+      // 历史断点，丢失补历史进度。resuming 阶段和翻到底时才上报/清游标
+      if (resuming || !isFast) reportCursor(isEnd ? null : nextUrl);
     }
 
     if (json.data.length === 0) break;
