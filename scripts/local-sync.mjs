@@ -161,6 +161,9 @@ async function main() {
   const zhihuUsername = remoteState.zhihuUsername || process.env.ZHIHU_USERNAME || "";
   const upvotesCursor = remoteState.upvotesCursor || undefined;
   const fullModeUsers = Array.isArray(remoteState.fullModeUsers) ? remoteState.fullModeUsers : [];
+  const followedProgress = remoteState.followedProgress && typeof remoteState.followedProgress === "object"
+    ? remoteState.followedProgress
+    : undefined;
 
   if (!cookieString) {
     console.error("❌ 线上 D1 与本地均未找到知乎 Cookie，请先在网页端【凭据】页更新 Cookie");
@@ -191,7 +194,8 @@ async function main() {
     zhihuUsername,
     cookieString,
     ...(upvotesCursor ? { upvotesCursor } : {}),
-    ...(fullModeUsers.length > 0 ? { fullModeUsers } : {})
+    ...(fullModeUsers.length > 0 ? { fullModeUsers } : {}),
+    ...(followedProgress ? { followedProgress } : {})
   };
 
   fs.writeFileSync(

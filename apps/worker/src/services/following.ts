@@ -16,6 +16,10 @@ export type FollowedUserRecord = {
   last_seen_at: string;
   last_synced_at?: string | null;
   mode_updated_at?: string;
+  /** 该答主在当前 sync_mode 下的历史扫描断点 offset（0 表示从头开始） */
+  resume_offset?: number;
+  /** 该答主在当前 sync_mode 下的历史存量是否已全部扫描完毕（完毕后日常只跑头部增量） */
+  history_done?: boolean;
 };
 
 const R2_FOLLOWED_KEY = "meta/followed_users.json";
@@ -81,7 +85,9 @@ export async function getFollowedUsersMap(bucket: any): Promise<Record<string, F
           ...(d1Newer ? existing : r),
           ...(d1Newer ? r : existing),
           sync_mode: existing.sync_mode || r.sync_mode || "default",
-          mode_updated_at: existing.mode_updated_at
+          mode_updated_at: existing.mode_updated_at,
+          resume_offset: existing.resume_offset ?? 0,
+          history_done: Boolean(existing.history_done)
         };
       }
     }
@@ -131,7 +137,9 @@ export async function upsertFollowedUsersSnapshot(
       first_seen_at: prev?.first_seen_at || now,
       last_seen_at: now,
       last_synced_at: prev?.last_synced_at ?? null,
-      mode_updated_at: prev?.mode_updated_at
+      mode_updated_at: prev?.mode_updated_at,
+      resume_offset: prev?.resume_offset ?? 0,
+      history_done: Boolean(prev?.history_done)
     };
   }
 
@@ -215,8 +223,14 @@ export async function setFollowedUserSyncMode(
     return { ok: false, error: "未找到该关注用户" };
   }
   const now = new Date().toISOString();
+  const modeChanged = target.sync_mode !== syncMode;
   target.sync_mode = syncMode;
   target.mode_updated_at = now;
+  if (modeChanged && syncMode === "full") {
+    // 从默认模式切换为全量模式时，重置该答主的 history_done 标记，触发全量历史补抓
+    target.history_done = false;
+    target.resume_offset = 0;
+  }
   map[urlToken] = target;
 
   await writeR2Map(bucket, map);
@@ -238,6 +252,25 @@ export async function setFollowedUserSyncMode(
     total_zhihu_items: totalZhihu,
     planned_backup_items: syncMode === "full" ? totalZhihu : Math.min(totalZhihu, 50)
   };
+}
+
+/**
+ * 爬虫上报某位关注答主的历史扫描进度（断点 resume_offset 与是否完成历史存量扫描 history_done）
+ */
+export async function updateFollowedUserProgress(
+  bucket: any,
+  urlToken: string,
+  progress: { resumeOffset: number; historyDone: boolean }
+) {
+  const map = await getFollowedUsersMap(bucket);
+  const target = map[urlToken];
+  if (!target) return { ok: false };
+  target.resume_offset = Math.max(0, Math.trunc(Number(progress.resumeOffset) || 0));
+  target.history_done = Boolean(progress.historyDone);
+  target.last_synced_at = new Date().toISOString();
+  map[urlToken] = target;
+  await writeR2Map(bucket, map);
+  return { ok: true };
 }
 
 /**

@@ -8,7 +8,11 @@ import { upsertContent } from "../services/contents.js";
 import { replaceComments } from "../services/comments.js";
 import { upsertCollectionSnapshot } from "../services/collections.js";
 import { upsertUpvote } from "../services/upvotes.js";
-import { getFollowedUsersMap, upsertFollowedUsersSnapshot } from "../services/following.js";
+import {
+  getFollowedUsersMap,
+  updateFollowedUserProgress,
+  upsertFollowedUsersSnapshot
+} from "../services/following.js";
 import { requireSecret } from "../middleware/require-secret.js";
 import { db } from "../db.js";
 import type { Bindings } from "../types.js";
@@ -116,12 +120,38 @@ ingestRoutes.get("/sync-state", async c => {
   const fullModeUsers = Object.values(followedMap)
     .filter(u => !u.is_unfollowed && u.sync_mode === "full")
     .map(u => u.url_token);
+  const followedProgress: Record<string, { resumeOffset: number; historyDone: boolean; syncMode: "default" | "full" }> = {};
+  for (const u of Object.values(followedMap)) {
+    if (u.is_unfollowed) continue;
+    followedProgress[u.url_token] = {
+      resumeOffset: u.resume_offset ?? 0,
+      historyDone: Boolean(u.history_done),
+      syncMode: u.sync_mode === "full" ? "full" : "default"
+    };
+  }
   return c.json({
     upvotesCursor: map["upvotes_cursor"] || null,
     cookieString: map["zhihu_cookie"] || c.env.ZHIHU_COOKIE_STRING || fallbackZc0 || null,
     zhihuUsername: c.env.ZHIHU_USERNAME || null,
-    fullModeUsers
+    fullModeUsers,
+    followedProgress
   });
+});
+
+ingestRoutes.post("/followed-user-progress", async c => {
+  const body = await c.req.json().catch(() => null) as {
+    urlToken?: unknown;
+    resumeOffset?: unknown;
+    historyDone?: unknown;
+  } | null;
+  if (!body || typeof body.urlToken !== "string" || !body.urlToken) {
+    return c.json({ error: "urlToken is required" }, 400);
+  }
+  const res = await updateFollowedUserProgress(c.env.BUCKET, body.urlToken, {
+    resumeOffset: Number(body.resumeOffset) || 0,
+    historyDone: Boolean(body.historyDone)
+  });
+  return c.json(res);
 });
 
 ingestRoutes.post("/followed-users", async c => {

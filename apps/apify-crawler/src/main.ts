@@ -12,13 +12,16 @@ interface InputSchema {
     upvotesCursor?: string;
     /** 开启了「全量备份」的关注答主 url_token 列表 */
     fullModeUsers?: string[];
+    /** 每位关注答主的历史扫描进度（断点 offset 与是否已完成首次历史摸底） */
+    followedProgress?: Record<string, { resumeOffset: number; historyDone: boolean; syncMode: "default" | "full" }>;
 }
 
 await Actor.init();
 const input = await Actor.getInput<InputSchema>();
 if (!input) throw new Error("Missing input");
-const { runType, isFast, apiUrl, apiSecret, zhihuUsername, cookieString, upvotesCursor, fullModeUsers } = input;
+const { runType, isFast, apiUrl, apiSecret, zhihuUsername, cookieString, upvotesCursor, fullModeUsers, followedProgress } = input;
 const fullModeSet = new Set(Array.isArray(fullModeUsers) ? fullModeUsers : []);
+const followedProgMap = followedProgress && typeof followedProgress === "object" ? followedProgress : {};
 
 // 失败上报：所有异常都被吞掉的爬虫在 Apify 上永远显示 SUCCEEDED，
 // cookie 失效后零数据入库也毫无感知。这里集中统计，结束时据此决定 run 状态。
@@ -959,32 +962,57 @@ export async function runFollowingScraper(onlyList = false) {
     };
   }
 
+  const reportUserProgress = (urlToken: string, resumeOffset: number, historyDone: boolean) =>
+    post("/ingest/followed-user-progress", { urlToken, resumeOffset, historyDone }).catch(() => {});
+
   for (const u of sortedUsers) {
     if (stats.circuitBroken) break;
     if (u.answerCount <= 0 && u.articlesCount <= 0) continue;
 
     const isUserFull = fullModeSet.has(u.urlToken);
+    const prog = followedProgMap[u.urlToken] || { resumeOffset: 0, historyDone: false };
+    const isHistoryDone = Boolean(prog.historyDone);
+
+    // 核心分流逻辑：
+    // - 若该答主已完成首次历史存量扫描（historyDone === true）且当前为日常快速同步（isFast === true）：
+    //   只从最新第 1 页（offset=0, sort_by=created）往后看，遇到连续已存在记录（碰到上次的标记点）立即停止！
+    // - 若该答主尚未完成首次历史存量扫描（historyDone === false）或手动跑全量（!isFast）：
+    //   - 默认模式：扫描最新 60 篇 + 最高赞 60 篇，自动抢救所有高危/精品回答，扫完即标 historyDone = true；
+    //   - 全量模式：先看第 1 页最新增量，然后直接从上次保存的断点 prog.resumeOffset 继续往后抓全量，每页更新断点，抓到底标 historyDone = true！
+    const onlyIncrementalNow = isFast && isHistoryDone;
+
     console.log(
-      `👤 同步关注答主 [${u.name}] (${isUserFull ? `全量模式 · 共 ${u.answerCount} 回答 + ${u.articlesCount} 文章` : `智能风险抢救模式 · 扫描并自动备份高危易和谐/精品回答`})...`
+      `👤 同步关注答主 [${u.name}] (${
+        onlyIncrementalNow
+          ? "日常增量 · 扫描最新动态至上次标记点"
+          : isUserFull
+          ? `全量断点续传 · 从第 ${prog.resumeOffset || 0} 篇继续 (共 ${u.answerCount} 回答)`
+          : "首次历史摸底 · 扫描最新+最高赞并自动抢救高危/精品回答"
+      })...`
     );
 
-    // 1. 抓取回答：
-    // - 全量模式：抓取该答主全部回答
-    // - 智能风险抢救模式（默认）：扫描最新回答 + 最高赞回答（最多扫描 100 篇，只把命中「高危易和谐」或「深度精品」的回答写入 D1/R2，兼顾容量与质量！）
+    let completedAllPlans = true;
+
     if (u.answerCount > 0 && !stats.circuitBroken) {
-      const plans: Array<{ sortBy: "created" | "voteups"; maxScan: number; earlyStop: number }> = isUserFull
-        ? [{ sortBy: "created", maxScan: 100000, earlyStop: isFast ? 15 : 999999 }]
-        : isFast
-        ? [{ sortBy: "created", maxScan: 40, earlyStop: 8 }]
-        : [
-            { sortBy: "created", maxScan: 60, earlyStop: 999999 },
-            { sortBy: "voteups", maxScan: 60, earlyStop: 999999 }
-          ];
+      const plans: Array<{ sortBy: "created" | "voteups"; startOffset: number; maxScan: number; earlyStop: number; trackResume: boolean }> =
+        onlyIncrementalNow
+          ? [{ sortBy: "created", startOffset: 0, maxScan: 40, earlyStop: 5, trackResume: false }]
+          : isUserFull
+          ? [
+              ...(prog.resumeOffset > 0
+                ? [{ sortBy: "created" as const, startOffset: 0, maxScan: 20, earlyStop: 5, trackResume: false }]
+                : []),
+              { sortBy: "created" as const, startOffset: prog.resumeOffset || 0, maxScan: 100000, earlyStop: 999999, trackResume: true }
+            ]
+          : [
+              { sortBy: "created", startOffset: 0, maxScan: 60, earlyStop: 999999, trackResume: false },
+              { sortBy: "voteups", startOffset: 0, maxScan: 60, earlyStop: 999999, trackResume: false }
+            ];
 
       let savedForUser = 0;
       for (const plan of plans) {
-        if (stats.circuitBroken) break;
-        let aOffset = 0;
+        if (stats.circuitBroken) { completedAllPlans = false; break; }
+        let aOffset = plan.startOffset;
         let aIsEnd = false;
         let unchanged = 0;
 
@@ -993,10 +1021,11 @@ export async function runFollowingScraper(onlyList = false) {
           const aRes = await context.request.get(
             `https://www.zhihu.com/api/v4/members/${u.urlToken}/answers?include=${includeStr}&limit=${batchLimit}&offset=${aOffset}&sort_by=${plan.sortBy}`
           );
-          if (!aRes.ok()) break;
+          if (!aRes.ok()) { completedAllPlans = false; break; }
           const aJson = await aRes.json();
           if (!aJson.data || aJson.data.length === 0) break;
 
+          let pageFailed = false;
           for (const item of aJson.data) {
             if (!item?.id) continue;
             const cleanedHtml = cleanHtml(item.content);
@@ -1048,13 +1077,23 @@ export async function runFollowingScraper(onlyList = false) {
                 unchanged = 0;
               }
             } catch (err: any) {
+              pageFailed = true;
+              completedAllPlans = false;
               console.error(`❌ 保存关注答主回答失败: ${err.message}`);
               if (stats.circuitBroken) break;
             }
           }
 
+          if (pageFailed || stats.circuitBroken) {
+            completedAllPlans = false;
+            break;
+          }
+
           if (!aIsEnd) aIsEnd = Boolean(aJson.paging?.is_end);
           aOffset += batchLimit;
+          if (plan.trackResume && !aIsEnd) {
+            await reportUserProgress(u.urlToken, aOffset, false);
+          }
           await new Promise(r => setTimeout(r, 500));
         }
       }
@@ -1122,6 +1161,7 @@ export async function runFollowingScraper(onlyList = false) {
               unchanged = 0;
             }
           } catch (err: any) {
+            completedAllPlans = false;
             console.error(`❌ 保存关注答主文章失败: ${err.message}`);
             if (stats.circuitBroken) break;
           }
@@ -1131,6 +1171,10 @@ export async function runFollowingScraper(onlyList = false) {
         artOffset += batchLimit;
         await new Promise(r => setTimeout(r, 500));
       }
+    }
+
+    if (completedAllPlans && !stats.circuitBroken && !isHistoryDone) {
+      await reportUserProgress(u.urlToken, 0, true);
     }
   }
 
