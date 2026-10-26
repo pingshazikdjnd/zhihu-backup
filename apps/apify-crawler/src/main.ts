@@ -217,20 +217,20 @@ export async function runScraper() {
         const dbRes = await sendContent(contentInput);
         console.log(`✅ 保存回答: ${contentInput.title}`);
         
-        if (!dbRes.created && !dbRes.changed) {
+        const needComments = contentInput.commentCount > 0 && contentInput.commentCount > (dbRes.prevCommentCount || 0);
+        if (needComments) {
+          console.log(`💬 发现待备份/更新评论 (${dbRes.prevCommentCount || 0} -> ${contentInput.commentCount})，加入抓取队列`);
+          pendingCommentsQueue.push({ answerId: String(item.id), url: contentInput.sourceUrl });
+          existingCount = 0;
+        } else if (!dbRes.created && !dbRes.changed) {
           existingCount++;
           if (existingCount >= 20 && isFast) {
-            console.log("🛑 连续20个条目无更新，停止本轮极速同步。");
+            console.log("🛑 连续20个条目及评论均无更新，停止本轮极速同步。");
             isEnd = true;
             break;
           }
         } else {
           existingCount = 0;
-        }
-        
-        if (contentInput.commentCount > 0 && contentInput.commentCount > (dbRes.prevCommentCount || 0)) {
-          console.log(`💬 发现新评论 (${dbRes.prevCommentCount} -> ${contentInput.commentCount})，加入抓取队列`);
-          pendingCommentsQueue.push({ answerId: String(item.id), url: contentInput.sourceUrl });
         }
       } catch (err: any) {
         console.error(`❌ 保存回答失败: ${err.message}`);
@@ -390,6 +390,87 @@ export async function runScraper() {
   await browser.close();
 }
 
+/**
+ * 为收藏夹/赞同/关注答主的回答或文章抓取前 1 页（20条）高赞置顶热评与内联子评论回复。
+ * 这样既能把收藏/赞同回答下最精华的神评、答主补充和反转现场保存下来，
+ * 又不会因为万评热帖翻几百页触发知乎风控或撑爆免费 D1 每日 100K 写入限额。
+ */
+async function syncHotCommentsForContent(
+  context: any,
+  sourceType: "answer" | "article" | "pin",
+  sourceId: string
+) {
+  if (sourceType !== "answer" && sourceType !== "article") return;
+  if (stats.circuitBroken) return;
+
+  const endpointType = sourceType === "article" ? "articles" : "answers";
+  try {
+    const cRes = await context.request.get(
+      `https://www.zhihu.com/api/v4/${endpointType}/${sourceId}/root_comments?limit=20&offset=0`
+    );
+    if (!cRes.ok()) return;
+    const cJson = await cRes.json();
+    if (!cJson.data || cJson.data.length === 0) return;
+
+    const hotComments: any[] = [];
+    for (const c of cJson.data) {
+      let imgUrl = "";
+      let textContent = c.content || "";
+      const imgMatch = textContent.match(/<a[^>]+href="([^"]+)"[^>]*>.*?查看图片.*?<\/a>/i);
+      if (imgMatch) {
+        imgUrl = imgMatch[1];
+        textContent = textContent.replace(imgMatch[0], "").trim();
+      }
+      hotComments.push({
+        id: String(c.id),
+        parentId: c.reply_to_comment_id ? String(c.reply_to_comment_id) : null,
+        author: c.author?.member?.name || "匿名",
+        authorAvatar: c.author?.member?.avatar_url || "",
+        beReplied: null,
+        content: cleanHtml(textContent),
+        img: imgUrl,
+        time: toIsoOrNull(c.created_time),
+        location: c.address_text || "",
+        likes: c.vote_count || c.reaction?.statistics?.like_count || 0,
+        isAuthor: c.is_author === true || c.is_author === 1 || c.author?.role === "author",
+        isTop: c.top === true || c.top === 1,
+        isFeatured: c.featured === true || c.featured === 1
+      });
+
+      if (Array.isArray(c.child_comments)) {
+        for (const child of c.child_comments) {
+          hotComments.push({
+            id: String(child.id),
+            parentId: String(c.id),
+            author: child.author?.member?.name || "匿名",
+            authorAvatar: child.author?.member?.avatar_url || "",
+            beReplied: child.reply_to_author?.member?.name || null,
+            content: cleanHtml(child.content),
+            img: "",
+            time: toIsoOrNull(child.created_time),
+            location: child.address_text || "",
+            likes: child.vote_count || child.reaction?.statistics?.like_count || 0,
+            isAuthor: child.is_author === true || child.is_author === 1 || child.author?.role === "author",
+            isTop: child.top === true || child.top === 1,
+            isFeatured: child.featured === true || child.featured === 1
+          });
+        }
+      }
+    }
+
+    if (hotComments.length > 0) {
+      const uniqueMap = new Map(hotComments.map(c => [c.id, c] as const));
+      await sendComments({
+        contentPk: `${sourceType}:${sourceId}`,
+        comments: [...uniqueMap.values()],
+        partial: true
+      });
+    }
+  } catch (e: any) {
+    console.warn(`⚠️ 抓取精选热评跳过 (${sourceType}:${sourceId}): ${e?.message || e}`);
+  }
+}
+
 export async function runCollectionScraper() {
   const browser = await setupBrowser();
   console.log("🚀 开始知乎收藏夹自动同步...");
@@ -523,10 +604,14 @@ export async function runCollectionScraper() {
               };
               try {
                 const dbRes = await sendContent(contentInput);
-                if (!dbRes.created && !dbRes.changed) {
+                const needHotComments = contentInput.commentCount > 0 && (dbRes.prevCommentCount || 0) === 0;
+                if (needHotComments && !stats.circuitBroken) {
+                  await syncHotCommentsForContent(context, item.type as "answer" | "article" | "pin", String(item.id));
+                }
+                if (!dbRes.created && !dbRes.changed && !needHotComments) {
                   existingCount++;
                   if (existingCount >= 20 && isFast) {
-                    console.log("🛑 连续20个收藏条目无更新，停止本收藏夹的极速同步。");
+                    console.log("🛑 连续20个收藏条目及评论均无更新，停止本收藏夹的极速同步。");
                     cIsEnd = true;
                     break;
                   }
@@ -705,6 +790,9 @@ export async function runUpvotesScraper() {
       try {
         const pk = await sendContent(contentInput);
         if (pk) {
+           if (contentInput.commentCount > 0 && (pk.prevCommentCount || 0) === 0 && !stats.circuitBroken) {
+             await syncHotCommentsForContent(context, sourceType, sourceId);
+           }
            const upvoteTime = toIsoOrNull(item.created_time);
            // created_time 缺失时为空串：/ingest/upvote 对空串返回 400，
            // 整条赞同上报会失败——内容已入库，跳过时间戳上报即可
@@ -1078,6 +1166,9 @@ export async function runFollowingScraper(onlyList = false) {
 
             try {
               const dbRes = await sendContent(contentInput);
+              if (contentInput.commentCount > 0 && (dbRes.prevCommentCount || 0) === 0 && !stats.circuitBroken) {
+                await syncHotCommentsForContent(context, "answer", String(item.id));
+              }
               savedForUser++;
               if (!dbRes.created && !dbRes.changed) {
                 unchanged++;

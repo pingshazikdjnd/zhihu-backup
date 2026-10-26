@@ -277,18 +277,26 @@ async function upsertContentInner(input: IngestContentInput) {
       });
 
       let prevCommentCount = existing.comment_count;
-      const hasUnmigratedComments = await db.prepare(`SELECT 1 FROM comments WHERE content_pk = ? AND author_avatar IS NULL LIMIT 1`).get(pk);
-      if (hasUnmigratedComments) {
-        prevCommentCount = 0; // Force sync comments to populate new fields
+      if (prevCommentCount > 0) {
+        const cStat = await db.prepare(
+          `SELECT COUNT(*) AS cnt, SUM(CASE WHEN author_avatar IS NULL THEN 1 ELSE 0 END) AS unmigrated FROM comments WHERE content_pk = ?`
+        ).get<{ cnt: number; unmigrated: number }>(pk);
+        if (!cStat || Number(cStat.cnt) === 0 || Number(cStat.unmigrated) > 0) {
+          prevCommentCount = 0; // comments 表中尚无评论或存在旧格式评论，强制返回 0 触发爬虫补抓
+        }
       }
 
       return { pk, changed: true, created: false, prevCommentCount, hash: contentHash };
     }
 
     let prevCommentCount = existing.comment_count;
-    const hasUnmigratedComments = await db.prepare(`SELECT 1 FROM comments WHERE content_pk = ? AND author_avatar IS NULL LIMIT 1`).get(pk);
-    if (hasUnmigratedComments) {
-      prevCommentCount = 0; // Force sync comments to populate new fields
+    if (prevCommentCount > 0) {
+      const cStat = await db.prepare(
+        `SELECT COUNT(*) AS cnt, SUM(CASE WHEN author_avatar IS NULL THEN 1 ELSE 0 END) AS unmigrated FROM comments WHERE content_pk = ?`
+      ).get<{ cnt: number; unmigrated: number }>(pk);
+      if (!cStat || Number(cStat.cnt) === 0 || Number(cStat.unmigrated) > 0) {
+        prevCommentCount = 0; // comments 表中尚无评论或存在旧格式评论，强制返回 0 触发爬虫补抓
+      }
     }
 
     await db.prepare(`
