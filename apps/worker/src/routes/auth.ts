@@ -47,6 +47,12 @@ function authorizeWrite(c: any): { ok: boolean } {
     if (allowed.includes(origin) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
       return { ok: true };
     }
+    for (const item of allowed) {
+      if (item.startsWith("https://") && item.endsWith(".pages.dev")) {
+        const host = item.slice("https://".length);
+        if (origin.startsWith("https://") && origin.endsWith(`.${host}`)) return { ok: true };
+      }
+    }
     return { ok: false };
   }
 

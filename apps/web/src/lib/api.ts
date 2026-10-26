@@ -1,9 +1,14 @@
-// 生产环境：部署时通过 VITE_API_BASE 指定 Cloudflare Worker 域名。
-// 开发环境：默认打到本地 Node API 的 3001。
-// 原来的兜底是 8787（wrangler dev 端口），本地 API 在 3001，两边都对不上。
-const API_BASE =
-  import.meta.env.VITE_API_BASE ||
-  (import.meta.env.DEV ? "http://127.0.0.1:3001" : "");
+// 生产环境：若部署在 Cloudflare Pages (*.pages.dev)，优先走同源 /api/*（由 Pages _worker.js
+// 通过 Service Binding 内部直连 Worker，彻底绕开国内对 *.workers.dev 的 DNS 污染且免去 CORS 预检）；
+// 其余自定义域名则使用 VITE_API_BASE。开发环境默认打到本地 3001。
+function resolveApiBase(): string {
+  if (typeof window !== "undefined" && window.location.hostname.endsWith(".pages.dev")) {
+    return "";
+  }
+  return import.meta.env.VITE_API_BASE || (import.meta.env.DEV ? "http://127.0.0.1:3001" : "");
+}
+
+const API_BASE = resolveApiBase();
 
 // AbortSignal.timeout 需要 Chrome 103+ / Safari 16+，老浏览器没有这个方法，
 // 直接调用会 TypeError 让整个 api() 挂掉，这里做降级。
@@ -21,7 +26,7 @@ function timeoutSignal(): AbortSignal | undefined {
 }
 
 export async function api<T>(path: string, options?: RequestInit): Promise<T> {
-  if (!API_BASE) {
+  if (API_BASE === "" && typeof window !== "undefined" && !window.location.hostname.endsWith(".pages.dev")) {
     throw new Error("VITE_API_BASE is not configured for this build");
   }
 
@@ -38,5 +43,3 @@ export async function api<T>(path: string, options?: RequestInit): Promise<T> {
 
   return res.json();
 }
-
-export { API_BASE };

@@ -25,6 +25,13 @@ app.use("*", cors({
       .map(s => s.trim())
       .filter(Boolean);
     if (allowed.includes(origin)) return origin;
+    // 允许配置的 *.pages.dev 主域名对应的 Cloudflare Pages 预览子域名（如 https://172f1bdd.zhihu-backup.pages.dev）
+    for (const item of allowed) {
+      if (item.startsWith("https://") && item.endsWith(".pages.dev")) {
+        const host = item.slice("https://".length);
+        if (origin.startsWith("https://") && origin.endsWith(`.${host}`)) return origin;
+      }
+    }
     // 本地开发
     if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return origin;
     return undefined;
