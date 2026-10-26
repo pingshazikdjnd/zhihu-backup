@@ -66,10 +66,11 @@ export async function triggerApifyRun(
 
   let res: Response;
   try {
-    // timeout=4h：默认 1 小时在首次全量（数千回答/赞同的老账号）不够用，
-    // 超时会被强杀（实测 3600s 死在赞同段中段）
+    // timeout=12h：默认 1 小时在首次全量（数千回答/赞同的老账号）不够用。
+    // 实测赞同段 ~1.65s/条且每次 run 从头翻页（重复段必须先过一遍），
+    // 4h 只能推进 ~8700 条、进度会被重复成本卡死；12h 一次翻到底
     res = await fetch(
-      `https://api.apify.com/v2/acts/${env.APIFY_ACTOR_ID}/runs?token=${env.APIFY_TOKEN}&timeout=14400`,
+      `https://api.apify.com/v2/acts/${env.APIFY_ACTOR_ID}/runs?token=${env.APIFY_TOKEN}&timeout=43200`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
