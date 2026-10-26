@@ -12,8 +12,8 @@ interface InputSchema {
     upvotesCursor?: string;
     /** 开启了「全量备份」的关注答主 url_token 列表 */
     fullModeUsers?: string[];
-    /** 每位关注答主的历史扫描进度（断点 offset 与是否已完成首次历史摸底） */
-    followedProgress?: Record<string, { resumeOffset: number; historyDone: boolean; syncMode: "default" | "full" }>;
+    /** 每位关注答主的历史扫描进度（断点 offset、是否已完成首次历史摸底、上次最新回答标记点） */
+    followedProgress?: Record<string, { resumeOffset: number; historyDone: boolean; syncMode: "default" | "full"; lastCheckedAnswerId?: string }>;
 }
 
 await Actor.init();
@@ -962,16 +962,18 @@ export async function runFollowingScraper(onlyList = false) {
     };
   }
 
-  const reportUserProgress = (urlToken: string, resumeOffset: number, historyDone: boolean) =>
-    post("/ingest/followed-user-progress", { urlToken, resumeOffset, historyDone }).catch(() => {});
+  const reportUserProgress = (urlToken: string, resumeOffset: number, historyDone: boolean, lastCheckedAnswerId?: string) =>
+    post("/ingest/followed-user-progress", { urlToken, resumeOffset, historyDone, lastCheckedAnswerId }).catch(() => {});
 
   for (const u of sortedUsers) {
     if (stats.circuitBroken) break;
     if (u.answerCount <= 0 && u.articlesCount <= 0) continue;
 
     const isUserFull = fullModeSet.has(u.urlToken);
-    const prog = followedProgMap[u.urlToken] || { resumeOffset: 0, historyDone: false };
+    const prog = followedProgMap[u.urlToken] || { resumeOffset: 0, historyDone: false, lastCheckedAnswerId: "" };
     const isHistoryDone = Boolean(prog.historyDone);
+    const lastMarkAnswerId = String(prog.lastCheckedAnswerId || "");
+    let newestSeenAnswerId = "";
 
     // 核心分流逻辑：
     // - 若该答主已完成首次历史存量扫描（historyDone === true）且当前为日常快速同步（isFast === true）：
@@ -1028,6 +1030,16 @@ export async function runFollowingScraper(onlyList = false) {
           let pageFailed = false;
           for (const item of aJson.data) {
             if (!item?.id) continue;
+            const itemIdStr = String(item.id);
+            if (plan.sortBy === "created" && aOffset === 0 && !newestSeenAnswerId) {
+              newestSeenAnswerId = itemIdStr;
+            }
+            // 阶段二日常增量：一旦撞到上次扫描记录的最新回答标记点 lastMarkAnswerId，立即停下（哪怕中间跳过了水贴也能精确停住，0 次多余数据库写入！）
+            if (onlyIncrementalNow && lastMarkAnswerId && itemIdStr === lastMarkAnswerId) {
+              aIsEnd = true;
+              break;
+            }
+
             const cleanedHtml = cleanHtml(item.content);
 
             if (!isUserFull) {
@@ -1173,8 +1185,8 @@ export async function runFollowingScraper(onlyList = false) {
       }
     }
 
-    if (completedAllPlans && !stats.circuitBroken && !isHistoryDone) {
-      await reportUserProgress(u.urlToken, 0, true);
+    if (completedAllPlans && !stats.circuitBroken && (!isHistoryDone || (newestSeenAnswerId && newestSeenAnswerId !== lastMarkAnswerId))) {
+      await reportUserProgress(u.urlToken, 0, true, newestSeenAnswerId || lastMarkAnswerId || undefined);
     }
   }
 

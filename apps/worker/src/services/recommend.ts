@@ -297,21 +297,35 @@ export async function assessContentWithWorkersAI(env: Bindings, pk: string) {
   let modelUsed = "rule-fallback";
 
   if (env.AI) {
+    // 优先使用原生中文旗舰/高性价比模型：
+    // 1. qwen3-30b-a3b-fp8（阿里千问3 30B MoE，3B激活参数，中文互联网语境极强且免费Neurons消耗极低）
+    // 2. deepseek-v4.1-flash-1017（DeepSeek V4.1 Flash，中文推理犀利）
+    // 3. glm-5.3-flash（智谱 GLM-5.3 Flash，中文原生模型）
+    // 4. llama-3.3-70b-instruct-fp8-fast（70B 大参数兜底）
     const models = [
-      "@cf/qwen/qwen1.5-14b-chat-awq",
-      "@cf/meta/llama-3.1-8b-instruct-fast",
-      "@cf/meta/llama-3-8b-instruct"
+      "@cf/qwen/qwen3-30b-a3b-fp8",
+      "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+      "@cf/zai-org/glm-5.3-flash",
+      "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      "@cf/meta/llama-3.1-8b-instruct-fp8"
     ];
     for (const m of models) {
       try {
         const resp = await env.AI.run(m, {
           messages: [
-            { role: "system", content: "你擅长分析中文互联网文章的审查和谐风险与核心价值，回答简明扼要。" },
+            { role: "system", content: "你擅长分析中文互联网文章的审查和谐风险与核心价值，回答简明扼要，直接输出三点结论，不要输出多余寒暄。" },
             { role: "user", content: prompt }
           ],
-          max_tokens: 320
+          max_tokens: 360
         });
-        const text = typeof resp?.response === "string" ? resp.response.trim() : "";
+        const rawText =
+          typeof resp?.response === "string"
+            ? resp.response
+            : typeof resp?.choices?.[0]?.message?.content === "string"
+            ? resp.choices[0].message.content
+            : "";
+        // 剥离可能的 <think>...</think> 思考块，只留最终精炼结论
+        const text = rawText.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
         if (text) {
           aiText = text;
           modelUsed = m;

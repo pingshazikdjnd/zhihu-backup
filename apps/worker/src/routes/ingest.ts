@@ -120,13 +120,14 @@ ingestRoutes.get("/sync-state", async c => {
   const fullModeUsers = Object.values(followedMap)
     .filter(u => !u.is_unfollowed && u.sync_mode === "full")
     .map(u => u.url_token);
-  const followedProgress: Record<string, { resumeOffset: number; historyDone: boolean; syncMode: "default" | "full" }> = {};
+  const followedProgress: Record<string, { resumeOffset: number; historyDone: boolean; syncMode: "default" | "full"; lastCheckedAnswerId?: string }> = {};
   for (const u of Object.values(followedMap)) {
     if (u.is_unfollowed) continue;
     followedProgress[u.url_token] = {
       resumeOffset: u.resume_offset ?? 0,
       historyDone: Boolean(u.history_done),
-      syncMode: u.sync_mode === "full" ? "full" : "default"
+      syncMode: u.sync_mode === "full" ? "full" : "default",
+      lastCheckedAnswerId: u.last_checked_answer_id || ""
     };
   }
   return c.json({
@@ -143,13 +144,15 @@ ingestRoutes.post("/followed-user-progress", async c => {
     urlToken?: unknown;
     resumeOffset?: unknown;
     historyDone?: unknown;
+    lastCheckedAnswerId?: unknown;
   } | null;
   if (!body || typeof body.urlToken !== "string" || !body.urlToken) {
     return c.json({ error: "urlToken is required" }, 400);
   }
   const res = await updateFollowedUserProgress(c.env.BUCKET, body.urlToken, {
     resumeOffset: Number(body.resumeOffset) || 0,
-    historyDone: Boolean(body.historyDone)
+    historyDone: Boolean(body.historyDone),
+    lastCheckedAnswerId: typeof body.lastCheckedAnswerId === "string" ? body.lastCheckedAnswerId : undefined
   });
   return c.json(res);
 });

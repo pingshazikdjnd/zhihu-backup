@@ -20,6 +20,8 @@ export type FollowedUserRecord = {
   resume_offset?: number;
   /** 该答主在当前 sync_mode 下的历史存量是否已全部扫描完毕（完毕后日常只跑头部增量） */
   history_done?: boolean;
+  /** 上次扫描时看到的该答主最新一篇回答 ID（阶段二日常增量直接扫到此标记点即停，0 多余写入） */
+  last_checked_answer_id?: string;
 };
 
 const R2_FOLLOWED_KEY = "meta/followed_users.json";
@@ -87,7 +89,8 @@ export async function getFollowedUsersMap(bucket: any): Promise<Record<string, F
           sync_mode: existing.sync_mode || r.sync_mode || "default",
           mode_updated_at: existing.mode_updated_at,
           resume_offset: existing.resume_offset ?? 0,
-          history_done: Boolean(existing.history_done)
+          history_done: Boolean(existing.history_done),
+          last_checked_answer_id: existing.last_checked_answer_id || ""
         };
       }
     }
@@ -139,7 +142,8 @@ export async function upsertFollowedUsersSnapshot(
       last_synced_at: prev?.last_synced_at ?? null,
       mode_updated_at: prev?.mode_updated_at,
       resume_offset: prev?.resume_offset ?? 0,
-      history_done: Boolean(prev?.history_done)
+      history_done: Boolean(prev?.history_done),
+      last_checked_answer_id: prev?.last_checked_answer_id || ""
     };
   }
 
@@ -260,13 +264,16 @@ export async function setFollowedUserSyncMode(
 export async function updateFollowedUserProgress(
   bucket: any,
   urlToken: string,
-  progress: { resumeOffset: number; historyDone: boolean }
+  progress: { resumeOffset: number; historyDone: boolean; lastCheckedAnswerId?: string }
 ) {
   const map = await getFollowedUsersMap(bucket);
   const target = map[urlToken];
   if (!target) return { ok: false };
   target.resume_offset = Math.max(0, Math.trunc(Number(progress.resumeOffset) || 0));
   target.history_done = Boolean(progress.historyDone);
+  if (progress.lastCheckedAnswerId) {
+    target.last_checked_answer_id = String(progress.lastCheckedAnswerId);
+  }
   target.last_synced_at = new Date().toISOString();
   map[urlToken] = target;
   await writeR2Map(bucket, map);
