@@ -585,16 +585,31 @@ button { font-family: inherit; }
 }
 @media (max-width: 640px) {
   .zhihu-nav { gap: 12px; }
-  .zhihu-nav a { font-size: 14px; }
+  /* 单字换行成竖排（"概/览"）的修正：不允许 nav 项内换行 */
+  .zhihu-nav a { font-size: 14px; white-space: nowrap; }
   .header-actions { display: none; }
   .back-fab { position: static; margin-bottom: 10px; }
   .card { padding: 14px 16px; }
 }
 
-/* ===== 窄屏适配：搜索框固定 min-width 曾把 .tab-bar 撑出 108px 横向溢出 ===== */
+/* ===== 窄屏适配（实测 375/390px）：
+   1) 搜索框固定 min-width 曾把 .tab-bar 撑出 108px 溢出
+   2) 卡片 footer 统计项 nowrap 会撑出 139px 溢出
+   3) tab/按钮 32px 不达 44px 触控标准 ===== */
 @media (max-width: 640px) {
   .tab-bar { flex-wrap: wrap; gap: 8px; padding: 8px 12px; }
-  .tab-bar .tab { white-space: nowrap; padding: 6px 10px; }
+  /* 触控目标 ≥44px（原 32px） */
+  .tab-bar .tab { white-space: nowrap; padding: 12px 10px; min-height: 44px; box-sizing: border-box; }
   .tab-bar .tab-right { margin-left: 0; width: 100%; }
-  .search-input { min-width: 0; flex: 1 1 auto; }
+  .search-input { min-width: 0; flex: 1 1 auto; padding: 10px 14px; min-height: 44px; box-sizing: border-box; }
+  .sort-chip { padding: 10px 14px; min-height: 44px; }
+
+  /* footer 允许换行：时间戳独占尾行，不再撑出横向滚动 */
+  .card-footer { flex-wrap: wrap; gap: 10px 14px; margin-top: 10px; }
+  .card-footer .footer-right { margin-left: 0; width: 100%; font-size: 12px; }
+
+  /* 表单按钮同步达触控标准 */
+  .btn-primary, .btn-ghost { min-height: 44px; }
 }
+/* 卡片兜底：超长标题/URL 不许撑破容器 */
+.card { min-width: 0; overflow-wrap: anywhere; }
