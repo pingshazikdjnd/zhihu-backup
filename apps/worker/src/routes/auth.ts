@@ -5,68 +5,75 @@ import type { Bindings } from "../types.js";
 export const authRoutes = new Hono<{ Bindings: Bindings }>();
 
 const COOKIE_KEY = "zhihu_cookie";
+const WRITE_TOKEN_KEY = "cookie_write_token";
 
 function isValidCookieString(s: string): boolean {
   // 至少要带登录态 z_c0，否则存进去也是无效的
   return /(?:^|;\s*)z_c0=[^;]+/.test(s);
 }
 
+function isOriginAllowed(c: any): boolean {
+  const origin = c.req.header("origin");
+  if (!origin) return true; // 无 Origin 的脚本直调
+  const allowed = String(c.env.ALLOWED_ORIGIN || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (allowed.includes(origin) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+    return true;
+  }
+  for (const item of allowed) {
+    if (item.startsWith("https://") && item.endsWith(".pages.dev")) {
+      const host = item.slice("https://".length);
+      if (origin.startsWith("https://") && origin.endsWith(`.${host}`)) return true;
+    }
+  }
+  return false;
+}
+
 /**
- * 写入凭据的鉴权策略（刻意做成"默认开放，可一键收紧"）：
- *
- * - 配了 `COOKIE_WRITE_TOKEN`：必须带该 token，或带 `API_SECRET`（脚本用）
- * - 没配 `COOKIE_WRITE_TOKEN`：网页可以直接提交
- *
- * 为什么默认开放：cookie 失效是低频但必须立刻处理的事，
- * 如果每次都要去 Cloudflare 后台或终端敲 secret，这个功能就没有意义了。
- *
- * 代价：任何知道 Worker 域名的人都能覆盖你库里的 cookie。
- * 介意的话执行 `npx wrangler secret put COOKIE_WRITE_TOKEN`，前端会提示你填一次。
+ * 读取当前生效的凭据页写入口令：优先读 D1 app_settings 中的在线设置值，回退到环境变量 COOKIE_WRITE_TOKEN。
  */
-function authorizeWrite(c: any): { ok: boolean } {
+async function getActiveWriteToken(c: any): Promise<string> {
+  try {
+    const row = await db.prepare(
+      `SELECT value FROM app_settings WHERE key = ?`
+    ).get<{ value: string }>(WRITE_TOKEN_KEY);
+    if (row?.value && row.value.trim()) {
+      return row.value.trim();
+    }
+  } catch {
+    // 忽略表未就绪
+  }
+  return String(c.env.COOKIE_WRITE_TOKEN || "").trim();
+}
+
+/**
+ * 写入凭据的鉴权策略：
+ * - 配了口令（D1 `cookie_write_token` 或环境变量 `COOKIE_WRITE_TOKEN`）：必须带该口令，或带 `API_SECRET`
+ * - 没配口令：校验 Origin 白名单后允许网页直接提交
+ */
+async function authorizeWrite(c: any): Promise<{ ok: boolean }> {
   const apiSecret = c.env.API_SECRET;
-  const writeToken = c.env.COOKIE_WRITE_TOKEN;
   const auth = c.req.header("authorization") || "";
 
   if (apiSecret && auth === `Bearer ${apiSecret}`) return { ok: true };
+  if (!isOriginAllowed(c)) return { ok: false };
 
+  const writeToken = await getActiveWriteToken(c);
   if (writeToken) {
     return { ok: auth === `Bearer ${writeToken}` };
   }
 
-  // CSRF 防线：默认开放只对"无 Origin 的脚本调用"保留（curl/回传脚本）。
-  // 浏览器发起的跨站表单 POST 一定带 Origin 头，且 c.req.json() 不校验
-  // Content-Type，text/plain 表单就能拼出合法 JSON——Origin 不在白名单
-  // （ALLOWED_ORIGIN + localhost）时拒绝，跨站静默覆盖/清空 cookie 就不可行了。
-  const origin = c.req.header("origin");
-  if (origin) {
-    const allowed = String(c.env.ALLOWED_ORIGIN || "")
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean);
-    if (allowed.includes(origin) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
-      return { ok: true };
-    }
-    for (const item of allowed) {
-      if (item.startsWith("https://") && item.endsWith(".pages.dev")) {
-        const host = item.slice("https://".length);
-        if (origin.startsWith("https://") && origin.endsWith(`.${host}`)) return { ok: true };
-      }
-    }
-    return { ok: false };
-  }
-
-  // 没有配置写入口令、也没有 Origin（脚本直调）→ 开放
   return { ok: true };
 }
 
 /**
  * 保存 cookie。
- * 唯一入口是网页表单；带 API_SECRET 的脚本调用也兼容，但项目里已不再提供扫码脚本。
  */
 authRoutes.post("/zhihu-cookie", async c => {
-  if (!authorizeWrite(c).ok) {
-    return c.json({ error: "Unauthorized", needToken: true }, 401);
+  if (!(await authorizeWrite(c)).ok) {
+    return c.json({ error: "密码错误或未填写操作密码", needToken: true }, 401);
   }
 
   const body = await c.req.json().catch(() => null) as { cookieString?: unknown } | null;
@@ -97,9 +104,47 @@ authRoutes.post("/zhihu-cookie", async c => {
 });
 
 /**
+ * 在线设置或修改凭据页操作密码（口令）。
+ * - 若当前已有密码（D1 或环境变量 COOKIE_WRITE_TOKEN），必须先校验 currentToken 正确才允许修改
+ * - 若当前未设密码，可直接设置初始密码
+ */
+authRoutes.post("/write-token", async c => {
+  if (!isOriginAllowed(c)) {
+    return c.json({ error: "Forbidden origin" }, 403);
+  }
+
+  const body = await c.req.json().catch(() => null) as {
+    currentToken?: unknown;
+    newToken?: unknown;
+  } | null;
+
+  const currentInput = typeof body?.currentToken === "string" ? body.currentToken.trim() : "";
+  const newToken = typeof body?.newToken === "string" ? body.newToken.trim() : "";
+
+  if (newToken.length < 4 || newToken.length > 128) {
+    return c.json({ error: "新密码长度需在 4 到 128 个字符之间" }, 400);
+  }
+
+  const activeToken = await getActiveWriteToken(c);
+  const auth = c.req.header("authorization") || "";
+  const hasApiSecret = Boolean(c.env.API_SECRET && auth === `Bearer ${c.env.API_SECRET}`);
+
+  if (activeToken && !hasApiSecret && currentInput !== activeToken) {
+    return c.json({ error: "当前密码不正确，无法修改" }, 401);
+  }
+
+  const now = new Date().toISOString();
+  await db.prepare(`
+    INSERT INTO app_settings (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(WRITE_TOKEN_KEY, newToken, now);
+
+  return c.json({ ok: true, writeTokenRequired: true, updatedAt: now });
+});
+
+/**
  * 查 Apify 最后一次 run 的状态，带 60 秒 D1 缓存。
- * 用来回答一个关键问题：cookie 到底还有没有用。
- * Apify run 因为 cookie 失效而失败时，页面就能立刻看出来，而不是等数据不更新才发现。
  */
 async function getLastApifyRun(c: any) {
   const token = c.env.APIFY_TOKEN;
@@ -154,7 +199,7 @@ async function getLastApifyRun(c: any) {
 }
 
 /**
- * 登录状态。永远不返回 cookie 明文。
+ * 登录状态。永远不返回 cookie 明文与密码明文。
  */
 authRoutes.get("/zhihu-status", async c => {
   let row: { value: string; updated_at: string } | null = null;
@@ -163,7 +208,6 @@ authRoutes.get("/zhihu-status", async c => {
       `SELECT value, updated_at FROM app_settings WHERE key = ?`
     ).get(COOKIE_KEY) as any;
   } catch (e) {
-    // migration 0001 还没 apply 时会走到这里；回落到 env
     console.error("read app_settings failed (migration applied?):", e);
   }
 
@@ -178,6 +222,8 @@ authRoutes.get("/zhihu-status", async c => {
     if (!Number.isNaN(t)) ageHours = Math.round((Date.now() - t) / 3600_000);
   }
 
+  const activeToken = await getActiveWriteToken(c);
+
   return c.json({
     hasCookie: !!value,
     source,
@@ -185,9 +231,7 @@ authRoutes.get("/zhihu-status", async c => {
     ageHours,
     cookieCount: value ? value.split(";").filter(s => s.trim()).length : 0,
     hasZC0: isValidCookieString(value),
-    // 告诉前端这个部署是否要求写入口令
-    writeTokenRequired: !!c.env.COOKIE_WRITE_TOKEN,
-    // 上一次 Apify run 的状态：失败通常意味着 cookie 已失效
+    writeTokenRequired: Boolean(activeToken),
     lastRun: await getLastApifyRun(c)
   });
 });
@@ -196,8 +240,8 @@ authRoutes.get("/zhihu-status", async c => {
  * 清除 D1 里存的 cookie（env 里的不受影响）。
  */
 authRoutes.post("/zhihu-cookie/clear", async c => {
-  if (!authorizeWrite(c).ok) {
-    return c.json({ error: "Unauthorized", needToken: true }, 401);
+  if (!(await authorizeWrite(c)).ok) {
+    return c.json({ error: "密码错误或未填写操作密码", needToken: true }, 401);
   }
   await db.prepare(`DELETE FROM app_settings WHERE key = ?`).run(COOKIE_KEY);
   return c.json({ ok: true });
