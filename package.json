@@ -3,7 +3,9 @@
   "private": true,
   "packageManager": "pnpm@10.0.0",
   "scripts": {
-    "dev:web": "pnpm --filter web dev"
+    "dev:web": "pnpm --filter web dev",
+    "sync:local": "node scripts/local-sync.mjs",
+    "sync:upvotes": "node scripts/local-sync.mjs --type=upvotes"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

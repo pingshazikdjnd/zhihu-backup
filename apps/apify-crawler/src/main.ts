@@ -572,6 +572,7 @@ export async function runUpvotesScraper() {
   let isEnd = false;
   let count = 0;
   let existingCount = 0;
+  let consecutiveFailures = 0;
 
   while (!isEnd && nextUrl) {
     const res = await context.request.get(nextUrl);
@@ -640,6 +641,7 @@ export async function runUpvotesScraper() {
 
       try {
         const pk = await sendContent(contentInput);
+        consecutiveFailures = 0;
         if (pk) {
            const upvoteTime = toIsoOrNull(item.created_time);
            // created_time 缺失时为空串：/ingest/upvote 对空串返回 400，
@@ -670,8 +672,17 @@ export async function runUpvotesScraper() {
         }
       } catch (err: any) {
         stats.failed++;
+        consecutiveFailures++;
         console.error(`❌ 保存赞同失败: ${title}`, err.message);
+        if (consecutiveFailures >= 5) {
+          console.error("🛑 连续 5 次入库失败（可能触发 D1 每日写入限额），暂停抓取并保留当前断点游标，下次从本页继续。");
+          break;
+        }
       }
+    }
+
+    if (consecutiveFailures >= 5) {
+      break;
     }
 
     console.log(`💬 已拉取并保存 ${count} 条赞同记录...`);

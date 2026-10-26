@@ -101,6 +101,20 @@ ingestRoutes.post("/upvote", async c => {
   return c.json({ success: true, ...result });
 });
 
+ingestRoutes.get("/sync-state", async c => {
+  // 供本地同步脚本拉取线上最新断点游标与网页端更新的 cookie（受 requireSecret 保护）
+  const rows = await db.prepare(
+    `SELECT key, value, updated_at FROM app_settings WHERE key IN ('upvotes_cursor', 'zhihu_cookie')`
+  ).all<{ key: string; value: string; updated_at: string }>();
+  const map: Record<string, string> = {};
+  for (const r of rows) map[r.key] = r.value;
+  return c.json({
+    upvotesCursor: map["upvotes_cursor"] || null,
+    cookieString: map["zhihu_cookie"] || c.env.ZHIHU_COOKIE_STRING || c.env.ZHIHU_COOKIE_Z_C0 || null,
+    zhihuUsername: c.env.ZHIHU_USERNAME || null
+  });
+});
+
 ingestRoutes.post("/sync-state", async c => {
   // 爬虫的断点游标上报（赞同段每翻一页存一次"下一页游标"）。
   // 上报失败在爬虫侧被吞掉（最多下次多翻一段），这里无需重语义。
