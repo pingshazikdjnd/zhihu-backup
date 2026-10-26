@@ -32,7 +32,7 @@ export default function Layout({ children }: { children: ReactNode }) {
             <NavLink to="/questions" className={({ isActive }) => isActive ? "active" : ""}>问题</NavLink>
             <NavLink to="/following" className={({ isActive }) => isActive ? "active" : ""}>关注</NavLink>
             <NavLink to="/changes" className={({ isActive }) => isActive ? "active" : ""}>变更</NavLink>
-            <NavLink to="/auth" className={({ isActive }) => isActive ? "active" : ""}>登录</NavLink>
+            <NavLink to="/settings" className={({ isActive }) => isActive ? "active" : ""}>设置</NavLink>
           </nav>
           <div className="header-actions">
             <div className="sync-dropdown">

@@ -14,14 +14,29 @@ interface InputSchema {
     fullModeUsers?: string[];
     /** 每位关注答主的历史扫描进度（断点 offset、是否已完成首次历史摸底、上次最新回答标记点） */
     followedProgress?: Record<string, { resumeOffset: number; historyDone: boolean; syncMode: "default" | "full"; lastCheckedAnswerId?: string }>;
+    /** 全局同步与评论抓取策略设置 */
+    syncConfig?: {
+      commentsMyAnswers?: "full" | "hot" | "none";
+      commentsCollections?: "full" | "hot" | "none";
+      commentsUpvotes?: "full" | "hot" | "none";
+      commentsFollowing?: "full" | "hot" | "none";
+      followingSensitivity?: "strict" | "standard" | "relaxed";
+    };
 }
 
 await Actor.init();
 const input = await Actor.getInput<InputSchema>();
 if (!input) throw new Error("Missing input");
-const { runType, isFast, apiUrl, apiSecret, zhihuUsername, cookieString, upvotesCursor, fullModeUsers, followedProgress } = input;
+const { runType, isFast, apiUrl, apiSecret, zhihuUsername, cookieString, upvotesCursor, fullModeUsers, followedProgress, syncConfig } = input;
 const fullModeSet = new Set(Array.isArray(fullModeUsers) ? fullModeUsers : []);
 const followedProgMap = followedProgress && typeof followedProgress === "object" ? followedProgress : {};
+const cfg = {
+  commentsMyAnswers: syncConfig?.commentsMyAnswers || "full",
+  commentsCollections: syncConfig?.commentsCollections || "hot",
+  commentsUpvotes: syncConfig?.commentsUpvotes || "hot",
+  commentsFollowing: syncConfig?.commentsFollowing || "hot",
+  followingSensitivity: syncConfig?.followingSensitivity || "standard"
+};
 
 // 失败上报：所有异常都被吞掉的爬虫在 Apify 上永远显示 SUCCEEDED，
 // cookie 失效后零数据入库也毫无感知。这里集中统计，结束时据此决定 run 状态。
@@ -217,7 +232,10 @@ export async function runScraper() {
         const dbRes = await sendContent(contentInput);
         console.log(`✅ 保存回答: ${contentInput.title}`);
         
-        const needComments = contentInput.commentCount > 0 && contentInput.commentCount > (dbRes.prevCommentCount || 0);
+        const needComments =
+          cfg.commentsMyAnswers !== "none" &&
+          contentInput.commentCount > 0 &&
+          contentInput.commentCount > (dbRes.prevCommentCount || 0);
         if (needComments) {
           console.log(`💬 发现待备份/更新评论 (${dbRes.prevCommentCount || 0} -> ${contentInput.commentCount})，加入抓取队列`);
           pendingCommentsQueue.push({ answerId: String(item.id), url: contentInput.sourceUrl });
@@ -266,6 +284,10 @@ export async function runScraper() {
         // 否则必须标记不完整 —— 不然服务端会把没抓到的评论全部判为已删除。
         if (!cJson.data || cJson.data.length === 0) {
           if (!cJson.paging?.is_end) cIncomplete = true;
+          break;
+        }
+        if (cfg.commentsMyAnswers === "hot" && cOffset >= 20) {
+          cIncomplete = true;
           break;
         }
         
@@ -391,83 +413,111 @@ export async function runScraper() {
 }
 
 /**
- * 为收藏夹/赞同/关注答主的回答或文章抓取前 1 页（20条）高赞置顶热评与内联子评论回复。
- * 这样既能把收藏/赞同回答下最精华的神评、答主补充和反转现场保存下来，
- * 又不会因为万评热帖翻几百页触发知乎风控或撑爆免费 D1 每日 100K 写入限额。
+ * 按设置策略（none: 不抓 / hot: 前1页20条高赞热评+内联子评论 / full: 全量分页抓取）
+ * 为收藏夹/赞同/关注答主的回答或文章抓取评论。
  */
 async function syncHotCommentsForContent(
   context: any,
   sourceType: "answer" | "article" | "pin",
-  sourceId: string
+  sourceId: string,
+  mode: "full" | "hot" | "none" = "hot"
 ) {
+  if (mode === "none") return;
   if (sourceType !== "answer" && sourceType !== "article") return;
   if (stats.circuitBroken) return;
 
   const endpointType = sourceType === "article" ? "articles" : "answers";
   try {
-    const cRes = await context.request.get(
-      `https://www.zhihu.com/api/v4/${endpointType}/${sourceId}/root_comments?limit=20&offset=0`
-    );
-    if (!cRes.ok()) return;
-    const cJson = await cRes.json();
-    if (!cJson.data || cJson.data.length === 0) return;
+    let cOffset = 0;
+    let cIsEnd = false;
+    let cIncomplete = false;
+    const allComments: any[] = [];
+    const maxPages = mode === "full" ? 200 : 1;
+    let pagesFetched = 0;
 
-    const hotComments: any[] = [];
-    for (const c of cJson.data) {
-      let imgUrl = "";
-      let textContent = c.content || "";
-      const imgMatch = textContent.match(/<a[^>]+href="([^"]+)"[^>]*>.*?查看图片.*?<\/a>/i);
-      if (imgMatch) {
-        imgUrl = imgMatch[1];
-        textContent = textContent.replace(imgMatch[0], "").trim();
+    while (!cIsEnd && pagesFetched < maxPages && !stats.circuitBroken) {
+      const cRes = await context.request.get(
+        `https://www.zhihu.com/api/v4/${endpointType}/${sourceId}/root_comments?limit=20&offset=${cOffset}`
+      );
+      if (!cRes.ok()) {
+        cIncomplete = true;
+        break;
       }
-      hotComments.push({
-        id: String(c.id),
-        parentId: c.reply_to_comment_id ? String(c.reply_to_comment_id) : null,
-        author: c.author?.member?.name || "匿名",
-        authorAvatar: c.author?.member?.avatar_url || "",
-        beReplied: null,
-        content: cleanHtml(textContent),
-        img: imgUrl,
-        time: toIsoOrNull(c.created_time),
-        location: c.address_text || "",
-        likes: c.vote_count || c.reaction?.statistics?.like_count || 0,
-        isAuthor: c.is_author === true || c.is_author === 1 || c.author?.role === "author",
-        isTop: c.top === true || c.top === 1,
-        isFeatured: c.featured === true || c.featured === 1
-      });
+      const cJson = await cRes.json();
+      if (!cJson.data || cJson.data.length === 0) {
+        if (!cJson.paging?.is_end) cIncomplete = true;
+        break;
+      }
 
-      if (Array.isArray(c.child_comments)) {
-        for (const child of c.child_comments) {
-          hotComments.push({
-            id: String(child.id),
-            parentId: String(c.id),
-            author: child.author?.member?.name || "匿名",
-            authorAvatar: child.author?.member?.avatar_url || "",
-            beReplied: child.reply_to_author?.member?.name || null,
-            content: cleanHtml(child.content),
-            img: "",
-            time: toIsoOrNull(child.created_time),
-            location: child.address_text || "",
-            likes: child.vote_count || child.reaction?.statistics?.like_count || 0,
-            isAuthor: child.is_author === true || child.is_author === 1 || child.author?.role === "author",
-            isTop: child.top === true || child.top === 1,
-            isFeatured: child.featured === true || child.featured === 1
-          });
+      for (const c of cJson.data) {
+        let imgUrl = "";
+        let textContent = c.content || "";
+        const imgMatch = textContent.match(/<a[^>]+href="([^"]+)"[^>]*>.*?查看图片.*?<\/a>/i);
+        if (imgMatch) {
+          imgUrl = imgMatch[1];
+          textContent = textContent.replace(imgMatch[0], "").trim();
+        }
+        allComments.push({
+          id: String(c.id),
+          parentId: c.reply_to_comment_id ? String(c.reply_to_comment_id) : null,
+          author: c.author?.member?.name || "匿名",
+          authorAvatar: c.author?.member?.avatar_url || "",
+          beReplied: null,
+          content: cleanHtml(textContent),
+          img: imgUrl,
+          time: toIsoOrNull(c.created_time),
+          location: c.address_text || "",
+          likes: c.vote_count || c.reaction?.statistics?.like_count || 0,
+          isAuthor: c.is_author === true || c.is_author === 1 || c.author?.role === "author",
+          isTop: c.top === true || c.top === 1,
+          isFeatured: c.featured === true || c.featured === 1
+        });
+
+        if (Array.isArray(c.child_comments)) {
+          for (const child of c.child_comments) {
+            allComments.push({
+              id: String(child.id),
+              parentId: String(c.id),
+              author: child.author?.member?.name || "匿名",
+              authorAvatar: child.author?.member?.avatar_url || "",
+              beReplied: child.reply_to_author?.member?.name || null,
+              content: cleanHtml(child.content),
+              img: "",
+              time: toIsoOrNull(child.created_time),
+              location: child.address_text || "",
+              likes: child.vote_count || child.reaction?.statistics?.like_count || 0,
+              isAuthor: child.is_author === true || child.is_author === 1 || child.author?.role === "author",
+              isTop: child.top === true || child.top === 1,
+              isFeatured: child.featured === true || child.featured === 1
+            });
+          }
         }
       }
+
+      cIsEnd = Boolean(cJson.paging?.is_end);
+      cOffset += 20;
+      pagesFetched++;
+      if (!cIsEnd && pagesFetched < maxPages) {
+        await new Promise(r => setTimeout(r, 350));
+      }
     }
 
-    if (hotComments.length > 0) {
-      const uniqueMap = new Map(hotComments.map(c => [c.id, c] as const));
-      await sendComments({
-        contentPk: `${sourceType}:${sourceId}`,
-        comments: [...uniqueMap.values()],
-        partial: true
-      });
+    if (allComments.length > 0) {
+      const uniqueMap = new Map(allComments.map(c => [c.id, c] as const));
+      const finalComments = [...uniqueMap.values()];
+      const CHUNK = 500;
+      for (let i = 0; i < finalComments.length; i += CHUNK) {
+        const isLast = i + CHUNK >= finalComments.length;
+        await sendComments({
+          contentPk: `${sourceType}:${sourceId}`,
+          comments: finalComments.slice(i, i + CHUNK),
+          partial: mode === "hot" ? true : (isLast ? (cIncomplete || !cIsEnd) : true),
+          ...(mode === "full" && isLast && cIsEnd && !cIncomplete ? { allIds: finalComments.map(c => c.id) } : {})
+        });
+      }
     }
   } catch (e: any) {
-    console.warn(`⚠️ 抓取精选热评跳过 (${sourceType}:${sourceId}): ${e?.message || e}`);
+    console.warn(`⚠️ 抓取评论跳过 (${sourceType}:${sourceId}): ${e?.message || e}`);
   }
 }
 
@@ -604,9 +654,12 @@ export async function runCollectionScraper() {
               };
               try {
                 const dbRes = await sendContent(contentInput);
-                const needHotComments = contentInput.commentCount > 0 && (dbRes.prevCommentCount || 0) === 0;
+                const needHotComments =
+                  cfg.commentsCollections !== "none" &&
+                  contentInput.commentCount > 0 &&
+                  (dbRes.prevCommentCount || 0) === 0;
                 if (needHotComments && !stats.circuitBroken) {
-                  await syncHotCommentsForContent(context, item.type as "answer" | "article" | "pin", String(item.id));
+                  await syncHotCommentsForContent(context, item.type as "answer" | "article" | "pin", String(item.id), cfg.commentsCollections);
                 }
                 if (!dbRes.created && !dbRes.changed && !needHotComments) {
                   existingCount++;
@@ -790,8 +843,13 @@ export async function runUpvotesScraper() {
       try {
         const pk = await sendContent(contentInput);
         if (pk) {
-           if (contentInput.commentCount > 0 && (pk.prevCommentCount || 0) === 0 && !stats.circuitBroken) {
-             await syncHotCommentsForContent(context, sourceType, sourceId);
+           if (
+             cfg.commentsUpvotes !== "none" &&
+             contentInput.commentCount > 0 &&
+             (pk.prevCommentCount || 0) === 0 &&
+             !stats.circuitBroken
+           ) {
+             await syncHotCommentsForContent(context, sourceType, sourceId, cfg.commentsUpvotes);
            }
            const upvoteTime = toIsoOrNull(item.created_time);
            // created_time 缺失时为空串：/ingest/upvote 对空串返回 400，
@@ -1036,11 +1094,11 @@ export async function runFollowingScraper(onlyList = false) {
       risk += 10;
     }
 
-    // 判定准则：
-    // 1. 高危且有一定内容质量（非纯一句话抖机灵）：risk >= 25 && (value >= 8 || textLen >= 150 || isCollapsed || isLabeled) -> 自动抢救备份！
-    // 2. 极高含金量深度精品：value >= 38 -> 自动精选备份！
-    const isHighRiskWorthSaving = risk >= 25 && (value >= 8 || textLen >= 150 || isCollapsed || isLabeled);
-    const isHighQuality = value >= 38;
+    // 判定准则（支持 sensitivity: strict | standard | relaxed）：
+    const riskThreshold = cfg.followingSensitivity === "strict" ? 40 : cfg.followingSensitivity === "relaxed" ? 18 : 25;
+    const valueThreshold = cfg.followingSensitivity === "strict" ? 50 : cfg.followingSensitivity === "relaxed" ? 24 : 38;
+    const isHighRiskWorthSaving = risk >= riskThreshold && (value >= 8 || textLen >= 150 || isCollapsed || isLabeled);
+    const isHighQuality = value >= valueThreshold;
 
     return {
       shouldBackup: isHighRiskWorthSaving || isHighQuality,
@@ -1166,8 +1224,13 @@ export async function runFollowingScraper(onlyList = false) {
 
             try {
               const dbRes = await sendContent(contentInput);
-              if (contentInput.commentCount > 0 && (dbRes.prevCommentCount || 0) === 0 && !stats.circuitBroken) {
-                await syncHotCommentsForContent(context, "answer", String(item.id));
+              if (
+                cfg.commentsFollowing !== "none" &&
+                contentInput.commentCount > 0 &&
+                (dbRes.prevCommentCount || 0) === 0 &&
+                !stats.circuitBroken
+              ) {
+                await syncHotCommentsForContent(context, "answer", String(item.id), cfg.commentsFollowing);
               }
               savedForUser++;
               if (!dbRes.created && !dbRes.changed) {

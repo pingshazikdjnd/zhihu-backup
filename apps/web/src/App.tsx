@@ -28,6 +28,7 @@ export default function App() {
           <Route path="/following" element={<FollowingPage />} />
           <Route path="/following/:token" element={<FollowingPage />} />
           <Route path="/changes" element={<ChangesPage />} />
+          <Route path="/settings" element={<AuthPage />} />
           <Route path="/auth" element={<AuthPage />} />
           <Route
             path="*"

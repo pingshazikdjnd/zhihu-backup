@@ -13,6 +13,7 @@ import {
   updateFollowedUserProgress,
   upsertFollowedUsersSnapshot
 } from "../services/following.js";
+import { getSyncConfig } from "./auth.js";
 import { requireSecret } from "../middleware/require-secret.js";
 import { db } from "../db.js";
 import type { Bindings } from "../types.js";
@@ -130,12 +131,14 @@ ingestRoutes.get("/sync-state", async c => {
       lastCheckedAnswerId: u.last_checked_answer_id || ""
     };
   }
+  const syncConfig = await getSyncConfig(c.env.BUCKET);
   return c.json({
     upvotesCursor: map["upvotes_cursor"] || null,
     cookieString: map["zhihu_cookie"] || c.env.ZHIHU_COOKIE_STRING || fallbackZc0 || null,
     zhihuUsername: c.env.ZHIHU_USERNAME || null,
     fullModeUsers,
-    followedProgress
+    followedProgress,
+    syncConfig
   });
 });
 

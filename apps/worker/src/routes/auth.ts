@@ -6,6 +6,97 @@ export const authRoutes = new Hono<{ Bindings: Bindings }>();
 
 const COOKIE_KEY = "zhihu_cookie";
 const WRITE_TOKEN_KEY = "cookie_write_token";
+const SYNC_CONFIG_KEY = "sync_config";
+const R2_SYNC_CONFIG_KEY = "meta/sync_config.json";
+
+export type CommentSyncMode = "full" | "hot" | "none";
+export type SyncConfig = {
+  commentsMyAnswers: CommentSyncMode;
+  commentsCollections: CommentSyncMode;
+  commentsUpvotes: CommentSyncMode;
+  commentsFollowing: CommentSyncMode;
+  followingSensitivity: "strict" | "standard" | "relaxed";
+  preferredAiModel: string;
+  updatedAt?: string | null;
+};
+
+export const DEFAULT_SYNC_CONFIG: SyncConfig = {
+  commentsMyAnswers: "full",
+  commentsCollections: "hot",
+  commentsUpvotes: "hot",
+  commentsFollowing: "hot",
+  followingSensitivity: "standard",
+  preferredAiModel: "@cf/qwen/qwen3-30b-a3b-fp8",
+  updatedAt: null
+};
+
+const VALID_COMMENT_MODES = new Set<CommentSyncMode>(["full", "hot", "none"]);
+const VALID_SENSITIVITY = new Set(["strict", "standard", "relaxed"]);
+const VALID_AI_MODELS = new Set([
+  "@cf/qwen/qwen3-30b-a3b-fp8",
+  "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+  "@cf/zai-org/glm-5.3-flash",
+  "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+]);
+
+export async function getSyncConfig(bucket: any): Promise<SyncConfig> {
+  let r2Cfg: Partial<SyncConfig> | null = null;
+  if (bucket) {
+    try {
+      const obj = await bucket.get(R2_SYNC_CONFIG_KEY);
+      if (obj) r2Cfg = JSON.parse(await obj.text());
+    } catch { /* ignore */ }
+  }
+  let d1Cfg: Partial<SyncConfig> | null = null;
+  try {
+    const row = await db.prepare(`SELECT value FROM app_settings WHERE key = ?`).get<{ value: string }>(SYNC_CONFIG_KEY);
+    if (row?.value) d1Cfg = JSON.parse(row.value);
+  } catch { /* ignore */ }
+
+  const merged = {
+    ...DEFAULT_SYNC_CONFIG,
+    ...(d1Cfg || {}),
+    ...(r2Cfg || {})
+  };
+  return {
+    commentsMyAnswers: VALID_COMMENT_MODES.has(merged.commentsMyAnswers as CommentSyncMode) ? (merged.commentsMyAnswers as CommentSyncMode) : "full",
+    commentsCollections: VALID_COMMENT_MODES.has(merged.commentsCollections as CommentSyncMode) ? (merged.commentsCollections as CommentSyncMode) : "hot",
+    commentsUpvotes: VALID_COMMENT_MODES.has(merged.commentsUpvotes as CommentSyncMode) ? (merged.commentsUpvotes as CommentSyncMode) : "hot",
+    commentsFollowing: VALID_COMMENT_MODES.has(merged.commentsFollowing as CommentSyncMode) ? (merged.commentsFollowing as CommentSyncMode) : "hot",
+    followingSensitivity: VALID_SENSITIVITY.has(merged.followingSensitivity) ? merged.followingSensitivity : "standard",
+    preferredAiModel: VALID_AI_MODELS.has(merged.preferredAiModel) ? merged.preferredAiModel : "@cf/qwen/qwen3-30b-a3b-fp8",
+    updatedAt: merged.updatedAt || null
+  };
+}
+
+export async function saveSyncConfig(bucket: any, patch: Partial<SyncConfig>): Promise<SyncConfig> {
+  const current = await getSyncConfig(bucket);
+  const now = new Date().toISOString();
+  const next: SyncConfig = {
+    commentsMyAnswers: VALID_COMMENT_MODES.has(patch.commentsMyAnswers as CommentSyncMode) ? (patch.commentsMyAnswers as CommentSyncMode) : current.commentsMyAnswers,
+    commentsCollections: VALID_COMMENT_MODES.has(patch.commentsCollections as CommentSyncMode) ? (patch.commentsCollections as CommentSyncMode) : current.commentsCollections,
+    commentsUpvotes: VALID_COMMENT_MODES.has(patch.commentsUpvotes as CommentSyncMode) ? (patch.commentsUpvotes as CommentSyncMode) : current.commentsUpvotes,
+    commentsFollowing: VALID_COMMENT_MODES.has(patch.commentsFollowing as CommentSyncMode) ? (patch.commentsFollowing as CommentSyncMode) : current.commentsFollowing,
+    followingSensitivity: VALID_SENSITIVITY.has(patch.followingSensitivity as string) ? (patch.followingSensitivity as any) : current.followingSensitivity,
+    preferredAiModel: VALID_AI_MODELS.has(patch.preferredAiModel as string) ? (patch.preferredAiModel as string) : current.preferredAiModel,
+    updatedAt: now
+  };
+
+  if (bucket) {
+    await bucket.put(R2_SYNC_CONFIG_KEY, JSON.stringify(next), {
+      httpMetadata: { contentType: "application/json; charset=utf-8" }
+    });
+  }
+  try {
+    await db.prepare(`
+      INSERT INTO app_settings (key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run(SYNC_CONFIG_KEY, JSON.stringify(next), now);
+  } catch { /* D1 每日写入限额满时由 R2 持久化 */ }
+
+  return next;
+}
 
 function isValidCookieString(s: string): boolean {
   // 至少要带登录态 z_c0，否则存进去也是无效的
@@ -223,6 +314,12 @@ authRoutes.get("/zhihu-status", async c => {
   }
 
   const activeToken = await getActiveWriteToken(c);
+  const syncConfig = await getSyncConfig(c.env.BUCKET);
+  let upvotesCursor: string | null = null;
+  try {
+    const cRow = await db.prepare(`SELECT value FROM app_settings WHERE key = 'upvotes_cursor'`).get<{ value: string }>();
+    if (cRow?.value) upvotesCursor = cRow.value;
+  } catch { /* ignore */ }
 
   return c.json({
     hasCookie: !!value,
@@ -232,8 +329,30 @@ authRoutes.get("/zhihu-status", async c => {
     cookieCount: value ? value.split(";").filter(s => s.trim()).length : 0,
     hasZC0: isValidCookieString(value),
     writeTokenRequired: Boolean(activeToken),
-    lastRun: await getLastApifyRun(c)
+    lastRun: await getLastApifyRun(c),
+    syncConfig,
+    upvotesCursor
   });
+});
+
+/**
+ * 读取与更新全局同步与评论抓取策略设置
+ */
+authRoutes.get("/settings", async c => {
+  const syncConfig = await getSyncConfig(c.env.BUCKET);
+  return c.json({ ok: true, syncConfig });
+});
+
+authRoutes.post("/settings", async c => {
+  if (!(await authorizeWrite(c)).ok) {
+    return c.json({ error: "操作密码错误或未填写，请先在设置页输入操作密码", needToken: true }, 401);
+  }
+  const body = await c.req.json().catch(() => null) as Partial<SyncConfig> | null;
+  if (!body || typeof body !== "object") {
+    return c.json({ error: "invalid body" }, 400);
+  }
+  const saved = await saveSyncConfig(c.env.BUCKET, body);
+  return c.json({ ok: true, syncConfig: saved });
 });
 
 /**

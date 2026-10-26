@@ -1,6 +1,7 @@
 import { db } from "../db.js";
 import { evaluateContentRisk } from "./risk.js";
 import { getFollowedUsersMap } from "./following.js";
+import { getSyncConfig } from "../routes/auth.js";
 import type { Bindings } from "../types.js";
 
 const FAV_JOIN = `(SELECT content_pk, MAX(first_seen_at) AS fav_added_at FROM collection_items WHERE is_removed = 0 GROUP BY content_pk)`;
@@ -297,18 +298,17 @@ export async function assessContentWithWorkersAI(env: Bindings, pk: string) {
   let modelUsed = "rule-fallback";
 
   if (env.AI) {
-    // 优先使用原生中文旗舰/高性价比模型：
-    // 1. qwen3-30b-a3b-fp8（阿里千问3 30B MoE，3B激活参数，中文互联网语境极强且免费Neurons消耗极低）
-    // 2. deepseek-v4.1-flash-1017（DeepSeek V4.1 Flash，中文推理犀利）
-    // 3. glm-5.3-flash（智谱 GLM-5.3 Flash，中文原生模型）
-    // 4. llama-3.3-70b-instruct-fp8-fast（70B 大参数兜底）
-    const models = [
+    const cfg = await getSyncConfig(env.BUCKET);
+    const defaultChain = [
       "@cf/qwen/qwen3-30b-a3b-fp8",
       "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
       "@cf/zai-org/glm-5.3-flash",
       "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
       "@cf/meta/llama-3.1-8b-instruct-fp8"
     ];
+    const models = cfg.preferredAiModel
+      ? [cfg.preferredAiModel, ...defaultChain.filter(m => m !== cfg.preferredAiModel)]
+      : defaultChain;
     for (const m of models) {
       try {
         const resp = await env.AI.run(m, {
