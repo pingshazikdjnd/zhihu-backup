@@ -8,12 +8,14 @@ interface InputSchema {
     apiSecret?: string;
     zhihuUsername: string;
     cookieString: string;
+    /** 赞同段断点游标（moments 的 paging.next）：从上次中断处继续补历史 */
+    upvotesCursor?: string;
 }
 
 await Actor.init();
 const input = await Actor.getInput<InputSchema>();
 if (!input) throw new Error("Missing input");
-const { runType, isFast, apiUrl, apiSecret, zhihuUsername, cookieString } = input;
+const { runType, isFast, apiUrl, apiSecret, zhihuUsername, cookieString, upvotesCursor } = input;
 
 // 失败上报：所有异常都被吞掉的爬虫在 Apify 上永远显示 SUCCEEDED，
 // cookie 失效后零数据入库也毫无感知。这里集中统计，结束时据此决定 run 状态。
@@ -555,7 +557,18 @@ export async function runUpvotesScraper() {
   const context = await browser.newContext();
   await context.addCookies(getCookiesArray());
 
+  // 断点续传游标上报：moments 按 paging.next（before_id 游标）向更旧翻页。
+  // 每翻完一页把"下一页游标"存到 Worker，run 无论何时中断（超时/额度/风控），
+  // 下次都从断点继续，不用从头重翻几千条已入库的动态（实测重复成本会卡死进度）。
+  // 游标到达末尾（is_end）或断点失效时上报 null 清除，下次恢复全量。
+  const reportCursor = (url: string | null) =>
+    post("/ingest/sync-state", { key: "upvotes_cursor", value: url })
+      .catch(() => { /* 上报失败不阻塞抓取：最多下次多翻一段 */ });
+
   let nextUrl = `https://www.zhihu.com/api/v3/moments/${ZHIHU_USERNAME}/activities?limit=20`;
+  // resuming=true 表示当前处于"从断点补历史"阶段（不做已存在早停）
+  let resuming = false;
+  let wantResume = false;
   let isEnd = false;
   let count = 0;
   let existingCount = 0;
@@ -565,7 +578,9 @@ export async function runUpvotesScraper() {
     if (!res.ok()) {
       console.error(`❌ 获取动态失败: API 返回状态码 ${res.status()}`);
       if (res.status() === 401 || res.status() === 403) stats.authRejected++;
-      else stats.failed++; // 中途 429/5xx 也计入终态，不再静默截断
+      else stats.failed++;
+      // 断点游标失效（知乎改版/游标过期）时清掉，下次从头全量——宁可重翻不可卡死
+      if (resuming) reportCursor(null);
       break;
     }
     const json = await res.json();
@@ -640,6 +655,14 @@ export async function runUpvotesScraper() {
                  isEnd = true;
                  break;
                }
+               // 全量模式 + 有断点：新增段撞到已入库的，标记切换到断点
+               // （实际跳转在页尾统一处理，避免被页尾的 nextUrl 赋值覆盖）
+               if (existingCount >= 20 && upvotesCursor && !resuming) {
+                 console.log("🔁 新增段完成（连续 20 条已存在），跳到上次断点继续补历史");
+                 wantResume = true;
+                 existingCount = 0;
+                 break;
+               }
              } else {
                existingCount = 0;
              }
@@ -654,7 +677,18 @@ export async function runUpvotesScraper() {
     console.log(`💬 已拉取并保存 ${count} 条赞同记录...`);
 
     if (!isEnd) isEnd = json.paging?.is_end;
-    nextUrl = json.paging?.next;
+
+    // 页尾统一决定下一页：跳断点 > 正常游标
+    if (wantResume) {
+      nextUrl = upvotesCursor as string;
+      wantResume = false;
+      resuming = true;
+    } else {
+      nextUrl = json.paging?.next || "";
+      // 快速模式不上报：它只翻新增段，上报会把"新增段的下一页"覆盖成
+      // 历史断点，丢失补历史进度。全量模式翻到底（is_end）时清游标
+      if (!isFast) reportCursor(isEnd ? null : nextUrl);
+    }
 
     if (json.data.length === 0) break;
 

@@ -54,6 +54,20 @@ export async function triggerApifyRun(
     return { ok: false, error: "ZHIHU_USERNAME is not configured" };
   }
 
+  // 赞同段断点游标：有存量的断点时注入 input，爬虫跳过已入库的新增段
+  // 直接从断点补历史（每页翻完会经 /ingest/sync-state 推进游标）
+  let upvotesCursor: string | null = null;
+  try {
+    const row = await env.DB.prepare(
+      `SELECT value FROM app_settings WHERE key = 'upvotes_cursor'`
+    ).first() as any;
+    if (typeof row?.value === "string" && row.value.startsWith("https://")) {
+      upvotesCursor = row.value;
+    }
+  } catch {
+    // app_settings 不存在（migration 未 apply）时无断点可用
+  }
+
   const payload = {
     runType,
     isFast,
@@ -61,7 +75,8 @@ export async function triggerApifyRun(
     // Actor 的 INPUT_SCHEMA 必须声明 apiSecret，否则 Apify 会剥掉该字段
     apiSecret: env.API_SECRET,
     zhihuUsername: zhihuUser,
-    cookieString: cookieStr
+    cookieString: cookieStr,
+    ...(upvotesCursor ? { upvotesCursor } : {})
   };
 
   let res: Response;

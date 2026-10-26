@@ -101,6 +101,28 @@ ingestRoutes.post("/upvote", async c => {
   return c.json({ success: true, ...result });
 });
 
+ingestRoutes.post("/sync-state", async c => {
+  // 爬虫的断点游标上报（赞同段每翻一页存一次"下一页游标"）。
+  // 上报失败在爬虫侧被吞掉（最多下次多翻一段），这里无需重语义。
+  const body = await c.req.json().catch(() => null) as { key?: unknown; value?: unknown } | null;
+  const ALLOWED_KEYS = new Set(["upvotes_cursor"]);
+  if (!body || typeof body.key !== "string" || !ALLOWED_KEYS.has(body.key)) {
+    return c.json({ error: "invalid key" }, 400);
+  }
+  if (body.value === null) {
+    await db.prepare(`DELETE FROM app_settings WHERE key = ?`).run(body.key);
+    return c.json({ ok: true, cleared: true });
+  }
+  if (typeof body.value !== "string" || !body.value.startsWith("https://")) {
+    return c.json({ error: "invalid value" }, 400);
+  }
+  await db.prepare(`
+    INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(body.key, body.value, new Date().toISOString());
+  return c.json({ ok: true });
+});
+
 ingestRoutes.post("/sync-all", async c => {
   // 云端不再本地拉起任务，统一走 /api/sync/full
   return c.json({ success: false, message: "Use /api/sync/full instead" }, 410 as any);

@@ -42,6 +42,12 @@
             "description": "Bearer token for the Cloudflare Worker /ingest endpoints. Must match API_SECRET in the Worker. Leave empty only for local testing.",
             "editor": "textfield",
             "isSecret": true
+        },
+        "upvotesCursor": {
+            "title": "Upvotes Resume Cursor",
+            "type": "string",
+            "description": "Internal: moments paging.next cursor from the last interrupted run. Injected automatically by the Worker; do not set manually.",
+            "editor": "textfield"
         }
     },
     "required": ["apiUrl", "zhihuUsername", "cookieString"]
