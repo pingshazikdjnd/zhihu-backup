@@ -342,9 +342,9 @@ export async function listContents(params: { type?: string; q?: string; author?:
 
   const orderBy =
     params.sort === "vote"
-      ? `c.voteup_count DESC, COALESCE(NULLIF(c.created_time, ''), NULLIF(c.updated_time, ''), c.last_seen_at) DESC`
+      ? `c.voteup_count DESC, COALESCE(NULLIF(c.created_time, ''), NULLIF(c.updated_time, ''), '1970-01-01') DESC`
       : params.sort === "time" || params.author
-      ? `COALESCE(NULLIF(c.created_time, ''), NULLIF(c.updated_time, ''), c.last_seen_at) DESC, c.last_seen_at DESC`
+      ? `COALESCE(NULLIF(c.created_time, ''), NULLIF(c.updated_time, ''), '1970-01-01') DESC, CAST(c.source_id AS INTEGER) DESC`
       : `c.last_seen_at DESC`;
 
   const totalRow = await db.prepare(`
