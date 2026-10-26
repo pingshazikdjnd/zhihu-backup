@@ -19,3 +19,9 @@ export const allCollectionsStore = {
   hasMoreItems: true,
   scrollPosition: 0
 };
+
+export const questionsStore = {
+  list: [] as any[],
+  page: 1,
+  hasMore: true
+};

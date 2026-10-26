@@ -8,6 +8,7 @@ import CollectionsPage from "./pages/CollectionsPage.js";
 import CollectionDetailPage from "./pages/CollectionDetailPage.js";
 import ChangesPage from "./pages/ChangesPage.js";
 import AuthPage from "./pages/AuthPage.js";
+import QuestionsPage from "./pages/QuestionsPage.js";
 
 export default function App() {
   return (
@@ -19,6 +20,8 @@ export default function App() {
           <Route path="/contents/:pk" element={<ContentDetailPage />} />
           <Route path="/collections" element={<CollectionsPage />} />
           <Route path="/collections/:id" element={<CollectionDetailPage />} />
+          <Route path="/questions" element={<QuestionsPage />} />
+          <Route path="/questions/:id" element={<QuestionsPage />} />
           <Route path="/changes" element={<ChangesPage />} />
           <Route path="/auth" element={<AuthPage />} />
           <Route

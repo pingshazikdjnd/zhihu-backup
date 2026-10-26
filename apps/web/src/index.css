@@ -584,9 +584,15 @@ button { font-family: inherit; }
   .back-fab { left: 12px; top: 66px; padding: 7px 14px; }
 }
 @media (max-width: 640px) {
-  .zhihu-nav { gap: 12px; }
-  /* 单字换行成竖排（"概/览"）的修正：不允许 nav 项内换行 */
-  .zhihu-nav a { font-size: 14px; white-space: nowrap; }
+  /* 6 个导航项在 375px 放不下会撑出溢出：改为可横向滚动的紧凑条 */
+  .zhihu-nav {
+    gap: 12px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .zhihu-nav::-webkit-scrollbar { display: none; }
+  .zhihu-nav a { font-size: 14px; white-space: nowrap; flex-shrink: 0; }
   .header-actions { display: none; }
   .back-fab { position: static; margin-bottom: 10px; }
   .card { padding: 14px 16px; }

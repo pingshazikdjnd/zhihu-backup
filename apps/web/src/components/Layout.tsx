@@ -28,6 +28,7 @@ export default function Layout({ children }: { children: ReactNode }) {
             <NavLink to="/" end className={({ isActive }) => isActive ? "active" : ""}>概览</NavLink>
             <NavLink to="/contents" className={({ isActive }) => isActive ? "active" : ""}>内容</NavLink>
             <NavLink to="/collections" className={({ isActive }) => isActive ? "active" : ""}>收藏夹</NavLink>
+            <NavLink to="/questions" className={({ isActive }) => isActive ? "active" : ""}>问题</NavLink>
             <NavLink to="/changes" className={({ isActive }) => isActive ? "active" : ""}>变更</NavLink>
             <NavLink to="/auth" className={({ isActive }) => isActive ? "active" : ""}>登录</NavLink>
           </nav>

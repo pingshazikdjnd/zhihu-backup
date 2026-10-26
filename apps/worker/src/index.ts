@@ -8,6 +8,7 @@ import { syncRoutes } from "./routes/sync.js";
 import { upvoteRoutes } from "./routes/upvotes.js";
 import { statsRoutes } from "./routes/stats.js";
 import { authRoutes } from "./routes/auth.js";
+import { questionRoutes } from "./routes/questions.js";
 import { dbContext } from "./db.js";
 import { triggerApifyRun } from "./services/apify.js";
 import type { Bindings } from "./types.js";
@@ -53,6 +54,7 @@ app.route("/api/sync", syncRoutes);
 app.route("/api/upvotes", upvoteRoutes);
 app.route("/api/stats", statsRoutes);
 app.route("/api/auth", authRoutes);
+app.route("/api/questions", questionRoutes);
 
 // Cloudflare Cron 定时触发 Apify。
 // 这样「谁负责爬」这件事完全落在 Apify + CF 自身，前端不需要持有任何 secret。
