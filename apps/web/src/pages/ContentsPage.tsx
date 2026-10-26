@@ -65,7 +65,7 @@ export default function ContentsPage() {
     contentsStore.activeTab = activeTab;
   }, [activeTab]);
 
-  const fetchAnswers = async (page: number) => {
+  const fetchAnswers = async (page: number, sort = sortBy) => {
     setIsLoading(true);
     setError("");
     try {
@@ -73,7 +73,7 @@ export default function ContentsPage() {
       // 不配就退化成"全部内容"，至少不会永远空白。
       const author = (import.meta.env.VITE_ZHIHU_USERNAME as string | undefined) || "";
       const authorQuery = author ? `&author=${encodeURIComponent(author)}` : "";
-      const res = await api<{ data: any[]; total?: number }>(`/api/contents?page=${page}${authorQuery}`);
+      const res = await api<{ data: any[]; total?: number }>(`/api/contents?page=${page}${authorQuery}&sort=${sort}`);
       const myAnswers = res.data;
 
       if (typeof res.total === "number") setAnswersTotal(res.total);
@@ -81,6 +81,9 @@ export default function ContentsPage() {
       if (res.data.length < 50) {
         setHasMoreAnswers(false);
         contentsStore.hasMoreAnswers = false;
+      } else {
+        setHasMoreAnswers(true);
+        contentsStore.hasMoreAnswers = true;
       }
 
       setAnswersData(prev => {
@@ -98,15 +101,18 @@ export default function ContentsPage() {
     }
   };
 
-  const fetchUpvotes = async (page: number) => {
+  const fetchUpvotes = async (page: number, sort = sortBy) => {
     setIsLoading(true);
     setError("");
     try {
-      const res = await api<{ data: any[] }>(`/api/upvotes?page=${page}`);
+      const res = await api<{ data: any[] }>(`/api/upvotes?page=${page}&sort=${sort}`);
 
       if (res.data.length < 50) {
         setHasMoreUpvotes(false);
         contentsStore.hasMoreUpvotes = false;
+      } else {
+        setHasMoreUpvotes(true);
+        contentsStore.hasMoreUpvotes = true;
       }
 
       setUpvotesData(prev => {
@@ -121,6 +127,18 @@ export default function ContentsPage() {
       setError(e?.message || "赞同列表加载失败");
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleSortChange = (nextSort: "time" | "vote") => {
+    if (nextSort === sortBy) return;
+    setSortBy(nextSort);
+    contentsStore.scrollPosition = 0;
+    window.scrollTo(0, 0);
+    if (activeTab === "answers") {
+      fetchAnswers(1, nextSort);
+    } else {
+      fetchUpvotes(1, nextSort);
     }
   };
 
@@ -151,16 +169,7 @@ export default function ContentsPage() {
   }, [isLoading, hasMoreAnswers, hasMoreUpvotes, activeTab, answersPage, upvotesPage]);
 
   const currentItems = searchResults !== null ? searchResults : (activeTab === "answers" ? answersData : upvotesData);
-
-  const sortedItems = searchResults !== null ? currentItems : [...currentItems].sort((a, b) => {
-    if (sortBy === "vote") {
-      return (b.voteup_count || 0) - (a.voteup_count || 0);
-    } else {
-      const timeA = new Date(a.upvote_time || a.updated_time || a.last_seen_at || 0).getTime();
-      const timeB = new Date(b.upvote_time || b.updated_time || b.last_seen_at || 0).getTime();
-      return (Number.isNaN(timeB) ? 0 : timeB) - (Number.isNaN(timeA) ? 0 : timeA);
-    }
-  });
+  const sortedItems = currentItems;
 
   const parseDateStr = (val: any) => {
     if (!val) return "";
@@ -197,8 +206,8 @@ export default function ContentsPage() {
           {searchResults !== null && (
             <span style={{ fontSize: 13, color: "var(--zhihu-meta)" }}>命中 {searchTotal} 条</span>
           )}
-          <button className={`sort-chip ${sortBy === "time" ? "active" : ""}`} onClick={() => setSortBy("time")}>按时间</button>
-          <button className={`sort-chip ${sortBy === "vote" ? "active" : ""}`} onClick={() => setSortBy("vote")}>按赞同数</button>
+          <button className={`sort-chip ${sortBy === "time" ? "active" : ""}`} onClick={() => handleSortChange("time")}>按时间</button>
+          <button className={`sort-chip ${sortBy === "vote" ? "active" : ""}`} onClick={() => handleSortChange("vote")}>按赞同数</button>
           <input
             type="search"
             className="search-input"

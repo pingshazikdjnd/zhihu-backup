@@ -5,5 +5,6 @@ export const upvoteRoutes = new Hono();
 
 upvoteRoutes.get("/", async c => {
   const page = parseInt(c.req.query("page") || "1", 10);
-  return c.json({ data: await listUpvotes({ page }) });
+  const sort = c.req.query("sort");
+  return c.json({ data: await listUpvotes({ page, sort }) });
 });

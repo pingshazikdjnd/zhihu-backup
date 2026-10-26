@@ -9,8 +9,9 @@ contentRoutes.get("/", async c => {
   const type = c.req.query("type");
   const q = c.req.query("q");
   const author = c.req.query("author");
+  const sort = c.req.query("sort");
   const page = parseInt(c.req.query("page") || "1", 10);
-  const { rows, total } = await listContents({ type, q, author, page });
+  const { rows, total } = await listContents({ type, q, author, sort, page });
   return c.json({ data: rows, total });
 });
 

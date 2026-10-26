@@ -312,7 +312,7 @@ async function upsertContentInner(input: IngestContentInput) {
   });
 }
 
-export async function listContents(params: { type?: string; q?: string; author?: string; page?: number }) {
+export async function listContents(params: { type?: string; q?: string; author?: string; sort?: string; page?: number }) {
   const conditions: string[] = [];
   const values: unknown[] = [];
 
@@ -340,6 +340,13 @@ export async function listContents(params: { type?: string; q?: string; author?:
   const limit = 50;
   const offset = (page - 1) * limit;
 
+  const orderBy =
+    params.sort === "vote"
+      ? `c.voteup_count DESC, COALESCE(NULLIF(c.created_time, ''), NULLIF(c.updated_time, ''), c.last_seen_at) DESC`
+      : params.sort === "time" || params.author
+      ? `COALESCE(NULLIF(c.created_time, ''), NULLIF(c.updated_time, ''), c.last_seen_at) DESC, c.last_seen_at DESC`
+      : `c.last_seen_at DESC`;
+
   const totalRow = await db.prepare(`
     SELECT count(*) as c FROM contents c ${where}
   `).get(...values) as { c: number };
@@ -348,13 +355,11 @@ export async function listContents(params: { type?: string; q?: string; author?:
     SELECT c.pk, c.source_type, c.source_id, c.title, c.question_title, c.source_url,
            c.author_name, c.author_url_token, c.author_avatar, c.author_headline, c.excerpt,
            c.voteup_count, c.comment_count, c.favorite_count, c.visit_count,
-           c.updated_time, c.last_seen_at, c.is_deleted, u.upvote_time
+           c.created_time, c.updated_time, c.last_seen_at, c.is_deleted, u.upvote_time
     FROM contents c
     LEFT JOIN upvotes u ON u.content_pk = c.pk
     ${where}
-    -- 排序用同步时间（last_seen_at）：updated_time 是知乎侧编辑时间，
-    -- 从不编辑的老内容首次备份后会按编辑时间沉到列表最底部，用户翻不到刚备份的东西
-    ORDER BY c.last_seen_at DESC
+    ORDER BY ${orderBy}
     LIMIT ${limit} OFFSET ${offset}
   `).all(...values);
 
