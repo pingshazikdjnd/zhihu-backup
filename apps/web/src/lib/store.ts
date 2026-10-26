@@ -23,5 +23,8 @@ export const allCollectionsStore = {
 export const questionsStore = {
   list: [] as any[],
   page: 1,
-  hasMore: true
+  total: null as number | null,
+  q: "",
+  scrollPosition: 0,
+  detailCache: {} as Record<string, { data: any; scrollPosition: number }>
 };

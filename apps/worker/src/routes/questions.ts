@@ -7,7 +7,8 @@ export const questionRoutes = new Hono<{ Bindings: Bindings }>();
 // 按问题维度聚合用户赞同/收藏过的回答（只读公开，同其他读接口）
 questionRoutes.get("/", async c => {
   const page = parseInt(c.req.query("page") || "1", 10);
-  const { rows, total } = await listQuestions({ page });
+  const q = c.req.query("q") || "";
+  const { rows, total } = await listQuestions({ page, q });
   return c.json({ data: rows, total });
 });
 

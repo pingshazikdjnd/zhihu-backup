@@ -17,10 +17,10 @@ export const db = {
     };
 
     return {
-      get: async (...params: any[]) => {
+      get: async <T = any>(...params: any[]): Promise<T | null> => {
         return await build(params).first();
       },
-      all: async (...params: any[]) => {
+      all: async <T = any>(...params: any[]): Promise<T[]> => {
         const res = await build(params).all();
         return res.results;
       },

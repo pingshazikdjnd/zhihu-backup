@@ -51,20 +51,39 @@ export default function QuestionsPage() {
 function QuestionList() {
   const [rows, setRows] = useState<QuestionRow[]>(questionsStore.list);
   const [page, setPage] = useState(questionsStore.page);
-  const [total, setTotal] = useState<number | null>(null);
+  const [total, setTotal] = useState<number | null>(questionsStore.total);
+  const [qInput, setQInput] = useState(questionsStore.q);
+  const [activeQ, setActiveQ] = useState(questionsStore.q);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const fetchPage = async (p: number) => {
+  useEffect(() => {
+    window.scrollTo(0, questionsStore.scrollPosition);
+    const handleScroll = () => {
+      questionsStore.scrollPosition = window.scrollY;
+    };
+    window.addEventListener("scroll", handleScroll, { passive: true });
+    return () => window.removeEventListener("scroll", handleScroll);
+  }, []);
+
+  const fetchPage = async (p: number, queryStr = activeQ) => {
     setIsLoading(true);
     setError("");
     try {
-      const res = await api<{ data: QuestionRow[]; total?: number }>(`/api/questions?page=${p}`);
-      setRows(prev => (p === 1 ? res.data : [...prev, ...res.data]));
-      questionsStore.list = p === 1 ? res.data : [...rows, ...res.data];
+      const qs = new URLSearchParams({ page: String(p) });
+      if (queryStr.trim()) qs.set("q", queryStr.trim());
+      const res = await api<{ data: QuestionRow[]; total?: number }>(`/api/questions?${qs.toString()}`);
+      setRows(prev => {
+        const next = p === 1 ? res.data : [...prev, ...res.data];
+        questionsStore.list = next;
+        return next;
+      });
       setPage(p);
       questionsStore.page = p;
-      if (typeof res.total === "number") setTotal(res.total);
+      if (typeof res.total === "number") {
+        setTotal(res.total);
+        questionsStore.total = res.total;
+      }
     } catch (e: any) {
       setError(e?.message || "问题列表加载失败");
     } finally {
@@ -73,18 +92,59 @@ function QuestionList() {
   };
 
   useEffect(() => {
-    if (rows.length === 0) fetchPage(1);
+    if (rows.length === 0) fetchPage(1, activeQ);
   }, []);
+
+  const handleSearch = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = qInput.trim();
+    setActiveQ(trimmed);
+    questionsStore.q = trimmed;
+    questionsStore.scrollPosition = 0;
+    window.scrollTo(0, 0);
+    fetchPage(1, trimmed);
+  };
+
+  const handleClearSearch = () => {
+    setQInput("");
+    setActiveQ("");
+    questionsStore.q = "";
+    questionsStore.scrollPosition = 0;
+    window.scrollTo(0, 0);
+    fetchPage(1, "");
+  };
 
   return (
     <div>
       {error && <div className="card" style={{ color: "var(--zhihu-red)", fontSize: 14 }}>{error}</div>}
 
       <div className="card" style={{ marginBottom: 10, padding: "14px 18px" }}>
-        <h1 style={{ fontSize: 18, margin: 0 }}>按问题整理</h1>
-        <p style={{ margin: "6px 0 0", color: "var(--zhihu-meta)", fontSize: 13 }}>
-          你赞同或收藏过的回答，按所属问题聚合{total !== null ? ` · 共 ${total} 个问题` : ""}
-        </p>
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+          <div>
+            <h1 style={{ fontSize: 18, margin: 0 }}>按问题整理</h1>
+            <p style={{ margin: "6px 0 0", color: "var(--zhihu-meta)", fontSize: 13 }}>
+              你赞同或收藏过的回答，按所属问题聚合{total !== null ? ` · 共 ${total} 个问题` : ""}
+            </p>
+          </div>
+          <form onSubmit={handleSearch} style={{ display: "flex", gap: 6, flex: "0 1 280px" }}>
+            <input
+              className="search-input"
+              type="search"
+              placeholder="搜索问题标题..."
+              value={qInput}
+              onChange={e => setQInput(e.target.value)}
+            />
+            {activeQ && (
+              <button
+                type="button"
+                onClick={handleClearSearch}
+                style={{ padding: "6px 10px", border: "1px solid var(--zhihu-border)", borderRadius: 6, background: "#fff", cursor: "pointer", fontSize: 13, whiteSpace: "nowrap" }}
+              >
+                清除
+              </button>
+            )}
+          </form>
+        </div>
       </div>
 
       <div className="cards">
@@ -108,13 +168,15 @@ function QuestionList() {
         ))}
         {isLoading && <p className="loading-state">加载中...</p>}
         {!isLoading && rows.length === 0 && !error && (
-          <p className="empty-state">还没有可整理的内容——先让同步抓一轮赞同和收藏</p>
+          <p className="empty-state">
+            {activeQ ? `未找到包含「${activeQ}」的问题` : "还没有可整理的内容——先让同步抓一轮赞同和收藏"}
+          </p>
         )}
-        {!isLoading && rows.length > 0 && rows.length < (total ?? Infinity) && (
+        {!isLoading && rows.length > 0 && total !== null && rows.length < total && (
           <button
             className="btn-primary"
             style={{ display: "block", margin: "10px auto" }}
-            onClick={() => fetchPage(page + 1)}
+            onClick={() => fetchPage(page + 1, activeQ)}
           >
             加载更多
           </button>
@@ -125,20 +187,55 @@ function QuestionList() {
 }
 
 function QuestionDetail({ questionId }: { questionId: string }) {
-  const [data, setData] = useState<any>(null);
+  const cached = questionsStore.detailCache[questionId];
+  const [data, setData] = useState<any>(cached?.data || null);
   const [loadError, setLoadError] = useState("");
   const [retryKey, setRetryKey] = useState(0);
 
   useEffect(() => {
+    const entry = questionsStore.detailCache[questionId];
+    if (entry?.scrollPosition) {
+      setTimeout(() => window.scrollTo(0, entry.scrollPosition), 0);
+    } else {
+      window.scrollTo(0, 0);
+    }
+    const handleScroll = () => {
+      if (questionsStore.detailCache[questionId]) {
+        questionsStore.detailCache[questionId].scrollPosition = window.scrollY;
+      }
+    };
+    window.addEventListener("scroll", handleScroll, { passive: true });
+    return () => window.removeEventListener("scroll", handleScroll);
+  }, [questionId]);
+
+  useEffect(() => {
+    const entry = questionsStore.detailCache[questionId];
+    if (entry?.data && retryKey === 0) {
+      setData(entry.data);
+      setLoadError("");
+      return;
+    }
+    let alive = true;
+    setData(null);
+    setLoadError("");
     api<{ question: any; answers: any[] }>(`/api/questions/${encodeURIComponent(questionId)}`)
       .then(d => {
+        if (!alive) return;
         if (!d?.question) {
           setLoadError("问题不存在");
           return;
         }
+        questionsStore.detailCache[questionId] = {
+          data: d,
+          scrollPosition: questionsStore.detailCache[questionId]?.scrollPosition || 0
+        };
         setData(d);
       })
-      .catch((e: any) => setLoadError(e?.message || "加载失败"));
+      .catch((e: any) => {
+        if (!alive) return;
+        setLoadError(e?.message || "加载失败");
+      });
+    return () => { alive = false; };
   }, [questionId, retryKey]);
 
   if (!data) {
@@ -167,34 +264,49 @@ function QuestionDetail({ questionId }: { questionId: string }) {
       </button>
 
       <div className="card" style={{ marginBottom: 10 }}>
-        <h1 className="question-title">{data.question.question_title}</h1>
+        <h1 className="question-title">{data.question.question_title || data.question.question_id}</h1>
         <p style={{ color: "var(--zhihu-meta)", fontSize: 14, margin: "8px 0 0" }}>
           我赞同/收藏过的回答 · 共 {data.answers.length} 条
         </p>
       </div>
 
       <div className="cards">
-        {data.answers.map((a: any) => (
-          <Link className="card" key={a.pk} to={`/contents/${encodeURIComponent(a.pk)}`}>
-            {a.author_name && (
-              <div className="card-author">
-                {a.author_avatar && <img src={a.author_avatar} alt="" referrerPolicy="no-referrer" />}
-                <span className="author-name">{a.author_name}</span>
-                {a.author_headline && <span className="author-headline">{a.author_headline}</span>}
+        {data.answers.map((a: any) => {
+          const rightTime = a.fav_added_at || a.updated_time || a.last_seen_at;
+          const rightLabel = a.fav_added_at ? "收藏于 " : (a.updated_time ? "编辑于 " : "同步于 ");
+          return (
+            <Link className="card" key={a.pk} to={`/contents/${encodeURIComponent(a.pk)}`}>
+              {a.author_name && (
+                <div className="card-author">
+                  {a.author_avatar && <img src={a.author_avatar} alt="" referrerPolicy="no-referrer" />}
+                  <span className="author-name">{a.author_name}</span>
+                  {a.author_headline && <span className="author-headline">{a.author_headline}</span>}
+                </div>
+              )}
+              {a.excerpt && <p className="card-excerpt">{stripHtml(a.excerpt)}</p>}
+              <div className="card-footer">
+                <span className="stat" style={{ color: "var(--zhihu-blue)", background: "var(--zhihu-blue-bg)", borderRadius: 4, padding: "2px 10px", fontWeight: 500 }}>
+                  ▲ {fmtNum(a.voteup_count)}
+                </span>
+                {a.upvote_time && (
+                  <span className="detail-tag" style={{ background: "var(--zhihu-blue-bg)", color: "var(--zhihu-blue)" }}>
+                    我赞同于 {fmtDate(a.upvote_time)}
+                  </span>
+                )}
+                {Boolean(a.in_favorites) && (
+                  <span className="detail-tag" style={{ background: "rgba(46,125,50,0.08)", color: "#2e7d32" }}>
+                    收藏中
+                  </span>
+                )}
+                {a.is_deleted === 1 && <span className="detail-tag red">已删除</span>}
+                {a.is_collapsed === 1 && <span className="detail-tag">已折叠</span>}
+                <span className="footer-right">
+                  {rightTime ? rightLabel : ""}{fmtDate(rightTime)}
+                </span>
               </div>
-            )}
-            {a.excerpt && <p className="card-excerpt">{stripHtml(a.excerpt)}</p>}
-            <div className="card-footer">
-              <span className="stat" style={{ color: "var(--zhihu-blue)", background: "var(--zhihu-blue-bg)", borderRadius: 4, padding: "2px 10px", fontWeight: 500 }}>
-                ▲ {fmtNum(a.voteup_count)}
-              </span>
-              {a.upvote_time
-                ? <span className="detail-tag" style={{ background: "var(--zhihu-blue-bg)", color: "var(--zhihu-blue)" }}>我赞同于 {fmtDate(a.upvote_time)}</span>
-                : <span className="detail-tag" style={{ background: "rgba(46,125,50,0.08)", color: "#2e7d32" }}>收藏中</span>}
-              <span className="footer-right">{a.upvote_time || a.updated_time || a.last_seen_at ? "收录于 " : ""}{fmtDate(a.upvote_time || a.updated_time || a.last_seen_at)}</span>
-            </div>
-          </Link>
-        ))}
+            </Link>
+          );
+        })}
         {data.answers.length === 0 && <p className="empty-state">这个问题下暂无相关回答</p>}
       </div>
     </>

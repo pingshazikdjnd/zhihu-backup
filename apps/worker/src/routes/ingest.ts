@@ -108,9 +108,12 @@ ingestRoutes.get("/sync-state", async c => {
   ).all<{ key: string; value: string; updated_at: string }>();
   const map: Record<string, string> = {};
   for (const r of rows) map[r.key] = r.value;
+  const fallbackZc0 = c.env.ZHIHU_COOKIE_Z_C0
+    ? (c.env.ZHIHU_COOKIE_Z_C0.includes("=") ? c.env.ZHIHU_COOKIE_Z_C0 : `z_c0=${c.env.ZHIHU_COOKIE_Z_C0}`)
+    : null;
   return c.json({
     upvotesCursor: map["upvotes_cursor"] || null,
-    cookieString: map["zhihu_cookie"] || c.env.ZHIHU_COOKIE_STRING || c.env.ZHIHU_COOKIE_Z_C0 || null,
+    cookieString: map["zhihu_cookie"] || c.env.ZHIHU_COOKIE_STRING || fallbackZc0 || null,
     zhihuUsername: c.env.ZHIHU_USERNAME || null
   });
 });

@@ -14,6 +14,7 @@ import { changeRoutes } from "./routes/changes.js";
 import { syncRoutes } from "./routes/sync.js";
 import { upvoteRoutes } from "./routes/upvotes.js";
 import { statsRoutes } from "./routes/stats.js";
+import { questionRoutes } from "./routes/questions.js";
 
 const app = new Hono();
 
@@ -28,6 +29,7 @@ app.route("/api/changes", changeRoutes);
 app.route("/api/sync", syncRoutes);
 app.route("/api/upvotes", upvoteRoutes);
 app.route("/api/stats", statsRoutes);
+app.route("/api/questions", questionRoutes);
 
 const port = Number(process.env.API_PORT || 3001);
 
