@@ -14,10 +14,12 @@
 - **版本历史**：正文变化会留快照，判断依据是正文内容的 SHA-256
 - **收藏夹追踪**：收藏夹里加了什么、移除了什么
 - **评论备份**：根评论 + 子评论，含「答主/置顶/精选」标记
-- **赞同记录**：你在什么时间赞同了哪条内容
+- **赞同记录**：你在什么时间赞同了哪条内容（支持 `upvotes_cursor` 断点续传，历史存量分批自动追平）
+- **按问题整理**：将所有赞同或收藏的回答按所属知乎问题聚合归档，标注「赞同/收藏」来源标签
+- **移动端适配**：窄屏横向滚动导航栏、44px 触控热区、自适应卡片与搜索栏
 - **变更时间线**：所有新增/更新/删除事件
 - **cookie 网页维护**：登录态失效时，打开网页贴一下就行，不用改代码或重部署
-- **定时抓取**：Cloudflare Cron 每天两次触发 Apify
+- **双轨自动同步**：本地 Windows 计划任务全自动断点追平存量（零 Apify 额度消耗）+ Cloudflare Cron 每天两次触发 Apify 增量同步
 
 ---
 
@@ -189,7 +191,18 @@ curl -X POST "https://<worker>/api/sync/full?target=all" \
 
 10 分钟内重复触发（比如 cron 和手动撞在一起）会被防重入锁拒绝，返回「已有同步在进行中」。
 
-**定时抓取**：在 `wrangler.toml` 的 `[triggers]` 里改，默认 `0 2,14 * * *`（UTC，即北京 10:00 / 22:00）。每次触发都是一次真实 Apify run，会产生费用。
+**定时抓取与双轨自动同步（存量本地自动追平 + 日常云端增量）**：
+
+首次全量同步（尤其老账号数千条历史赞同）受限于 **Cloudflare D1 免费版每日 100,000 行写入上限** 与 **Apify 免费版每月 $5 计算额度**，采用「本地自动追平存量 + 云端日常增量」双轨方案：
+
+1. **赞同历史断点续传（`upvotes_cursor`）+ D1 写满断路保护**：
+   - 爬虫在扫描最新动态（连续 20 条已存在）后，自动跳转到 `app_settings.upvotes_cursor` 保存的历史断点继续往旧动态翻页。
+   - **零失败才推进游标**：只有整页全部入库成功（`pageFailures === 0`）才推进并上报下一页游标；一旦连续 5 次入库失败（触发 D1 每日 100K 写入限额），立即安全刹车并保留当前页游标，绝不跳过任何一条未入库数据。
+2. **本地全自动计划任务（零 Apify 额度消耗）**：
+   - `scripts/local-sync.mjs` 会自动调用 Worker `GET /ingest/sync-state` 拉取线上最新 Cookie 与 `upvotes_cursor`，在本地拉起 Playwright Chromium 直连知乎（防海外 IP 风控），并通过 `.env.local` 配置的代理分流写入云端 D1 + R2。
+   - Windows 任务计划 `ZhihuBackup_LocalAutoSync`（由 `scripts/auto-sync-silent.vbs` 静默托管，日志写入 `logs/auto-sync.log`）每天 **08:05**（UTC 00:00 D1 每日写入限额重置后 5 分钟）与 **20:05** 自动在后台运行，且开启了 `StartWhenAvailable`（若当时关机/睡眠，开机后自动补跑），无需人工干预。
+3. **云端日常定时增量**：
+   - 在 `wrangler.toml` 的 `[triggers]` 中配置，默认 `0 2,14 * * *`（UTC，即北京时间 10:00 / 22:00）。存量追平后，日常快速增量模式（`isFast=true`）每次仅耗时 1～2 分钟，Apify 免费版每月 $5 额度完全够用。
 
 **本地冒烟测试**：在 `apps/worker` 下建 `.dev.vars` 写入 `API_SECRET=test-secret`，`npx wrangler dev --port 8788` 起本地 Worker，然后跑 `bash scripts/smoke-test.sh`。测试数据用 node 生成（不依赖 python3），Windows Git Bash 也能直接跑，结束时自动清理。
 
@@ -205,6 +218,8 @@ curl -X POST "https://<worker>/api/sync/full?target=all" \
 | GET | `/api/contents?page=&q=&type=&author=` | 内容列表（分页 50，按同步时间倒序） |
 | GET | `/api/contents/:pk` | 详情（正文从 R2 注入） |
 | GET | `/api/contents/:pk/comments` | 评论树数据 |
+| GET | `/api/questions?page=&q=` | 按问题整理列表（聚合赞同/收藏回答计数） |
+| GET | `/api/questions/:id` | 指定问题下的全部已备份回答（含赞同/收藏来源标签） |
 | GET | `/api/collections` | 收藏夹列表 |
 | GET | `/api/collections/items?page=` | 收藏条目 |
 | GET | `/api/collections/:id` | 收藏夹详情 |
@@ -212,10 +227,12 @@ curl -X POST "https://<worker>/api/sync/full?target=all" \
 | GET | `/api/changes/sync-runs` | 同步记录 |
 | GET | `/api/upvotes?page=` | 赞同记录 |
 | GET | `/api/stats` | 汇总统计 |
-| POST | `/ingest/content` | 写入内容（Apify 调用） |
+| POST | `/ingest/content` | 写入内容（Apify / 本地同步调用） |
 | POST | `/ingest/comments` | 写入评论 |
 | POST | `/ingest/collection-snapshot` | 写入收藏夹快照 |
 | POST | `/ingest/upvote` | 写入赞同记录 |
+| GET | `/ingest/sync-state` | 读取最新 Cookie、知乎账号与赞同断点游标（供本地自动同步脚本使用） |
+| POST | `/ingest/sync-state` | 上报/清空赞同断点游标 `upvotes_cursor` |
 | POST | `/api/sync` `/fast` `/full?target=` | 触发 Apify run |
 | GET | `/api/auth/zhihu-status` | cookie 状态 + 上次 run 结果 |
 | POST | `/api/auth/zhihu-cookie` | 保存 cookie（网页表单） |

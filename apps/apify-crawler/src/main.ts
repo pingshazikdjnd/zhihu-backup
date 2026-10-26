@@ -581,7 +581,7 @@ export async function runUpvotesScraper() {
       if (res.status() === 401 || res.status() === 403) stats.authRejected++;
       else stats.failed++;
       // 断点游标失效（知乎改版/游标过期）时清掉，下次从头全量——宁可重翻不可卡死
-      if (resuming) reportCursor(null);
+      if (resuming) await reportCursor(null);
       break;
     }
     const json = await res.json();
@@ -592,6 +592,8 @@ export async function runUpvotesScraper() {
       }
       break;
     }
+
+    let pageFailures = 0;
 
     for (const item of json.data) {
       if (!item.action_text || !item.action_text.includes("赞同")) continue;
@@ -641,7 +643,6 @@ export async function runUpvotesScraper() {
 
       try {
         const pk = await sendContent(contentInput);
-        consecutiveFailures = 0;
         if (pk) {
            const upvoteTime = toIsoOrNull(item.created_time);
            // created_time 缺失时为空串：/ingest/upvote 对空串返回 400，
@@ -670,8 +671,11 @@ export async function runUpvotesScraper() {
              }
            }
         }
+        // content 与 upvote 两步都成功才清零连续失败计数
+        consecutiveFailures = 0;
       } catch (err: any) {
         stats.failed++;
+        pageFailures++;
         consecutiveFailures++;
         console.error(`❌ 保存赞同失败: ${title}`, err.message);
         if (consecutiveFailures >= 5) {
@@ -697,8 +701,11 @@ export async function runUpvotesScraper() {
     } else {
       nextUrl = json.paging?.next || "";
       // 新增段不上报（不论快速/全量）：上报会把"新增段的下一页"覆盖成
-      // 历史断点，丢失补历史进度。resuming 阶段和翻到底时才上报/清游标
-      if (resuming || !isFast) reportCursor(isEnd ? null : nextUrl);
+      // 历史断点，丢失补历史进度。
+      // 只有本页零失败（pageFailures === 0）时才推进或清空断点游标，防止本页部分失败的条目被永久跳过。
+      if ((resuming || !isFast) && pageFailures === 0) {
+        await reportCursor(isEnd ? null : nextUrl);
+      }
     }
 
     if (json.data.length === 0) break;
