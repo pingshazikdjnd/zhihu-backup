@@ -882,34 +882,114 @@ export async function runFollowingScraper(onlyList = false) {
     "data[*].content,voteup_count,comment_count,created,updated,title,excerpt"
   );
 
+  // 抓取侧实时「和谐风险 + 内容含金量」评估器：
+  // 扫描关注答主的回答时，自动甄别「写得好但容易被和谐」的高危/精品回答入库，跳过日常普通水贴，兼顾容量与抢救质量！
+  const HIGH_RISK_KWS = [
+    "审查", "封禁", "删帖", "河蟹", "和谐", "敏感", "禁评", "夹总", "小管家",
+    "文革", "苏联", "解体", "政治", "政权", "意识形态", "官僚", "特权", "权贵", "既得利益",
+    "阶级", "阶层固化", "剥削", "牛马", "人矿", "烂尾", "维权", "赋红码", "公信力",
+    "人口崩塌", "生育率", "断交", "制裁", "房价崩盘", "失业率", "洗脑", "润学", "润出", "亡国",
+    "贪腐", "腐败", "垄断", "内幕", "真相", "反思", "历史虚无", "拜金", "男女对立", "彩礼"
+  ];
+  const MED_RISK_KWS = [
+    "华为", "公知", "民族", "爱国", "资本家", "996", "劳动法", "工会", "裁员",
+    "房地产", "土地财政", "城投", "地方债", "集采", "医保", "养老金", "延迟退休",
+    "教育公平", "学区房", "考公", "编制", "国企", "央企", "体制内", "贫富差距",
+    "俄乌", "中东", "以色列", "巴勒斯坦", "台海", "关税", "贸易战", "芯片封锁"
+  ];
+
+  function evaluateForAutoBackup(item: any, rawHtml: string): { shouldBackup: boolean; reason: string; riskScore: number; valueScore: number } {
+    let risk = 0;
+    let value = 0;
+    const reasons: string[] = [];
+
+    const voteup = Number(item?.voteup_count) || 0;
+    const comments = Number(item?.comment_count) || 0;
+    const favs = Number(item?.favorite_count) || 0;
+    const isCollapsed = Boolean(item?.is_collapsed);
+    const isLabeled = Boolean(item?.is_labeled) || Boolean(item?.label_info);
+    const text = `${item?.question?.title || ""} ${item?.title || ""} ${item?.excerpt || ""} ${rawHtml.slice(0, 1500)}`.toLowerCase();
+    const textLen = rawHtml.replace(/<[^>]+>/g, "").trim().length;
+
+    if (isCollapsed) { risk += 45; reasons.push("原站已折叠"); }
+    if (isLabeled) { risk += 30; reasons.push("风险黄标"); }
+    if (voteup >= 1000 && comments === 0) { risk += 35; reasons.push("千赞零评疑似禁评"); }
+    else if (voteup >= 200 && comments === 0) { risk += 25; reasons.push("高赞零评疑似禁评"); }
+    else if (voteup >= 1500 && comments > 0 && voteup / comments >= 80) { risk += 18; reasons.push("评论严控"); }
+
+    let highHits = 0;
+    for (const kw of HIGH_RISK_KWS) {
+      if (text.includes(kw)) { highHits++; if (highHits >= 3) break; }
+    }
+    let medHits = 0;
+    for (const kw of MED_RISK_KWS) {
+      if (text.includes(kw)) { medHits++; if (medHits >= 3) break; }
+    }
+    if (highHits > 0) { risk += 22 + (highHits - 1) * 10; reasons.push("高敏议题"); }
+    else if (medHits > 0) { risk += 14 + (medHits - 1) * 7; reasons.push("争议议题"); }
+
+    // “写得好”含金量：赞同数 + 收藏赞同比 + 深度长文
+    if (voteup >= 5000) value += 40;
+    else if (voteup >= 1000) value += 30;
+    else if (voteup >= 300) value += 22;
+    else if (voteup >= 80) value += 14;
+
+    const favRatio = voteup >= 30 ? favs / voteup : 0;
+    if (favRatio >= 0.45) { value += 28; risk += 10; reasons.push("极高收藏比神贴"); }
+    else if (favRatio >= 0.25 || favs >= 500) { value += 18; reasons.push("高收藏干货"); }
+
+    if (textLen >= 1200) value += 15;
+    else if (textLen >= 500) value += 8;
+
+    if ((highHits > 0 || medHits > 0) && (voteup >= 100 || textLen >= 400)) {
+      risk += 10;
+    }
+
+    // 判定准则：
+    // 1. 高危且有一定内容质量（非纯一句话抖机灵）：risk >= 25 && (value >= 8 || textLen >= 150 || isCollapsed || isLabeled) -> 自动抢救备份！
+    // 2. 极高含金量深度精品：value >= 38 -> 自动精选备份！
+    const isHighRiskWorthSaving = risk >= 25 && (value >= 8 || textLen >= 150 || isCollapsed || isLabeled);
+    const isHighQuality = value >= 38;
+
+    return {
+      shouldBackup: isHighRiskWorthSaving || isHighQuality,
+      reason: reasons.join("+") || (isHighQuality ? "高赞深度精品" : "常规"),
+      riskScore: Math.min(100, risk),
+      valueScore: Math.min(100, value)
+    };
+  }
+
   for (const u of sortedUsers) {
     if (stats.circuitBroken) break;
     if (u.answerCount <= 0 && u.articlesCount <= 0) continue;
 
     const isUserFull = fullModeSet.has(u.urlToken);
     console.log(
-      `👤 同步关注答主 [${u.name}] (${isUserFull ? `全量模式 · 共 ${u.answerCount} 回答 + ${u.articlesCount} 文章` : `精选前 50 篇`})...`
+      `👤 同步关注答主 [${u.name}] (${isUserFull ? `全量模式 · 共 ${u.answerCount} 回答 + ${u.articlesCount} 文章` : `智能风险抢救模式 · 扫描并自动备份高危易和谐/精品回答`})...`
     );
 
-    // 1. 抓取回答（默认精选模式：isFast 时抓最新 20 篇；非 isFast 时抓最新 20 篇 + 最高赞 30 篇 = 50 篇）
+    // 1. 抓取回答：
+    // - 全量模式：抓取该答主全部回答
+    // - 智能风险抢救模式（默认）：扫描最新回答 + 最高赞回答（最多扫描 100 篇，只把命中「高危易和谐」或「深度精品」的回答写入 D1/R2，兼顾容量与质量！）
     if (u.answerCount > 0 && !stats.circuitBroken) {
-      const plans: Array<{ sortBy: "created" | "voteups"; maxItems: number; earlyStop: number }> = isUserFull
-        ? [{ sortBy: "created", maxItems: 100000, earlyStop: isFast ? 15 : 999999 }]
+      const plans: Array<{ sortBy: "created" | "voteups"; maxScan: number; earlyStop: number }> = isUserFull
+        ? [{ sortBy: "created", maxScan: 100000, earlyStop: isFast ? 15 : 999999 }]
         : isFast
-        ? [{ sortBy: "created", maxItems: 20, earlyStop: 5 }]
+        ? [{ sortBy: "created", maxScan: 40, earlyStop: 8 }]
         : [
-            { sortBy: "created", maxItems: 20, earlyStop: 999999 },
-            { sortBy: "voteups", maxItems: 30, earlyStop: 999999 }
+            { sortBy: "created", maxScan: 60, earlyStop: 999999 },
+            { sortBy: "voteups", maxScan: 60, earlyStop: 999999 }
           ];
 
+      let savedForUser = 0;
       for (const plan of plans) {
         if (stats.circuitBroken) break;
         let aOffset = 0;
         let aIsEnd = false;
         let unchanged = 0;
 
-        while (!aIsEnd && aOffset < plan.maxItems && !stats.circuitBroken) {
-          const batchLimit = Math.min(20, plan.maxItems - aOffset);
+        while (!aIsEnd && aOffset < plan.maxScan && !stats.circuitBroken) {
+          const batchLimit = Math.min(20, plan.maxScan - aOffset);
           const aRes = await context.request.get(
             `https://www.zhihu.com/api/v4/members/${u.urlToken}/answers?include=${includeStr}&limit=${batchLimit}&offset=${aOffset}&sort_by=${plan.sortBy}`
           );
@@ -919,6 +999,16 @@ export async function runFollowingScraper(onlyList = false) {
 
           for (const item of aJson.data) {
             if (!item?.id) continue;
+            const cleanedHtml = cleanHtml(item.content);
+
+            if (!isUserFull) {
+              const evalRes = evaluateForAutoBackup(item, cleanedHtml);
+              if (!evalRes.shouldBackup) {
+                continue; // 普通低风险水贴直接跳过，不占 D1 / R2 容量
+              }
+              console.log(`  🛡️ [自动抢救 ${u.name}] 风险${evalRes.riskScore}分/质量${evalRes.valueScore}分 (${evalRes.reason}): ${item.question?.title || item.id}`);
+            }
+
             const contentInput = {
               sourceType: "answer" as const,
               sourceId: String(item.id),
@@ -931,7 +1021,7 @@ export async function runFollowingScraper(onlyList = false) {
                 headline: item.author?.headline || u.headline
               },
               question: item.question ? { id: String(item.question.id), title: item.question.title } : undefined,
-              contentHtml: cleanHtml(item.content),
+              contentHtml: cleanedHtml,
               contentMd: "",
               excerpt: item.excerpt || "",
               voteupCount: item.voteup_count || 0,
@@ -947,6 +1037,7 @@ export async function runFollowingScraper(onlyList = false) {
 
             try {
               const dbRes = await sendContent(contentInput);
+              savedForUser++;
               if (!dbRes.created && !dbRes.changed) {
                 unchanged++;
                 if (unchanged >= plan.earlyStop) {
@@ -967,15 +1058,17 @@ export async function runFollowingScraper(onlyList = false) {
           await new Promise(r => setTimeout(r, 500));
         }
       }
+      if (!isUserFull && savedForUser > 0) {
+        console.log(`  ✅ [${u.name}] 智能风险抢救共入库 ${savedForUser} 篇高危/精品回答`);
+      }
     }
 
-    // 2. 抓取专栏文章（全量模式下抓全部文章；精选模式下若回答不足 50 篇则用最新文章补足 50 篇）
-    const remainingForArticles = isUserFull ? 100000 : Math.max(0, 50 - u.answerCount);
-    if (u.articlesCount > 0 && remainingForArticles > 0 && !stats.circuitBroken) {
+    // 2. 抓取专栏文章（全量模式下抓全部文章；智能模式下扫描最新 40 篇文章并只自动备份高危/高质文章）
+    if (u.articlesCount > 0 && !stats.circuitBroken) {
       let artOffset = 0;
       let artIsEnd = false;
       let unchanged = 0;
-      const maxArticles = isFast && !isUserFull ? Math.min(10, remainingForArticles) : remainingForArticles;
+      const maxArticles = isUserFull ? 100000 : (isFast ? 20 : 40);
       const artEarlyStop = isFast ? 5 : 999999;
 
       while (!artIsEnd && artOffset < maxArticles && !stats.circuitBroken) {
@@ -989,6 +1082,12 @@ export async function runFollowingScraper(onlyList = false) {
 
         for (const item of artJson.data) {
           if (!item?.id) continue;
+          const cleanedHtml = cleanHtml(item.content);
+          if (!isUserFull) {
+            const evalRes = evaluateForAutoBackup(item, cleanedHtml);
+            if (!evalRes.shouldBackup) continue;
+            console.log(`  🛡️ [自动抢救文章 ${u.name}] 风险${evalRes.riskScore}分/质量${evalRes.valueScore}分 (${evalRes.reason}): ${item.title}`);
+          }
           const contentInput = {
             sourceType: "article" as const,
             sourceId: String(item.id),
@@ -1000,7 +1099,7 @@ export async function runFollowingScraper(onlyList = false) {
               avatarUrl: item.author?.avatar_url || u.avatarUrl,
               headline: item.author?.headline || u.headline
             },
-            contentHtml: cleanHtml(item.content),
+            contentHtml: cleanedHtml,
             contentMd: "",
             excerpt: item.excerpt || "",
             voteupCount: item.voteup_count || 0,

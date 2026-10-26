@@ -218,10 +218,9 @@ function FollowingHome() {
             <strong style={{ color: "var(--zhihu-blue)" }}>{summary.full_mode_users}</strong> 人 · 库内已收录他们{" "}
             <strong>{fmtNum(summary.total_backed_up_items)}</strong> 篇内容
             <br />
-            📊 <strong>备份容量预估</strong>：当前策略预计共备份{" "}
-            <strong style={{ color: "#16a34a" }}>{fmtNum(summary.planned_total_items)}</strong> 篇（默认每人精选前 50 篇；若将全部{" "}
+            📊 <strong>备份策略与容量预估</strong>：默认开启 <strong>「🛡️ 高危易和谐 + 深度精品自动抢救模式」</strong>（扫描关注答主的回答并只自动备份有被夹风险或高收藏比的精品，跳过普通水贴）；若将全部{" "}
             {summary.total_followed_users} 人都设为全量备份，则总计需抓取{" "}
-            <strong>{fmtNum(summary.total_zhihu_all_items)}</strong> 篇）
+            <strong>{fmtNum(summary.total_zhihu_all_items)}</strong> 篇。
           </div>
         )}
       </div>
@@ -345,7 +344,7 @@ function FollowingHome() {
                     <span style={{ fontSize: 11, color: "var(--zhihu-meta)" }}>
                       {isFull
                         ? `将备份该答主全部 ${u.answer_count} 回答 + ${u.articles_count} 文章`
-                        : `当前默认精选前 ${u.default_quota_items} 篇（知乎共 ${u.answer_count} 回答 / ${u.articles_count} 文章）`}
+                        : `默认仅自动抢救高危易和谐与高质回答（知乎共 ${u.answer_count} 回答 / ${u.articles_count} 文章）`}
                     </span>
                   </div>
                 </div>
