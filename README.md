@@ -9,6 +9,11 @@
 ## 核心功能
 
 - **内容与正文分离备份**：回答、文章、想法（pin）的完整 HTML 正文与历史版本存入 **Cloudflare R2**（免费 10GB、零流量费），结构化元数据与 4000 字搜索摘要存入 **Cloudflare D1**。
+- **关注的人与分层定量备份（`/following`）**：自动同步你关注的全部答主名录，默认每人抓取精选前 50 篇（最新 20 篇 + 最高赞 30 篇）+ 日常追新，并支持在网页上为重点答主一键开启 **「全量备份」**（界面实时计算并提示开启全量后将抓取该答主多少篇回答与文章，受操作密码保护）。
+- **知乎主页式推荐页 + 防和谐风险评估（`/recommend`）**：
+  - 支持 **「✨ 猜你想看」「⚠️ 高危易和谐榜」「🔥 偏爱与关注答主」「💎 绝版与深度神贴」** 四个频道与「🔄 换一批」。
+  - **回答和谐风险评估引擎**：结合原站信号（已删除/已折叠/争议黄标）、评论区控评信号（千赞零评疑似禁评）与高敏议题特征，自动计算 `0~100` 和谐风险分。
+  - **Cloudflare Workers AI 深度鉴定**：绑定免费 `[ai]` 算力（`@cf/qwen/qwen1.5-14b-chat-awq` / `@cf/meta/llama-3.1-8b-instruct-fast`），一键生成单篇回答的「和谐风险鉴定 + 核心看点提炼 + 归档建议」（结果永久缓存在 R2），并支持「🔍 找相似回答」。
 - **按问题整理（`/questions`）**：将你所有**赞同过**或**收藏过**的回答按所属知乎问题自动聚合归档，支持按问题标题搜索，同时展示「赞同 / 收藏」双来源标签与回答状态。
 - **版本历史追踪**：正文发生修改时按 SHA-256 哈希自动保留历史快照。
 - **收藏夹与评论同步**：追踪收藏夹新增/移除条目；备份根评论与子评论（含「答主/置顶/精选」标记，支持 500 条分批幂等对账）。
@@ -248,6 +253,14 @@ local-sync.bat           手动双击运行本地同步的快捷入口
 | GET | `/api/contents/:pk/comments` | 评论树数据 |
 | GET | `/api/questions?page=&q=` | 按问题整理列表（聚合赞同/收藏回答计数，支持问题标题搜索） |
 | GET | `/api/questions/:id` | 指定问题下的全部已备份回答（含赞同/收藏双标签与状态） |
+| GET | `/api/following/users?q=&mode=` | 关注的答主列表、每人已备份数与全量备份篇数预估 |
+| GET | `/api/following/users/:token?only_risk=` | 指定关注答主的详情与已备份回答/文章列表 |
+| POST | `/api/following/users/:token/mode` | 切换某位关注答主的备份模式（`default` 精选前50篇 / `full` 全量备份，受操作密码保护） |
+| GET | `/api/following/feed?page=&only_risk=` | 关注答主的回答动态流（支持只看高危易和谐回答） |
+| GET | `/api/recommend?channel=&seed=` | 个性化推荐流（`mix` / `risk` / `authors` / `classic`） |
+| GET | `/api/recommend/similar/:pk` | 查找库内同问题/同答主/相似主题的关联回答 |
+| POST | `/api/recommend/ai-assess` | 调用 Cloudflare Workers AI 进行单篇回答和谐风险与核心看点鉴定（带 R2 缓存） |
+| POST | `/ingest/followed-users` | 写入关注答主名录快照（D1 + R2 双写） |
 | GET | `/api/collections` | 收藏夹列表 |
 | GET | `/api/collections/items?page=` | 全部收藏条目 |
 | GET | `/api/collections/:id` | 单个收藏夹详情与快照历史 |

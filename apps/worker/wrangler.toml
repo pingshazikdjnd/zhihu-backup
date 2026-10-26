@@ -16,6 +16,9 @@ migrations_dir = "./migrations"
 binding = "BUCKET"
 bucket_name = "zhihu-backup-storage"
 
+[ai]
+binding = "AI"
+
 [vars]
 # Apify Actor 把数据 POST 回来的地址，必须是公网可达的 workers.dev 域名。
 # 部署后拿到真实域名，回填这里再 deploy 一次。

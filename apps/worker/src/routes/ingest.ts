@@ -8,6 +8,7 @@ import { upsertContent } from "../services/contents.js";
 import { replaceComments } from "../services/comments.js";
 import { upsertCollectionSnapshot } from "../services/collections.js";
 import { upsertUpvote } from "../services/upvotes.js";
+import { getFollowedUsersMap, upsertFollowedUsersSnapshot } from "../services/following.js";
 import { requireSecret } from "../middleware/require-secret.js";
 import { db } from "../db.js";
 import type { Bindings } from "../types.js";
@@ -111,11 +112,32 @@ ingestRoutes.get("/sync-state", async c => {
   const fallbackZc0 = c.env.ZHIHU_COOKIE_Z_C0
     ? (c.env.ZHIHU_COOKIE_Z_C0.includes("=") ? c.env.ZHIHU_COOKIE_Z_C0 : `z_c0=${c.env.ZHIHU_COOKIE_Z_C0}`)
     : null;
+  const followedMap = await getFollowedUsersMap(c.env.BUCKET);
+  const fullModeUsers = Object.values(followedMap)
+    .filter(u => !u.is_unfollowed && u.sync_mode === "full")
+    .map(u => u.url_token);
   return c.json({
     upvotesCursor: map["upvotes_cursor"] || null,
     cookieString: map["zhihu_cookie"] || c.env.ZHIHU_COOKIE_STRING || fallbackZc0 || null,
-    zhihuUsername: c.env.ZHIHU_USERNAME || null
+    zhihuUsername: c.env.ZHIHU_USERNAME || null,
+    fullModeUsers
   });
+});
+
+ingestRoutes.post("/followed-users", async c => {
+  const body = await c.req.json().catch(() => null) as {
+    users?: unknown;
+    incremental?: boolean;
+  } | null;
+  if (!body || !Array.isArray(body.users)) {
+    return c.json({ error: "users array is required" }, 400);
+  }
+  const res = await upsertFollowedUsersSnapshot(
+    c.env.BUCKET,
+    body.users as any[],
+    Boolean(body.incremental)
+  );
+  return c.json(res);
 });
 
 ingestRoutes.post("/sync-state", async c => {

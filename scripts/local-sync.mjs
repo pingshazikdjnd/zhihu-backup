@@ -160,6 +160,7 @@ async function main() {
   const cookieString = remoteState.cookieString || process.env.ZHIHU_COOKIE || "";
   const zhihuUsername = remoteState.zhihuUsername || process.env.ZHIHU_USERNAME || "";
   const upvotesCursor = remoteState.upvotesCursor || undefined;
+  const fullModeUsers = Array.isArray(remoteState.fullModeUsers) ? remoteState.fullModeUsers : [];
 
   if (!cookieString) {
     console.error("❌ 线上 D1 与本地均未找到知乎 Cookie，请先在网页端【凭据】页更新 Cookie");
@@ -175,6 +176,7 @@ async function main() {
   console.log(`✅ 账号: ${zhihuUsername}`);
   console.log(`✅ 模式: runType=${runType}, isFast=${isFast}`);
   console.log(`✅ 赞同断点游标: ${upvotesCursor ? upvotesCursor : "无（日常增量/从头扫描）"}`);
+  console.log(`✅ 全量备份关注答主数: ${fullModeUsers.length} 人`);
 
   // 4. 准备 Apify 本地存储目录并写入 INPUT.json
   const storageDir = path.join(CRAWLER_DIR, "storage");
@@ -188,7 +190,8 @@ async function main() {
     apiSecret,
     zhihuUsername,
     cookieString,
-    ...(upvotesCursor ? { upvotesCursor } : {})
+    ...(upvotesCursor ? { upvotesCursor } : {}),
+    ...(fullModeUsers.length > 0 ? { fullModeUsers } : {})
   };
 
   fs.writeFileSync(

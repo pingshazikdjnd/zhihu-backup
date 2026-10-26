@@ -1,4 +1,5 @@
 import type { Bindings } from "../types.js";
+import { getFollowedUsersMap } from "./following.js";
 
 /**
  * 取知乎 cookie：优先用扫码登录存进 D1 的那份，回落到环境变量。
@@ -68,6 +69,16 @@ export async function triggerApifyRun(
     // app_settings 不存在（migration 未 apply）时无断点可用
   }
 
+  let fullModeUsers: string[] = [];
+  try {
+    const followedMap = await getFollowedUsersMap(env.BUCKET);
+    fullModeUsers = Object.values(followedMap)
+      .filter(u => !u.is_unfollowed && u.sync_mode === "full")
+      .map(u => u.url_token);
+  } catch {
+    // ignore
+  }
+
   const payload = {
     runType,
     isFast,
@@ -76,7 +87,8 @@ export async function triggerApifyRun(
     apiSecret: env.API_SECRET,
     zhihuUsername: zhihuUser,
     cookieString: cookieStr,
-    ...(upvotesCursor ? { upvotesCursor } : {})
+    ...(upvotesCursor ? { upvotesCursor } : {}),
+    ...(fullModeUsers.length > 0 ? { fullModeUsers } : {})
   };
 
   let res: Response;

@@ -2,7 +2,7 @@ import { Actor, log } from "apify";
 import { chromium } from "playwright";
 
 interface InputSchema {
-    runType: "all" | "answers" | "collections" | "upvotes";
+    runType: "all" | "answers" | "collections" | "upvotes" | "following" | "following-list";
     isFast: boolean;
     apiUrl: string;
     apiSecret?: string;
@@ -10,12 +10,15 @@ interface InputSchema {
     cookieString: string;
     /** 赞同段断点游标（moments 的 paging.next）：从上次中断处继续补历史 */
     upvotesCursor?: string;
+    /** 开启了「全量备份」的关注答主 url_token 列表 */
+    fullModeUsers?: string[];
 }
 
 await Actor.init();
 const input = await Actor.getInput<InputSchema>();
 if (!input) throw new Error("Missing input");
-const { runType, isFast, apiUrl, apiSecret, zhihuUsername, cookieString, upvotesCursor } = input;
+const { runType, isFast, apiUrl, apiSecret, zhihuUsername, cookieString, upvotesCursor, fullModeUsers } = input;
+const fullModeSet = new Set(Array.isArray(fullModeUsers) ? fullModeUsers : []);
 
 // 失败上报：所有异常都被吞掉的爬虫在 Apify 上永远显示 SUCCEEDED，
 // cookie 失效后零数据入库也毫无感知。这里集中统计，结束时据此决定 run 状态。
@@ -785,19 +788,284 @@ export async function runUpvotesScraper() {
   }
 }
 
+export async function runFollowingScraper(onlyList = false) {
+  const browser = await setupBrowser();
+  console.log("🚀 开始同步你关注的人...");
+
+  const context = await browser.newContext();
+  await context.addCookies(getCookiesArray());
+
+  const followedUsers: Array<{
+    urlToken: string;
+    userId: string;
+    name: string;
+    avatarUrl: string;
+    headline: string;
+    answerCount: number;
+    articlesCount: number;
+    followerCount: number;
+  }> = [];
+
+  let offset = 0;
+  let isEnd = false;
+  let fIncomplete = false;
+
+  while (!isEnd) {
+    const res = await context.request.get(
+      `https://www.zhihu.com/api/v4/members/${ZHIHU_USERNAME}/followees?include=data%5B*%5D.answer_count,articles_count,follower_count,headline,avatar_url&limit=20&offset=${offset}`
+    );
+    if (!res.ok()) {
+      console.error(`❌ 获取关注列表失败: HTTP ${res.status()}`);
+      if (res.status() === 401 || res.status() === 403) stats.authRejected++;
+      else stats.failed++;
+      fIncomplete = true;
+      break;
+    }
+    const json = await res.json();
+    if (!json.data || json.data.length === 0) {
+      if (!json.paging?.is_end) {
+        stats.riskEmpty++;
+        fIncomplete = true;
+      }
+      break;
+    }
+
+    for (const u of json.data) {
+      if (!u.url_token || !u.name) continue;
+      followedUsers.push({
+        urlToken: String(u.url_token),
+        userId: String(u.id || ""),
+        name: String(u.name),
+        avatarUrl: String(u.avatar_url || ""),
+        headline: String(u.headline || ""),
+        answerCount: Number(u.answer_count) || 0,
+        articlesCount: Number(u.articles_count) || 0,
+        followerCount: Number(u.follower_count) || 0
+      });
+    }
+
+    isEnd = Boolean(json.paging?.is_end);
+    offset += 20;
+    await new Promise(r => setTimeout(r, 400));
+  }
+
+  if (followedUsers.length > 0) {
+    try {
+      await post("/ingest/followed-users", {
+        users: followedUsers,
+        incremental: fIncomplete
+      });
+      console.log(`✅ 已同步 ${followedUsers.length} 位关注答主名录`);
+    } catch (e: any) {
+      console.error(`❌ 上报关注答主名录失败: ${e?.message || e}`);
+    }
+  }
+
+  if (onlyList || stats.circuitBroken) {
+    await browser.close();
+    return;
+  }
+
+  // 同步关注答主的回答：
+  // - 开启了「全量备份（full）」的答主优先排在前面，抓取全量（快速模式下连续 15 条未变则早停）
+  // - 默认精选模式的答主：每人最多抓取前 50 篇（快速模式下只看最新第 1 页且连续 5 条未变即停）
+  const sortedUsers = [...followedUsers].sort((a, b) => {
+    const aFull = fullModeSet.has(a.urlToken) ? 1 : 0;
+    const bFull = fullModeSet.has(b.urlToken) ? 1 : 0;
+    return bFull - aFull;
+  });
+
+  const includeStr = encodeURIComponent(
+    "data[*].is_normal,comment_count,content,voteup_count,created_time,updated_time,question,excerpt,is_collapsed,is_labeled,label_info,visit_count,favorite_count"
+  );
+  const articleIncludeStr = encodeURIComponent(
+    "data[*].content,voteup_count,comment_count,created,updated,title,excerpt"
+  );
+
+  for (const u of sortedUsers) {
+    if (stats.circuitBroken) break;
+    if (u.answerCount <= 0 && u.articlesCount <= 0) continue;
+
+    const isUserFull = fullModeSet.has(u.urlToken);
+    console.log(
+      `👤 同步关注答主 [${u.name}] (${isUserFull ? `全量模式 · 共 ${u.answerCount} 回答 + ${u.articlesCount} 文章` : `精选前 50 篇`})...`
+    );
+
+    // 1. 抓取回答（默认精选模式：isFast 时抓最新 20 篇；非 isFast 时抓最新 20 篇 + 最高赞 30 篇 = 50 篇）
+    if (u.answerCount > 0 && !stats.circuitBroken) {
+      const plans: Array<{ sortBy: "created" | "voteups"; maxItems: number; earlyStop: number }> = isUserFull
+        ? [{ sortBy: "created", maxItems: 100000, earlyStop: isFast ? 15 : 999999 }]
+        : isFast
+        ? [{ sortBy: "created", maxItems: 20, earlyStop: 5 }]
+        : [
+            { sortBy: "created", maxItems: 20, earlyStop: 999999 },
+            { sortBy: "voteups", maxItems: 30, earlyStop: 999999 }
+          ];
+
+      for (const plan of plans) {
+        if (stats.circuitBroken) break;
+        let aOffset = 0;
+        let aIsEnd = false;
+        let unchanged = 0;
+
+        while (!aIsEnd && aOffset < plan.maxItems && !stats.circuitBroken) {
+          const batchLimit = Math.min(20, plan.maxItems - aOffset);
+          const aRes = await context.request.get(
+            `https://www.zhihu.com/api/v4/members/${u.urlToken}/answers?include=${includeStr}&limit=${batchLimit}&offset=${aOffset}&sort_by=${plan.sortBy}`
+          );
+          if (!aRes.ok()) break;
+          const aJson = await aRes.json();
+          if (!aJson.data || aJson.data.length === 0) break;
+
+          for (const item of aJson.data) {
+            if (!item?.id) continue;
+            const contentInput = {
+              sourceType: "answer" as const,
+              sourceId: String(item.id),
+              title: item.question?.title || "未知问题",
+              sourceUrl: `https://www.zhihu.com/question/${item.question?.id}/answer/${item.id}`,
+              author: {
+                name: item.author?.name || u.name,
+                urlToken: item.author?.url_token || u.urlToken,
+                avatarUrl: item.author?.avatar_url || u.avatarUrl,
+                headline: item.author?.headline || u.headline
+              },
+              question: item.question ? { id: String(item.question.id), title: item.question.title } : undefined,
+              contentHtml: cleanHtml(item.content),
+              contentMd: "",
+              excerpt: item.excerpt || "",
+              voteupCount: item.voteup_count || 0,
+              commentCount: item.comment_count || 0,
+              favoriteCount: item.favorite_count || 0,
+              visitCount: item.visit_count || 0,
+              isCollapsed: item.is_collapsed,
+              isLabeled: item.is_labeled,
+              labelInfo: item.label_info ? JSON.stringify(item.label_info) : "",
+              createdTime: toIsoOrNull(item.created_time),
+              updatedTime: toIsoOrNull(item.updated_time)
+            };
+
+            try {
+              const dbRes = await sendContent(contentInput);
+              if (!dbRes.created && !dbRes.changed) {
+                unchanged++;
+                if (unchanged >= plan.earlyStop) {
+                  aIsEnd = true;
+                  break;
+                }
+              } else {
+                unchanged = 0;
+              }
+            } catch (err: any) {
+              console.error(`❌ 保存关注答主回答失败: ${err.message}`);
+              if (stats.circuitBroken) break;
+            }
+          }
+
+          if (!aIsEnd) aIsEnd = Boolean(aJson.paging?.is_end);
+          aOffset += batchLimit;
+          await new Promise(r => setTimeout(r, 500));
+        }
+      }
+    }
+
+    // 2. 抓取专栏文章（全量模式下抓全部文章；精选模式下若回答不足 50 篇则用最新文章补足 50 篇）
+    const remainingForArticles = isUserFull ? 100000 : Math.max(0, 50 - u.answerCount);
+    if (u.articlesCount > 0 && remainingForArticles > 0 && !stats.circuitBroken) {
+      let artOffset = 0;
+      let artIsEnd = false;
+      let unchanged = 0;
+      const maxArticles = isFast && !isUserFull ? Math.min(10, remainingForArticles) : remainingForArticles;
+      const artEarlyStop = isFast ? 5 : 999999;
+
+      while (!artIsEnd && artOffset < maxArticles && !stats.circuitBroken) {
+        const batchLimit = Math.min(20, maxArticles - artOffset);
+        const artRes = await context.request.get(
+          `https://www.zhihu.com/api/v4/members/${u.urlToken}/articles?include=${articleIncludeStr}&limit=${batchLimit}&offset=${artOffset}`
+        );
+        if (!artRes.ok()) break;
+        const artJson = await artRes.json();
+        if (!artJson.data || artJson.data.length === 0) break;
+
+        for (const item of artJson.data) {
+          if (!item?.id) continue;
+          const contentInput = {
+            sourceType: "article" as const,
+            sourceId: String(item.id),
+            title: item.title || "未知文章",
+            sourceUrl: `https://zhuanlan.zhihu.com/p/${item.id}`,
+            author: {
+              name: item.author?.name || u.name,
+              urlToken: item.author?.url_token || u.urlToken,
+              avatarUrl: item.author?.avatar_url || u.avatarUrl,
+              headline: item.author?.headline || u.headline
+            },
+            contentHtml: cleanHtml(item.content),
+            contentMd: "",
+            excerpt: item.excerpt || "",
+            voteupCount: item.voteup_count || 0,
+            commentCount: item.comment_count || 0,
+            favoriteCount: item.favorite_count || 0,
+            visitCount: item.visit_count || 0,
+            createdTime: toIsoOrNull(item.created || item.created_time),
+            updatedTime: toIsoOrNull(item.updated || item.updated_time)
+          };
+
+          try {
+            const dbRes = await sendContent(contentInput);
+            if (!dbRes.created && !dbRes.changed) {
+              unchanged++;
+              if (unchanged >= artEarlyStop) {
+                artIsEnd = true;
+                break;
+              }
+            } else {
+              unchanged = 0;
+            }
+          } catch (err: any) {
+            console.error(`❌ 保存关注答主文章失败: ${err.message}`);
+            if (stats.circuitBroken) break;
+          }
+        }
+
+        if (!artIsEnd) artIsEnd = Boolean(artJson.paging?.is_end);
+        artOffset += batchLimit;
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+  }
+
+  await browser.close();
+  console.log("🎉 关注答主同步完成！");
+}
+
 
 // --- Apify Entry Point ---
 // 失败必须让 run 状态可见。之前所有异常都被吞掉后正常 exit，
 // cookie 失效后 run 依然 SUCCEEDED，Worker /auth 页据此误报"一切正常"。
 try {
-  if ((runType === "all" || runType === "answers") && !stats.circuitBroken) {
-    await runScraper();
-  }
-  if ((runType === "all" || runType === "collections") && !stats.circuitBroken) {
-    await runCollectionScraper();
-  }
-  if ((runType === "all" || runType === "upvotes") && !stats.circuitBroken) {
-    await runUpvotesScraper();
+  if (runType === "following-list") {
+    await runFollowingScraper(true);
+  } else if (runType === "following") {
+    await runFollowingScraper(false);
+  } else {
+    if (runType === "all") {
+      // 先同步关注人名录（写 R2 + D1，耗时仅 3 秒）
+      await runFollowingScraper(true);
+    }
+    if ((runType === "all" || runType === "answers") && !stats.circuitBroken) {
+      await runScraper();
+    }
+    if ((runType === "all" || runType === "collections") && !stats.circuitBroken) {
+      await runCollectionScraper();
+    }
+    if ((runType === "all" || runType === "upvotes") && !stats.circuitBroken) {
+      await runUpvotesScraper();
+    }
+    if (runType === "all" && !stats.circuitBroken) {
+      // 若自身回答/收藏/赞同跑完后当日 D1 配额仍有富余，继续同步关注答主的回答
+      await runFollowingScraper(false);
+    }
   }
 } catch (e: any) {
   log.error(e?.message || String(e));

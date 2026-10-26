@@ -7,8 +7,8 @@
             "title": "Run Type",
             "type": "string",
             "description": "What to synchronize",
-            "enum": ["all", "answers", "collections", "upvotes"],
-            "enumTitles": ["Sync All", "Sync Answers", "Sync Collections", "Sync Upvotes"],
+            "enum": ["all", "answers", "collections", "upvotes", "following", "following-list"],
+            "enumTitles": ["Sync All", "Sync Answers", "Sync Collections", "Sync Upvotes", "Sync Following", "Sync Following List Only"],
             "default": "all"
         },
         "isFast": {
@@ -48,6 +48,12 @@
             "type": "string",
             "description": "Internal: moments paging.next cursor from the last interrupted run. Injected automatically by the Worker; do not set manually.",
             "editor": "textfield"
+        },
+        "fullModeUsers": {
+            "title": "Full Mode Followed Users",
+            "type": "array",
+            "description": "URL tokens of followed users configured for full backup",
+            "editor": "json"
         }
     },
     "required": ["apiUrl", "zhihuUsername", "cookieString"]

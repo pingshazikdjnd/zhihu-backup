@@ -1,6 +1,7 @@
 export type Bindings = {
   DB: any; // D1Database
   BUCKET: any; // R2Bucket
+  AI?: any; // Cloudflare Workers AI binding
   API_SECRET?: string;
   APIFY_TOKEN?: string;
   APIFY_ACTOR_ID?: string;

@@ -12,9 +12,9 @@ function isValidCookieString(s: string): boolean {
   return /(?:^|;\s*)z_c0=[^;]+/.test(s);
 }
 
-function isOriginAllowed(c: any): boolean {
+export function isOriginAllowed(c: any, requireHeader = false): boolean {
   const origin = c.req.header("origin");
-  if (!origin) return true; // 无 Origin 的脚本直调
+  if (!origin) return !requireHeader;
   const allowed = String(c.env.ALLOWED_ORIGIN || "")
     .split(",")
     .map(s => s.trim())
@@ -34,7 +34,7 @@ function isOriginAllowed(c: any): boolean {
 /**
  * 读取当前生效的凭据页写入口令：优先读 D1 app_settings 中的在线设置值，回退到环境变量 COOKIE_WRITE_TOKEN。
  */
-async function getActiveWriteToken(c: any): Promise<string> {
+export async function getActiveWriteToken(c: any): Promise<string> {
   try {
     const row = await db.prepare(
       `SELECT value FROM app_settings WHERE key = ?`
@@ -53,7 +53,7 @@ async function getActiveWriteToken(c: any): Promise<string> {
  * - 配了口令（D1 `cookie_write_token` 或环境变量 `COOKIE_WRITE_TOKEN`）：必须带该口令，或带 `API_SECRET`
  * - 没配口令：校验 Origin 白名单后允许网页直接提交
  */
-async function authorizeWrite(c: any): Promise<{ ok: boolean }> {
+export async function authorizeWrite(c: any): Promise<{ ok: boolean }> {
   const apiSecret = c.env.API_SECRET;
   const auth = c.req.header("authorization") || "";
 
