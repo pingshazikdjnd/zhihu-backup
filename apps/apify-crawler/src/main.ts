@@ -186,6 +186,10 @@ export async function runScraper() {
   let offset = 0;
   let isEnd = false;
   let existingCount = 0;
+  let pagesScanned = 0;
+  let submitted = 0;
+  let createdCount = 0;
+  let noChangeCount = 0;
   
   console.log("🌐 正在通过 API 拉取回答列表...");
   const includeStr = encodeURIComponent("data[*].is_normal,admin_closed_comment,reward_info,is_collapsed,annotation_action,annotation_detail,collapse_reason,collapsed_by,suggest_edit,comment_count,can_comment,content,voteup_count,reshipment_settings,comment_permission,mark_infos,created_time,updated_time,review_info,question,excerpt,is_labeled,label_info,relationship.is_authorized,voting,is_author,is_thanked,is_nothelp,is_recognized,visit_count,favorite_count;data[*].author.badge[?(type=best_answerer)].topics");
@@ -212,25 +216,15 @@ export async function runScraper() {
       break;
     }
 
+    pagesScanned++;
     for (const item of json.data) {
       if (item.type !== "answer") continue;
 
-      let finalVoteup = item.voteup_count || item.reaction?.statistics?.like_count || item.reaction?.statistics?.upvote_count || 0;
-      let finalFavorite = item.favorite_count || item.thanks_count || item.reaction?.statistics?.favorites || item.reaction?.statistics?.favorite_count || 0;
-      let finalVisit = item.visit_count || item.reaction?.statistics?.visit_count || 0;
-      
-      // Fetch detailed stats because list API omits them
-      try {
-         const detailRes = await context.request.get(`https://www.zhihu.com/api/v4/answers/${item.id}?include=voteup_count,comment_count,visit_count,favorite_count`);
-         if (detailRes.ok()) {
-            const detail = await detailRes.json();
-            if (detail.voteup_count !== undefined) finalVoteup = detail.voteup_count;
-            if (detail.favorite_count !== undefined) finalFavorite = detail.favorite_count;
-            if (detail.visit_count !== undefined) finalVisit = detail.visit_count;
-         }
-      } catch (e) {
-         console.error(`Failed to fetch detail for ${item.id}`);
-      }
+      // 列表接口 include 已显式请求 voteup_count/visit_count/favorite_count/comment_count，
+      // 之前每条回答再单独请求一次 /answers/{id} 拿同样字段，纯属 562 次多余请求
+      const finalVoteup = item.voteup_count || item.reaction?.statistics?.like_count || item.reaction?.statistics?.upvote_count || 0;
+      const finalFavorite = item.favorite_count || item.thanks_count || item.reaction?.statistics?.favorites || item.reaction?.statistics?.favorite_count || 0;
+      const finalVisit = item.visit_count || item.reaction?.statistics?.visit_count || 0;
 
       const contentInput = {
         sourceType: "answer" as const,
@@ -255,7 +249,10 @@ export async function runScraper() {
 
       try {
         const dbRes = await sendContent(contentInput);
-        console.log(`✅ 保存回答: ${contentInput.title}`);
+        submitted++;
+        if (dbRes.created) createdCount++;
+        else if (!dbRes.changed) noChangeCount++;
+        console.log(`✅ 保存回答: ${contentInput.title}${dbRes.created ? " [新增]" : dbRes.changed ? " [有正文/元数据变更]" : " [无变化·仅计数同步]"}`);
         
         const needComments =
           cfg.commentsMyAnswers !== "none" &&
@@ -434,6 +431,10 @@ export async function runScraper() {
   }
 
   console.log("🎉 回答和评论同步完成！");
+  console.log(
+    `📊 本轮我的回答：扫描 ${pagesScanned} 页 / 提交 ${submitted} 条 / 新增 ${createdCount} 条 / 无变化 ${noChangeCount} 条` +
+    (isFast && existingCount >= 20 ? "（命中连续无更新早停）" : "")
+  );
   await browser.close();
 }
 

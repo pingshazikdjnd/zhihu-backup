@@ -173,6 +173,10 @@ async function upsertContentInner(input: IngestContentInput) {
     // 否则每次同步都追加 content_versions + 事件，D1 每日写入额度被计数抖动打满，
     // 爬虫也永远等不到 changed=false 而无法早停。
     const bodyChanges: string[] = [];
+    // profile 组是装饰性元数据（作者头像/简介）：头像 CDN 域名会轮换，同一头像每次
+    // URL 字符串都不同，不能参与「内容是否变更」判定，否则每轮都误判变更、写入放大
+    // 且爬虫永远等不到 changed=false。
+    const profileChanges: string[] = [];
     const counterChanges: string[] = [];
     let isBodyChanged = false;
 
@@ -197,10 +201,10 @@ async function upsertContentInner(input: IngestContentInput) {
       counterChanges.push(`浏览量(${existing.visit_count} -> ${safeVisitCount})`);
     }
     if (existing.author_avatar !== safeAuthorAvatar) {
-      bodyChanges.push("作者头像更新");
+      profileChanges.push("作者头像更新");
     }
     if (existing.author_headline !== safeAuthorHeadline) {
-      bodyChanges.push("作者简介更新");
+      profileChanges.push("作者简介更新");
     }
     const inputCollapsed = input.isCollapsed ? 1 : 0;
     if (existing.is_collapsed !== inputCollapsed) {
@@ -227,7 +231,7 @@ async function upsertContentInner(input: IngestContentInput) {
     };
 
     if (bodyChanges.length > 0) {
-      const changes = bodyChanges.concat(counterChanges);
+      const changes = bodyChanges.concat(profileChanges, counterChanges);
       // D1 没有交互式事务，batch 是唯一的原子手段：
       // 「更新 contents」和「写 content_versions」必须同生共死。
       const stmts: any[] = [];
@@ -308,20 +312,32 @@ async function upsertContentInner(input: IngestContentInput) {
       }
 
       return { pk, changed: true, created: false, prevCommentCount, hash: contentHash };
-    }
-
-    if (counterChanges.length > 0) {
-      // 只更新计数字段：单条 UPDATE（4 个数字 + last_seen_at），不写版本、不发事件、
-      // changed 保持 false，让爬虫的早停判定生效
+    } else if (profileChanges.length > 0 && counterChanges.length === 0) {
+      // 仅作者资料（头像/简介）变化：轻量更新两列，不写版本、不发事件、
+      // changed 保持 false，让爬虫的早停判定正常工作
       await db.prepare(`
         UPDATE contents
-        SET voteup_count = ?, comment_count = ?, favorite_count = ?, visit_count = ?, last_seen_at = ?
+        SET author_avatar = ?, author_headline = ?, last_seen_at = ?
+        WHERE pk = ?
+      `).run(safeAuthorAvatar, safeAuthorHeadline, now, pk);
+
+      return { pk, changed: false, created: false, prevCommentCount: await resolvePrevCommentCount(), hash: contentHash };
+    } else if (counterChanges.length > 0) {
+      // 只更新计数字段：单条 UPDATE（4 个数字 + last_seen_at），不写版本、不发事件、
+      // changed 保持 false，让爬虫的早停判定生效。
+      // 若同时有 profileChanges，在同一句里顺带写作者资料两列，避免头像永远不更新
+      await db.prepare(`
+        UPDATE contents
+        SET voteup_count = ?, comment_count = ?, favorite_count = ?, visit_count = ?,
+            author_avatar = ?, author_headline = ?, last_seen_at = ?
         WHERE pk = ?
       `).run(
         safeVoteupCount,
         safeCommentCount,
         safeFavoriteCount,
         safeVisitCount,
+        safeAuthorAvatar,
+        safeAuthorHeadline,
         now,
         pk
       );
