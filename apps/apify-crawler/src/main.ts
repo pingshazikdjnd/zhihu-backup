@@ -66,7 +66,15 @@ function sanitizeErrorForLog(err: unknown): string {
     .slice(0, 500);
 }
 
-async function post(path: string, body: unknown): Promise<any> {
+// 模型返回的 reason 属于不可信文本，进日志前统一去掉换行/控制字符，防日志注入
+function sanitizeReasonForLog(reason: unknown): string {
+  return String(reason ?? "").replace(/[\r\n\t\x00-\x1f]/g, " ").slice(0, 120);
+}
+
+async function post(path: string, body: unknown, opts?: { countStats?: boolean }): Promise<any> {
+  // countStats=false 用于 AI 复核等旁路请求：不写 D1，计数与熔断判定也不得被污染，
+  // 否则「零数据入库」终态会被 AI 调用成功/失败掩盖
+  const countStats = opts?.countStats !== false;
   // apiUrl 尾斜杠归一，避免拼出 //ingest/content 的 404
   const base = apiUrl.endsWith("/") ? apiUrl.slice(0, -1) : apiUrl;
   const headers: Record<string, string> = { "content-type": "application/json" };
@@ -86,15 +94,19 @@ async function post(path: string, body: unknown): Promise<any> {
       body: JSON.stringify(body)
     });
   } catch (e: any) {
-    stats.failed++;
-    stats.consecutiveFailures++;
-    if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
+    if (countStats) {
+      stats.failed++;
+      stats.consecutiveFailures++;
+      if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
+    }
     throw new Error(sanitizeErrorForLog(e));
   }
   if (!res.ok) {
-    stats.failed++;
-    stats.consecutiveFailures++;
-    if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
+    if (countStats) {
+      stats.failed++;
+      stats.consecutiveFailures++;
+      if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
+    }
     throw new Error(sanitizeErrorForLog(`${path} -> ${res.status} ${await res.text()}`));
   }
   // 成功计数放在 JSON 解析之后：200+非 JSON 体时避免 saved/failed 双计
@@ -102,26 +114,33 @@ async function post(path: string, body: unknown): Promise<any> {
   try {
     json = await res.json();
   } catch (e: any) {
-    stats.failed++;
-    stats.consecutiveFailures++;
-    if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
+    if (countStats) {
+      stats.failed++;
+      stats.consecutiveFailures++;
+      if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
+    }
     throw e;
   }
-  stats.saved++;
-  stats.consecutiveFailures = 0;
 
-  let cost = 1;
-  if (path === "/ingest/content") cost = 3;
-  else if (path === "/ingest/comments") cost = Math.max(1, ((body as any)?.comments?.length || 1) * 2);
-  else if (path === "/ingest/upvote") cost = 2;
-  else if (path === "/ingest/collection-snapshot") cost = Math.max(1, (body as any)?.items?.length || 1);
-  else if (path === "/ingest/followed-users") cost = Math.max(1, (body as any)?.users?.length || 1);
+  // 旁路请求（countStats=false）不计入入库统计，也不重置连续失败计数——
+  // 否则一次 AI 复核成功就能把真实的入库失败序列清零，掩盖熔断信号
+  if (countStats) {
+    stats.saved++;
+    stats.consecutiveFailures = 0;
 
-  stats.estimatedWrites += cost;
-  if (stats.estimatedWrites >= MAX_DAILY_ESTIMATED_WRITES) {
-    if (!stats.circuitBroken) {
-      stats.circuitBroken = true;
-      console.warn(`\n🛑 [D1每日限额保护] 今日预估写入已达 ${stats.estimatedWrites} 行（已充分吃满 CF 官方 100k 额度并适度利用缓冲）。主动安全挂起，已保存断点，等待明日 08:05 额度刷新后自动续跑！`);
+    let cost = 1;
+    if (path === "/ingest/content") cost = 3;
+    else if (path === "/ingest/comments") cost = Math.max(1, ((body as any)?.comments?.length || 1) * 2);
+    else if (path === "/ingest/upvote") cost = 2;
+    else if (path === "/ingest/collection-snapshot") cost = Math.max(1, (body as any)?.items?.length || 1);
+    else if (path === "/ingest/followed-users") cost = Math.max(1, (body as any)?.users?.length || 1);
+
+    stats.estimatedWrites += cost;
+    if (stats.estimatedWrites >= MAX_DAILY_ESTIMATED_WRITES) {
+      if (!stats.circuitBroken) {
+        stats.circuitBroken = true;
+        console.warn(`\n🛑 [D1每日限额保护] 今日预估写入已达 ${stats.estimatedWrites} 行（已充分吃满 CF 官方 100k 额度并适度利用缓冲）。主动安全挂起，已保存断点，等待明日 08:05 额度刷新后自动续跑！`);
+      }
     }
   }
 
@@ -1029,7 +1048,7 @@ async function evaluateFollowingCandidatesWithAI(
         riskScore: c.riskScore,
         riskTags: c.riskTags
       }))
-    });
+    }, { countStats: false });
     const rawResults: unknown = res?.results;
     if (!Array.isArray(rawResults)) return [];
     const worthMap = new Map<string, { risk: number; reason: string }>();
@@ -1048,7 +1067,7 @@ async function evaluateFollowingCandidatesWithAI(
     for (const c of capped) {
       const verdict = worthMap.get(c.sourceId);
       if (!verdict) continue;
-      console.log(`🤖 [AI判定值得备份] risk=${verdict.risk} reason=${verdict.reason}: ${c.title}`);
+      console.log(`🤖 [AI判定值得备份] risk=${verdict.risk} reason=${sanitizeReasonForLog(verdict.reason)}: ${c.title}`);
       kept.push(c);
     }
     return kept;
@@ -1269,7 +1288,12 @@ export async function runFollowingScraper(onlyList = false) {
     if (u.answerCount > 0 && !stats.circuitBroken) {
       const plans: Array<{ sortBy: "created" | "voteups"; startOffset: number; maxScan: number; earlyStop: number; trackResume: boolean }> =
         onlyIncrementalNow
-          ? [{ sortBy: "created", startOffset: 0, maxScan: 40, earlyStop: 5, trackResume: false }]
+          ? [
+              { sortBy: "created", startOffset: 0, maxScan: 40, earlyStop: 5, trackResume: false },
+              // 补一轮「最热 20」：后来涨赞或被折叠的内容早已沉出 created 最新 40 条，
+              // 只有按 voteups 重扫才能捞进规则/AI 候选池；不做早停、不跟踪断点
+              { sortBy: "voteups", startOffset: 0, maxScan: 20, earlyStop: 999999, trackResume: false }
+            ]
           : isUserFull
           ? [
               ...(prog.resumeOffset > 0
@@ -1298,7 +1322,16 @@ export async function runFollowingScraper(onlyList = false) {
             break;
           }
           const aJson = await aRes.json();
-          if (!aJson.data || aJson.data.length === 0) break;
+          if (!aJson.data || aJson.data.length === 0) {
+            // 空数组 + is_end=false 是知乎风控的典型信号：本轮并未扫完，
+            // 必须计入 riskEmpty 并禁止把该答主标成历史完成，否则零采集会被标成已完成
+            if (!aJson.paging?.is_end) {
+              stats.riskEmpty++;
+              completedAllPlans = false;
+              console.warn(`⚠️ [${u.name}] 回答列表返回空页但未到末尾，可能被风控，本轮未扫完`);
+            }
+            break;
+          }
 
           let pageFailed = false;
           for (const item of aJson.data) {
@@ -1459,7 +1492,15 @@ export async function runFollowingScraper(onlyList = false) {
           break;
         }
         const artJson = await artRes.json();
-        if (!artJson.data || artJson.data.length === 0) break;
+        if (!artJson.data || artJson.data.length === 0) {
+          // 同 answers 循环：空页且未到末尾视为风控，不得标记历史完成
+          if (!artJson.paging?.is_end) {
+            stats.riskEmpty++;
+            completedAllPlans = false;
+            console.warn(`⚠️ [${u.name}] 文章列表返回空页但未到末尾，可能被风控，本轮未扫完`);
+          }
+          break;
+        }
 
         for (const item of artJson.data) {
           if (!item?.id) continue;
