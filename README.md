@@ -241,6 +241,65 @@ local-sync.bat           手动双击运行本地同步的快捷入口
 
 ---
 
+## 本地测试（推荐在改任何东西前先跑一遍）
+
+本地测试会**真实访问知乎**（需要有效 cookie），但只写本地 D1 / 本地 R2 模拟，**不上云**，也不会污染线上 `content_versions`。
+
+1. **准备本地 Worker 环境变量**。进入 `apps/worker`，确认 `.dev.vars` 至少有：
+   ```env
+   API_SECRET=test-secret
+   ```
+   若文件已存在，把 `API_SECRET` 改成 `test-secret`（或记住原值，第 4 步命令里用同一个值，否则入库会 401）。
+
+2. **建本地库表结构**（只作用于本地 `.wrangler` 目录，不碰线上）：
+   ```bash
+   cd apps/worker
+   npx wrangler d1 migrations apply zhihu-backup --local
+   ```
+
+3. **启动本地 Worker**（仍在 `apps/worker`）：
+   ```bash
+   npx wrangler dev --port 8787
+   ```
+   启动后 `http://127.0.0.1:8787/api/health` 应返回 `{"ok":true}`。
+
+4. **另开一个终端**，在**仓库根目录**跑一次本地同步（`WORKER_URL` / `API_SECRET` 命令行覆盖优先于 `.env.local`）：
+   ```bash
+   WORKER_URL=http://127.0.0.1:8787 API_SECRET=test-secret node scripts/local-sync.mjs --type=answers --fast
+   ```
+   本地库是全新的、里面没有 cookie，脚本会回退读 `ZHIHU_COOKIE` 环境变量，所以首次运行补上完整 cookie：
+   ```bash
+   WORKER_URL=http://127.0.0.1:8787 API_SECRET=test-secret ZHIHU_COOKIE="<浏览器里复制的一整行 cookie>" node scripts/local-sync.mjs --type=answers --fast
+   ```
+   其他抓取器把 `--type=answers` 换成 `--type=collections` / `--type=upvotes` / `--type=all`。脚本会自己先跑一次 `tsc` 编译 `apps/apify-crawler`，无需手动 build。
+
+5. **检查本地库结果**：
+   - `http://127.0.0.1:8787/api/stats`：条目总数、版本数等汇总。
+   - `http://127.0.0.1:8787/api/contents?page=1&sort=time`：逐条确认标题/时间/计数已落库。
+   - 重点验证正文哈希改动：同一篇带图回答连跑两轮，第二轮应打印 `[无变化·仅计数同步]`，且本地 `content_versions` 不再为同一篇回答新增重复行。
+
+6. **测完把 `.env.local` 改回线上地址**。`.env.local` 里的 `WORKER_URL` 是日常自动同步的目标，**不要**把 `http://127.0.0.1:8787` 永久写进去（本地 Worker 一关，计划任务会全部失败）。上面用命令行临时覆盖即可，`.env.local` 保持线上地址。
+
+---
+
+## 多数据库方案（新库全量 / 双写 / 搬运）
+
+**当前代码只支持单一 D1 绑定**：`apps/worker/wrangler.toml` 只有一个 `[[d1_databases]] binding = "DB"`，所有 SQL 都经过 `apps/worker/src/db.ts` 这层薄封装（`prepare/raw/batch/transaction` 直接依赖 D1 语义），入库接口也只写 D1 + R2。因此下面任何方案都需要额外开发，不能只改配置。
+
+| 方案 | 做法 | 优点 | 代价 | 适用 |
+|---|---|---|---|---|
+| 方案一「单库切换」 | 把 Worker 的 `DB` 绑定指向新库；新库需 D1 兼容，若用 Turso/Postgres 则要先在 `db.ts` 加适配层（`.raw()` / `db.batch()` / `db.transaction()` 是 D1 专有语义，这是主要工作量） | 架构最简单，只有一份数据，没有双写一致性问题 | 需要一次性全量迁移（`wrangler d1 export` + 导入），切换窗口内要停写；换非 D1 库还要写适配层 | 已确定长期换库、能接受一次停机迁移 |
+| 方案二「双写」 | 爬虫在 `sendContent` / 快照上报处把同一份 payload 向两个后端各 POST 一次 | 改动局限在爬虫层，两个库都能实时读，回滚容易 | 请求翻倍；非原子，一半成功一半失败会产生分叉；`changed` / `prevCommentCount` 只能取一个库的返回值，早停与评论补抓判断会失真；D1 写入量翻倍 | 短期并行验证新库 |
+| 方案三「新库全量 → 每日搬运」 | 先把全量灌进新库，再由每日任务把新库增量搬到 D1（或反向），按 `pk` + `last_seen_at` / 版本 hash 去重 | 线上写入仍只打一个库，不引入双写失败；目标库可以是任意类型；可随时暂停搬运做对照 | 需要写搬运脚本与增量水位记录；两库最长有一天的时差 | 想换库但不愿改线上写入路径 |
+
+**推荐顺序**：
+
+1. **先用本地库把逻辑跑顺**（见上一节「本地测试」）：哈希归一化、评论补抓、版本写入这些改动全部在本地 D1 验证，零风险。
+2. **再决定目标库类型**：继续用 D1 就只是「方案一 + 换 binding」；要 Turso/Postgres 则必须先在 `apps/worker/src/db.ts` 做适配层（这是最重的一块）。
+3. **最后实现适配 / 双写**：优先「方案三（新库全量 → 每日搬运）」，双写只作短期过渡手段，不要作为长期架构。
+
+---
+
 ## API 一览
 
 只读接口公开访问；写接口需 `Authorization: Bearer <API_SECRET>`，凭据页接口需 `Authorization: Bearer <COOKIE_WRITE_TOKEN>`。

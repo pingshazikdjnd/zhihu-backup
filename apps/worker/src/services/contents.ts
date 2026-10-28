@@ -8,6 +8,17 @@ import type { IngestContentInput } from "shared";
 // D1 单行正文上限：正文原文存 R2，D1 只留纯文本供检索
 const SEARCH_TEXT_LIMIT = 4000;
 
+/**
+ * 用于哈希的 HTML 归一化：知乎图片 CDN 域名（pic1/picx/pic2...）与签名 query
+ * 每次请求都可能不同，直接参与哈希会导致同一篇回答每轮都被判为「正文已更新」，
+ * 进而无限追加版本与变更事件。这里只改哈希输入，不改落库/R2 的原始 HTML。
+ */
+function normalizeHtmlForHash(html: string): string {
+  return html
+    .replace(/https?:\/\/pic[0-9a-z]*\.zhimg\.com/gi, "https://zhimg.com")
+    .replace(/(<img\b[^>]*?\ssrc="[^"]*?)\?[^"]*"/gi, '$1"');
+}
+
 export function upsertContent(input: IngestContentInput) {
   // 同 pk 写串行化：消除读-比-写的并发覆盖窗口（详见 lock.ts）
   return withKeyLock(`${input.sourceType}:${input.sourceId}`, () => upsertContentInner(input));
@@ -21,8 +32,10 @@ async function upsertContentInner(input: IngestContentInput) {
   const rawMd = input.contentMd ?? "";
   // 可搜索正文（HTML 原文存 R2，D1 保留纯文本，否则 content_md LIKE 永远匹配不到）
   const searchText = buildSearchText(rawMd, rawHtml, SEARCH_TEXT_LIMIT);
+  // 哈希只吃归一化后的正文：图片 CDN 域名/签名抖动不应被判定为「正文已更新」。
+  // 注意 htmlToStore / R2 里的原文不受影响，归一化结果仅在哈希比较中使用。
   const rawContentHash = await sha256(
-    normalizeForHash(rawMd || rawHtml || input.excerpt || "")
+    normalizeForHash(normalizeHtmlForHash(rawMd || rawHtml || input.excerpt || ""))
   );
 
   // If excerpt is missing, extract from markdown/html before clearing them

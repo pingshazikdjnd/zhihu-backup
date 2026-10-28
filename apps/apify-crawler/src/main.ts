@@ -690,8 +690,7 @@ export async function runCollectionScraper() {
                 const dbRes = await sendContent(contentInput);
                 const needHotComments =
                   cfg.commentsCollections !== "none" &&
-                  contentInput.commentCount > 0 &&
-                  (dbRes.prevCommentCount || 0) === 0;
+                  contentInput.commentCount > (dbRes.prevCommentCount || 0);
                 if (needHotComments && !stats.circuitBroken) {
                   await syncHotCommentsForContent(context, item.type as "answer" | "article" | "pin", String(item.id), cfg.commentsCollections);
                 }
@@ -879,8 +878,7 @@ export async function runUpvotesScraper() {
         if (pk) {
            if (
              cfg.commentsUpvotes !== "none" &&
-             contentInput.commentCount > 0 &&
-             (pk.prevCommentCount || 0) === 0 &&
+             contentInput.commentCount > (pk.prevCommentCount || 0) &&
              !stats.circuitBroken
            ) {
              await syncHotCommentsForContent(context, sourceType, sourceId, cfg.commentsUpvotes);
@@ -1260,8 +1258,7 @@ export async function runFollowingScraper(onlyList = false) {
               const dbRes = await sendContent(contentInput);
               if (
                 cfg.commentsFollowing !== "none" &&
-                contentInput.commentCount > 0 &&
-                (dbRes.prevCommentCount || 0) === 0 &&
+                contentInput.commentCount > (dbRes.prevCommentCount || 0) &&
                 !stats.circuitBroken
               ) {
                 await syncHotCommentsForContent(context, "answer", String(item.id), cfg.commentsFollowing);
