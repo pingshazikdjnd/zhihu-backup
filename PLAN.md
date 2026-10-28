@@ -152,7 +152,7 @@
 | E5 | 内容单字段（`source_url`/`question_title`/`author_name`/`label_info`/`excerpt`/时间）不参与变更比较 | `contents.ts` 变更组只含 title/hash/折叠/标签 |
 | E6 | `changed=false` 仍每次重 PUT R2（html + versions 双写） | `ingest.ts` 无条件 put；实测稳态 fast 轮每轮约 100-600 条上报 → 200-1200 次 Class A，全量轮才会到 5 万级 |
 | E7 | 全量评论直写 D1 不可行（769 万条 = 2,317 万行、14.4GB） | TEST_REPORT |
-| **E8** | **answers 分页重叠导致假早停（本地实测，最严重）**：answers 接口忽略 `limit=20`，实测 offset=0/20/40 分别返回 37/38/20 条；爬虫按 `offset+=20` 翻页 → 约 40% 重复提交；重复项在空库上凑满「连续 20 条无变化」→ **562 篇只备份了 57 篇就 exit 0** | 本地验证：3 页/95 提交/57 新增/38 无变化 |
+| **E8** | **answers 分页重叠导致假早停（已修复 `b2a85e2`，仍有残留）**：answers 接口忽略 `limit=20`，`paging.next` 的 offset 按请求的 limit（20）推进而非实际条数（37），页间仍重叠约 47%。已改为跟随 `paging.next` + `seenIds` 去重（重复项不入库、不计早停）。**残留 1**：`fallbackOffset += pageLen` 从 0 跨页累加，与真实 offset 脱节，`paging.next` 中途消失时会跳页；**残留 2**：关注答主回答段（同一 answers 端点）仍是 `aOffset += batchLimit` 且无去重，`earlyStop=5` 下可能假早停 | 本地：29 页/538 唯一回答/0 重复；真机：offset=0 返回 37 条、next offset=20、第二页重叠 18 条 |
 
 ---
 
@@ -164,7 +164,11 @@
 |---|---|---|
 | 赞同游标 | D1 `app_settings.upvotes_cursor` | 保留 |
 | 关注答主进度 | R2 `meta/followed_users.json`（`resume_offset/history_done/last_checked_answer_id`） | 保留 |
-| 我的回答/收藏的"上次见到的最旧 id" | **无** | 新增两个游标，仍走 `app_settings`（`answers_cursor`、`collections_cursor.<folderId>`），**不引入 1.5MB 的 seen 映射** |
+| 我的回答 / 收藏的增量停止点 | **无** | 新增 **`answers_newest_id`** / `collections_cursor.<folderId>.newest_id`：只记「上次处理过的最新一条 id」，增量时从第 1 页翻、撞到它即停（通常 1 页内） |
+| 我的回答 / 收藏的全量续传断点 | **无** | 新增 `answers_resume_url` + `answers_resume_offset` + `answers_oldest_id` / 每个收藏夹同结构：每完整处理一页就更新；`is_end` 时清断点并把 `history_done=true` |
+| 我的回答 / 收藏的首次历史完成门 | **无** | `answers_history_done` / `collections_cursor.<id>.history_done`：仅 `is_end` 时置 true |
+
+> ⚠️ **不能用「最旧 id」做增量停止点**：那会让每次增量都翻到最后一页（等于每轮全量，早停彻底失效）。增量和续传是两种用途，必须两组字段（见期 4）。
 
 > 初版的 `sync-state.json`（含 1.5MB `seen` 映射）**不再采用**：Worker 解析/合并大 JSON 会撞 10ms CPU，且与现有两套游标重复。
 
@@ -202,6 +206,20 @@ for page in pages(offset = 0, 20, 40, ...):
 > ⚠️ **"hot 模式"名不副实**：由于知乎固定时间倒序且 `&order=` 被忽略，当前代码里所谓"前 20 条热评"实际是**最新 20 条**（`comments.ts:43`、`main.ts:436` 的旧注释假设了点赞序）。如果要按真实热度取 top20，必须多翻几页（例如 5 页 100 条）在本地按 `vote_count` 排序，成本 ×5。此项列入 §9 待决策。
 >
 > ⚠️ 该算法只解决"新增"，不能发现"删除/点赞变化"：删除对账只能在**完整抓到 `is_end=true`** 的轮次里做（见 §4.4 的 `complete` 标志）。
+>
+> **触发条件（当前代码只按 count 增长，不够）**：现在 5 处都是 `commentCount > prevCommentCount`，以下三种情况不会触发：
+> - 评论被删（count 减少）；
+> - 评论被改（count 不变）；
+> - 风控截断后补齐（count 不变）。
+>
+> 建议改成：`commentCount 变化 || 上次是"真不完整" || 每 N 天一次 complete 轮转`。
+> **不能直接把 `partial` 持久化后当作重抓条件**：hot 模式与内联子评论路径按设计恒发 `partial=true`，会导致所有多评论内容每轮无限重抓。必须把 `partial` 升级为 `partialReason`：
+> - `hot_cap` / `inline_children`：这是设计上的截断，**不触发**重抓；
+> - `http_error` / `risk_empty` / `offset_cap`：**触发**重抓。
+>
+> ⚠️ 评审建议的第三条「`newest_comment_time < 内容 updated_time`」**不要照做**：评论没有 `updated_time`，内容的 `updated_time` 只随正文编辑变化、不随评论增删改变化；该条件只能检测"正文改过"，既漏检评论变化又大量误触发。
+>
+> 另：`newest_comment_time` 必须是 **per content** 的，不能放全局 `app_settings`。
 
 ### 4.4 评论双层存储（新增，替代"全量直写 D1"）
 
@@ -320,7 +338,9 @@ CREATE INDEX IF NOT EXISTS idx_comments_root_time
 
 ### 期 4：补两条游标（不新建大 state 文件）
 
-1. `app_settings` 增加 `answers_cursor`、`collections_cursor.<folderId>`（存最旧 id + 时间）。
+1. `app_settings` 新增两组游标（**不要混成一个**）：
+   - 增量停止点：`answers_newest_id`、`collections_cursor.<folderId>.newest_id`（纯 id）；
+   - 全量续传：`answers_resume_url`、`answers_resume_offset`、`answers_oldest_id`，收藏夹同结构 + `history_done`。
 2. `POST /ingest/sync-state` 的 key 白名单从仅 `upvotes_cursor` 扩展为上述 key；**值校验当前只允许 `https://`，需要放宽为"`https://` 或纯 id"**（新游标是 id）。
 3. `GET /ingest/sync-state` 的 SELECT 也要带上这些新 key（当前只查 `upvotes_cursor` 与 `zhihu_cookie`），并同步加进 `scripts/local-sync.mjs` 的 `inputPayload`。
 4. 爬虫在 `runScraper` / `runCollectionScraper` 撞到游标 id 时停止，并上报新游标。
