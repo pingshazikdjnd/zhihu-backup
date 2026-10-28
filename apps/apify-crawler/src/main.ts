@@ -40,7 +40,16 @@ const cfg = {
 
 // 失败上报：所有异常都被吞掉的爬虫在 Apify 上永远显示 SUCCEEDED，
 // cookie 失效后零数据入库也毫无感知。这里集中统计，结束时据此决定 run 状态。
-const stats = { saved: 0, failed: 0, authRejected: 0, riskEmpty: 0, consecutiveFailures: 0, circuitBroken: false };
+const MAX_DAILY_ESTIMATED_WRITES = 120000; // 设为 120k：充分吃满 CF 官方 100k 免费额度并多薅 20% 边缘突发，安全高效
+const stats = {
+  saved: 0,
+  failed: 0,
+  authRejected: 0,
+  riskEmpty: 0,
+  consecutiveFailures: 0,
+  circuitBroken: false,
+  estimatedWrites: 0
+};
 
 async function post(path: string, body: unknown): Promise<any> {
   // apiUrl 尾斜杠归一，避免拼出 //ingest/content 的 404
@@ -79,6 +88,22 @@ async function post(path: string, body: unknown): Promise<any> {
   }
   stats.saved++;
   stats.consecutiveFailures = 0;
+
+  let cost = 1;
+  if (path === "/ingest/content") cost = 3;
+  else if (path === "/ingest/comments") cost = Math.max(1, ((body as any)?.comments?.length || 1) * 2);
+  else if (path === "/ingest/upvote") cost = 2;
+  else if (path === "/ingest/collection-snapshot") cost = Math.max(1, (body as any)?.items?.length || 1);
+  else if (path === "/ingest/followed-users") cost = Math.max(1, (body as any)?.users?.length || 1);
+
+  stats.estimatedWrites += cost;
+  if (stats.estimatedWrites >= MAX_DAILY_ESTIMATED_WRITES) {
+    if (!stats.circuitBroken) {
+      stats.circuitBroken = true;
+      console.warn(`\n🛑 [D1每日限额保护] 今日预估写入已达 ${stats.estimatedWrites} 行（已充分吃满 CF 官方 100k 额度并适度利用缓冲）。主动安全挂起，已保存断点，等待明日 08:05 额度刷新后自动续跑！`);
+    }
+  }
+
   return json;
 }
 
