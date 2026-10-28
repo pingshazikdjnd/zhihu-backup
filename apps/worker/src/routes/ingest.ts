@@ -45,23 +45,28 @@ ingestRoutes.post("/content", async c => {
   const result = await upsertContent(parsed.data);
 
   if (c.env.BUCKET) {
+    // R2 的 put 是 Class A 且不比对内容：同一 key 同字节也会计费。
+    // key 已带 content_hash（正文一变 key 就变），所以只要对象已存在就无需重写。
+    // 不能只用 created/changed 判断：D1 写成功但 R2 put 失败时，下一轮 changed=false
+    // 会让正文永久缺失；这里用 HEAD 兜底，miss 即补写。
+    const putIfAbsent = async (key: string, body: string, contentType: string, kind: string) => {
+      if (!result.created) {
+        const existing = await c.env.BUCKET.head(key).catch(() => null);
+        if (existing) return false;
+      }
+      await c.env.BUCKET.put(key, body, {
+        httpMetadata: { contentType },
+        customMetadata: { pk, kind }
+      });
+      return true;
+    };
+
     if (htmlToStore) {
-      // key 带 content_hash：同一篇内容多次更新时旧版本不会被覆盖
-      await c.env.BUCKET.put(`html/${pk}/${result.hash}`, htmlToStore, {
-        httpMetadata: { contentType: "text/html; charset=utf-8" },
-        customMetadata: { pk }
-      });
-      // 版本快照单独存一份，D1 的 content_versions 只留 hash + 元数据
-      await c.env.BUCKET.put(`versions/${pk}/${result.hash}`, htmlToStore, {
-        httpMetadata: { contentType: "text/html; charset=utf-8" },
-        customMetadata: { pk, kind: "version" }
-      });
+      // versions/ 前缀全仓库无任何读取，且与 html/ 同字节双写，已删除
+      await putIfAbsent(`html/${pk}/${result.hash}`, htmlToStore, "text/html; charset=utf-8", "html");
     }
     if (mdToStore) {
-      await c.env.BUCKET.put(`md/${pk}/${result.hash}`, mdToStore, {
-        httpMetadata: { contentType: "text/plain; charset=utf-8" },
-        customMetadata: { pk }
-      });
+      await putIfAbsent(`md/${pk}/${result.hash}`, mdToStore, "text/plain; charset=utf-8", "md");
     }
   }
 

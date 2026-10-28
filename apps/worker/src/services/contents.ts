@@ -319,11 +319,14 @@ async function upsertContentInner(input: IngestContentInput) {
 
       let prevCommentCount = existing.comment_count;
       if (prevCommentCount > 0) {
+        // 与 resolvePrevCommentCount 保持一致：只用「一条评论都没入库」判定补抓。
+        // 早前这里还检查 author_avatar IS NULL（旧格式未迁移），但匿名/注销用户的
+        // 头像本来就是 NULL，会让每次正文变更都强制整篇重抓评论、早停反复清零。
         const cStat = await db.prepare(
-          `SELECT COUNT(*) AS cnt, SUM(CASE WHEN author_avatar IS NULL THEN 1 ELSE 0 END) AS unmigrated FROM comments WHERE content_pk = ?`
-        ).get<{ cnt: number; unmigrated: number }>(pk);
-        if (!cStat || Number(cStat.cnt) === 0 || Number(cStat.unmigrated) > 0) {
-          prevCommentCount = 0; // comments 表中尚无评论或存在旧格式评论，强制返回 0 触发爬虫补抓
+          `SELECT COUNT(*) AS cnt FROM comments WHERE content_pk = ?`
+        ).get<{ cnt: number }>(pk);
+        if (!cStat || Number(cStat.cnt) === 0) {
+          prevCommentCount = 0; // comments 表中尚无评论，强制返回 0 触发爬虫补抓
         }
       }
 

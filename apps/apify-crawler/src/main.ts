@@ -223,19 +223,28 @@ export async function runScraper() {
 
   const pendingCommentsQueue: Array<{ answerId: string; url: string }> = [];
 
-  let offset = 0;
   let isEnd = false;
   let existingCount = 0;
   let pagesScanned = 0;
   let submitted = 0;
   let createdCount = 0;
   let noChangeCount = 0;
+  let duplicateSkipped = 0;
+  let limitIgnoredWarned = false;
   
   console.log("🌐 正在通过 API 拉取回答列表...");
   const includeStr = encodeURIComponent("data[*].is_normal,admin_closed_comment,reward_info,is_collapsed,annotation_action,annotation_detail,collapse_reason,collapsed_by,suggest_edit,comment_count,can_comment,content,voteup_count,reshipment_settings,comment_permission,mark_infos,created_time,updated_time,review_info,question,excerpt,is_labeled,label_info,relationship.is_authorized,voting,is_author,is_thanked,is_nothelp,is_recognized,visit_count,favorite_count;data[*].author.badge[?(type=best_answerer)].topics");
 
-  while (!isEnd) {
-    const res = await context.request.get(`https://www.zhihu.com/api/v4/members/${ZHIHU_USERNAME}/answers?include=${includeStr}&limit=20&offset=${offset}`);
+  // answers 接口会忽略 limit（实测 offset=0/20/40 返回 37/38/20 条），
+  // 继续按 offset += 20 翻页会把相邻页 40% 的重复项当成"无变化"，
+  // 极速模式下 20 条重复就能凑满早停阈值，562 篇只入库 57 篇。
+  // 改为跟随服务端 paging.next 翻页，并用 seenIds 去重后计早停。
+  let nextUrl: string = `https://www.zhihu.com/api/v4/members/${ZHIHU_USERNAME}/answers?include=${includeStr}&limit=20&offset=0`;
+  let fallbackOffset = 0;
+  const seenIds = new Set<string>();
+
+  while (!isEnd && nextUrl) {
+    const res = await context.request.get(nextUrl);
     
     if (!res.ok()) {
       console.error(`❌ 获取回答失败: API 返回状态码 ${res.status()}`);
@@ -257,8 +266,21 @@ export async function runScraper() {
     }
 
     pagesScanned++;
+    const pageLen = Array.isArray(json.data) ? json.data.length : 0;
+    if (pageLen !== 20 && !limitIgnoredWarned) {
+      limitIgnoredWarned = true;
+      console.warn(`⚠️ answers 分页返回 ${pageLen} 条（limit 未生效），已按 paging.next 翻页`);
+    }
     for (const item of json.data) {
-      if (item.type !== "answer") continue;
+      if (!item?.id || item.type !== "answer") continue;
+      const idStr = String(item.id);
+      // 分页重叠去重：同一回答可能在相邻页重复出现，重复项不得计入
+      // existingCount（否则重复项会被当成"无变化"凑满 20 条触发假早停）
+      if (seenIds.has(idStr)) {
+        duplicateSkipped++;
+        continue;
+      }
+      seenIds.add(idStr);
 
       // 列表接口 include 已显式请求 voteup_count/visit_count/favorite_count/comment_count，
       // 之前每条回答再单独请求一次 /answers/{id} 拿同样字段，纯属 562 次多余请求
@@ -323,9 +345,15 @@ export async function runScraper() {
     }
 
     if (stats.circuitBroken) break;
-    if (!isEnd) isEnd = json.paging?.is_end;
-    offset += 20;
+    if (!isEnd) isEnd = Boolean(json.paging?.is_end);
+    fallbackOffset += pageLen || 20;
+    const nextFromApi = typeof json.paging?.next === "string" ? json.paging.next : "";
+    // paging.next 优先；缺失时按实际返回条数推进 offset 兜底（limit 被忽略时也不会跳页）
+    nextUrl = nextFromApi || (isEnd ? "" : `https://www.zhihu.com/api/v4/members/${ZHIHU_USERNAME}/answers?include=${includeStr}&limit=20&offset=${fallbackOffset}`);
     await new Promise(r => setTimeout(r, 1000));
+  }
+  if (duplicateSkipped > 0) {
+    console.log(`🔁 answers 分页重叠去重：跳过 ${duplicateSkipped} 条重复条目`);
   }
 
   if (pendingCommentsQueue.length > 0 && !stats.circuitBroken) {
@@ -473,7 +501,7 @@ export async function runScraper() {
 
   console.log("🎉 回答和评论同步完成！");
   console.log(
-    `📊 本轮我的回答：扫描 ${pagesScanned} 页 / 提交 ${submitted} 条 / 新增 ${createdCount} 条 / 无变化 ${noChangeCount} 条` +
+    `📊 本轮我的回答：扫描 ${pagesScanned} 页 / 提交 ${submitted} 条 / 新增 ${createdCount} 条 / 无变化 ${noChangeCount} 条 / 重复跳过 ${duplicateSkipped} 条` +
     (isFast && existingCount >= 20 ? "（命中连续无更新早停）" : "")
   );
   await browser.close();
@@ -709,7 +737,7 @@ export async function runCollectionScraper() {
                 excerpt: item.excerpt || "",
                 voteupCount: item.voteup_count || item.reaction?.statistics?.like_count || item.reaction?.statistics?.upvote_count || 0,
                 commentCount: item.comment_count || 0,
-                favoriteCount: item.favorite_count || item.thanks_count || item.reaction?.statistics?.favorites || item.reaction?.statistics?.favorite_count || 0,
+                favoriteCount: item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0,
                 visitCount: item.visit_count || item.reaction?.statistics?.visit_count || 0,
                 isCollapsed: item.is_collapsed,
                 isLabeled: item.is_labeled,
@@ -1193,9 +1221,11 @@ export async function runFollowingScraper(onlyList = false) {
     let value = 0;
     const reasons: string[] = [];
 
-    const voteup = Number(item?.voteup_count) || 0;
+    // following 列表接口常不下发 voteup_count/favorite_count（只在 reaction.statistics 里），
+    // 只读顶层字段会让自动抢救判定把高赞神贴当成 0 赞，漏掉该抢救的内容
+    const voteup = Number(item?.voteup_count ?? item?.reaction?.statistics?.like_count) || 0;
     const comments = Number(item?.comment_count) || 0;
-    const favs = Number(item?.favorite_count) || 0;
+    const favs = Number(item?.favorite_count ?? item?.reaction?.statistics?.favorites) || 0;
     const isCollapsed = Boolean(item?.is_collapsed);
     const isLabeled = Boolean(item?.is_labeled) || Boolean(item?.label_info);
     const text = `${item?.question?.title || ""} ${item?.title || ""} ${item?.excerpt || ""} ${rawHtml.slice(0, 1500)}`.toLowerCase();
@@ -1364,9 +1394,10 @@ export async function runFollowingScraper(onlyList = false) {
               contentHtml: cleanedHtml,
               contentMd: "",
               excerpt: item.excerpt || "",
-              voteupCount: item.voteup_count || 0,
+              // following 列表不下发顶层 voteup_count/favorite_count，需回退到 reaction.statistics
+              voteupCount: item.voteup_count ?? item.reaction?.statistics?.like_count ?? 0,
               commentCount: item.comment_count || 0,
-              favoriteCount: item.favorite_count || 0,
+              favoriteCount: item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0,
               visitCount: item.visit_count || 0,
               isCollapsed: item.is_collapsed,
               isLabeled: item.is_labeled,
@@ -1382,7 +1413,7 @@ export async function runFollowingScraper(onlyList = false) {
               } else {
                 // 规则未通过：只有落在候选池（高赞/长文/中风险）才进入本轮的 AI 复核队列
                 const plainTextLen = cleanedHtml.replace(/<[^>]+>/g, "").trim().length;
-                const voteup = Number(item.voteup_count) || 0;
+                const voteup = Number(item.voteup_count ?? item.reaction?.statistics?.like_count) || 0;
                 const isAiCandidate = voteup >= 100 || plainTextLen >= 600 || evalRes.riskScore >= 18;
                 if (isAiCandidate && answerAiCandidates.length < 10) {
                   answerAiCandidates.push({
@@ -1393,7 +1424,7 @@ export async function runFollowingScraper(onlyList = false) {
                     excerpt: item.excerpt || "",
                     voteupCount: voteup,
                     commentCount: Number(item.comment_count) || 0,
-                    favoriteCount: Number(item.favorite_count) || 0,
+                    favoriteCount: Number(item.favorite_count ?? item.reaction?.statistics?.favorites) || 0,
                     isCollapsed: Boolean(item.is_collapsed),
                     isLabeled: Boolean(item.is_labeled) || Boolean(item.label_info),
                     riskScore: evalRes.riskScore,
@@ -1520,9 +1551,10 @@ export async function runFollowingScraper(onlyList = false) {
             contentHtml: cleanedHtml,
             contentMd: "",
             excerpt: item.excerpt || "",
-            voteupCount: item.voteup_count || 0,
+            // 同理：文章列表也只给 reaction.statistics
+            voteupCount: item.voteup_count ?? item.reaction?.statistics?.like_count ?? 0,
             commentCount: item.comment_count || 0,
-            favoriteCount: item.favorite_count || 0,
+            favoriteCount: item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0,
             visitCount: item.visit_count || 0,
             createdTime: toIsoOrNull(item.created || item.created_time),
             updatedTime: toIsoOrNull(item.updated || item.updated_time)
@@ -1534,7 +1566,7 @@ export async function runFollowingScraper(onlyList = false) {
             } else {
               // 文章路径同一套候选池与 AI 复核策略：规则通过直接存，否则入候选池
               const plainTextLen = cleanedHtml.replace(/<[^>]+>/g, "").trim().length;
-              const voteup = Number(item.voteup_count) || 0;
+              const voteup = Number(item.voteup_count ?? item.reaction?.statistics?.like_count) || 0;
               const isAiCandidate = voteup >= 100 || plainTextLen >= 600 || evalRes.riskScore >= 18;
               if (isAiCandidate && articleAiCandidates.length < 10) {
                 articleAiCandidates.push({
@@ -1545,7 +1577,7 @@ export async function runFollowingScraper(onlyList = false) {
                   excerpt: item.excerpt || "",
                   voteupCount: voteup,
                   commentCount: Number(item.comment_count) || 0,
-                  favoriteCount: Number(item.favorite_count) || 0,
+                  favoriteCount: Number(item.favorite_count ?? item.reaction?.statistics?.favorites) || 0,
                   isCollapsed: Boolean(item.is_collapsed),
                   isLabeled: Boolean(item.is_labeled) || Boolean(item.label_info),
                   riskScore: evalRes.riskScore,
