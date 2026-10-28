@@ -57,6 +57,12 @@ async function post(path: string, body: unknown): Promise<any> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (apiSecret) headers["authorization"] = `Bearer ${apiSecret}`;
 
+  // 熔断后立即拒绝：只置位不拦截的话，评论分块/热评发送等路径仍会继续
+  // 打出成百上千行写入，直接撞穿 D1 当日硬顶
+  if (stats.circuitBroken) {
+    throw new Error("circuit_open: 已达当日写入预算，跳过后续请求");
+  }
+
   let res: Response;
   try {
     res = await fetch(`${base}${path}`, {
@@ -402,6 +408,7 @@ export async function runScraper() {
           // 否则前面批次刚插入的评论会被误判删除
           const CHUNK = 500;
           for (let i = 0; i < finalComments.length; i += CHUNK) {
+            if (stats.circuitBroken) break;
             const isLast = i + CHUNK >= finalComments.length;
             const payload = {
               contentPk: `answer:${task.answerId}`,
@@ -533,6 +540,7 @@ async function syncHotCommentsForContent(
       const finalComments = [...uniqueMap.values()];
       const CHUNK = 500;
       for (let i = 0; i < finalComments.length; i += CHUNK) {
+        if (stats.circuitBroken) break;
         const isLast = i + CHUNK >= finalComments.length;
         await sendComments({
           contentPk: `${sourceType}:${sourceId}`,

@@ -215,15 +215,18 @@ async function upsertContentInner(input: IngestContentInput) {
       bodyChanges.push("标签更新");
     }
 
-    // comments 表尚无评论或存在旧格式评论（头像未迁移）时强制返回 0，
-    // 触发爬虫补抓；两条「无 body 变更」的返回路径都必须带上这个修正
+    // comments 表尚无评论时强制返回 0，触发爬虫补抓；
+    // 两条「无 body 变更」的返回路径都必须带上这个修正
     const resolvePrevCommentCount = async () => {
       let prevCommentCount = existing.comment_count;
       if (prevCommentCount > 0) {
         const cStat = await db.prepare(
-          `SELECT COUNT(*) AS cnt, SUM(CASE WHEN author_avatar IS NULL THEN 1 ELSE 0 END) AS unmigrated FROM comments WHERE content_pk = ?`
-        ).get<{ cnt: number; unmigrated: number }>(pk);
-        if (!cStat || Number(cStat.cnt) === 0 || Number(cStat.unmigrated) > 0) {
+          `SELECT COUNT(*) AS cnt FROM comments WHERE content_pk = ?`
+        ).get<{ cnt: number }>(pk);
+        // 只有「一条评论都没入库」才强制补抓。此前用 author_avatar IS NULL 判定
+        // 「旧格式未迁移」，但知乎匿名/注销用户的头像本来就是空，导致这些内容
+        // 永远被判为未抓全、每轮全量重抓评论，早停被反复清零。
+        if (!cStat || Number(cStat.cnt) === 0) {
           prevCommentCount = 0;
         }
       }
