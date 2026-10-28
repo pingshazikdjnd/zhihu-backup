@@ -2,6 +2,7 @@ import { db } from "../db.js";
 import { evaluateContentRisk } from "./risk.js";
 import { getFollowedUsersMap } from "./following.js";
 import { getSyncConfig } from "../routes/auth.js";
+import { sha256 } from "../utils/hash.js";
 import type { Bindings } from "../types.js";
 
 const FAV_JOIN = `(SELECT content_pk, MAX(first_seen_at) AS fav_added_at FROM collection_items WHERE is_removed = 0 GROUP BY content_pk)`;
@@ -361,4 +362,229 @@ export async function assessContentWithWorkersAI(env: Bindings, pk: string) {
     ...staticRisk,
     ai: aiResult
   };
+}
+
+// ===== 关注答主「是否值得备份」AI 批量复核 =====
+// 目标：规则筛选未通过、但处在候选池（高赞/长文/中风险）的回答或文章，
+// 用一次批量 Workers AI 调用判断是否值得抢救备份，重点识别容易被和谐的内容。
+// 额度保护：单次最多 10 条、逐条 R2 缓存、失败一律规则降级不抛错。
+
+export type FollowingEvalItem = {
+  sourceId: string;
+  sourceType: "answer" | "article" | "pin";
+  title: string;
+  questionTitle?: string;
+  excerpt?: string;
+  voteupCount?: number;
+  commentCount?: number;
+  favoriteCount?: number;
+  isCollapsed?: boolean;
+  isLabeled?: boolean;
+  riskScore?: number;
+  riskTags?: string[];
+};
+
+export type FollowingEvalResult = { sourceId: string; worth: boolean; risk: number; reason: string };
+
+// AI 不可用 / 解析失败 / 未返回该条时的规则兜底（绝不抛错中断抓取）
+function fallbackFollowingResult(item: FollowingEvalItem): FollowingEvalResult {
+  const risk = Math.min(100, Math.max(0, Math.round(Number(item.riskScore) || 0)));
+  return {
+    sourceId: item.sourceId,
+    worth: risk >= 25 || Boolean(item.isCollapsed) || Boolean(item.isLabeled),
+    risk,
+    reason: "AI不可用·规则兜底"
+  };
+}
+
+function extractWorkersAiText(resp: unknown): string {
+  if (!resp || typeof resp !== "object") return "";
+  const obj = resp as Record<string, unknown>;
+  if (typeof obj.response === "string") return obj.response;
+  const choices = obj.choices;
+  if (Array.isArray(choices) && choices.length > 0) {
+    const first = choices[0];
+    if (first && typeof first === "object") {
+      const message = (first as Record<string, unknown>).message;
+      if (message && typeof message === "object") {
+        const content = (message as Record<string, unknown>).content;
+        if (typeof content === "string") return content;
+      }
+    }
+  }
+  return "";
+}
+
+// 剥离 ```json 围栏与 <think> 思考块，再从文本里截取第一个 JSON 数组
+function parseFollowingAiArray(text: string): FollowingEvalResult[] | null {
+  const cleaned = text
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+  const start = cleaned.indexOf("[");
+  const end = cleaned.lastIndexOf("]");
+  if (start < 0 || end <= start) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  const results: FollowingEvalResult[] = [];
+  for (const row of parsed) {
+    if (!row || typeof row !== "object") continue;
+    const rec = row as Record<string, unknown>;
+    const sourceId = typeof rec.sourceId === "string" ? rec.sourceId : "";
+    if (!sourceId) continue;
+    const riskRaw = Number(rec.risk);
+    results.push({
+      sourceId,
+      worth: rec.worth === true,
+      risk: Number.isFinite(riskRaw) ? Math.min(100, Math.max(0, Math.round(riskRaw))) : 0,
+      reason: typeof rec.reason === "string" ? rec.reason.slice(0, 120) : ""
+    });
+  }
+  return results.length > 0 ? results : null;
+}
+
+export async function evaluateFollowingWithAI(env: Bindings, items: FollowingEvalItem[]) {
+  const capped = items.slice(0, 10);
+  const resultMap = new Map<string, FollowingEvalResult & { cached: boolean }>();
+  const cacheKeyMap = new Map<string, string>();
+  const misses: FollowingEvalItem[] = [];
+  let cachedCount = 0;
+
+  // 1. 逐条查 R2 缓存：key = meta/ai-following/<sha256(sourceId|摘要|赞数)>.json
+  for (const item of capped) {
+    const cacheSeed = `${item.sourceId}|${item.excerpt || item.title || ""}|${Number(item.voteupCount) || 0}`;
+    let cacheKey = "";
+    try {
+      cacheKey = `meta/ai-following/${await sha256(cacheSeed)}.json`;
+    } catch { /* 哈希失败则跳过缓存 */ }
+    if (cacheKey) cacheKeyMap.set(item.sourceId, cacheKey);
+
+    let hit: (FollowingEvalResult & { cached: boolean }) | null = null;
+    if (env.BUCKET && cacheKey) {
+      try {
+        const obj = await env.BUCKET.get(cacheKey);
+        if (obj) {
+          const parsed: unknown = JSON.parse(await obj.text());
+          if (parsed && typeof parsed === "object") {
+            const rec = parsed as Record<string, unknown>;
+            if (typeof rec.worth === "boolean" && rec.sourceId === item.sourceId) {
+              const riskRaw = Number(rec.risk);
+              hit = {
+                sourceId: item.sourceId,
+                worth: rec.worth,
+                risk: Number.isFinite(riskRaw) ? Math.min(100, Math.max(0, Math.round(riskRaw))) : 0,
+                reason: typeof rec.reason === "string" ? rec.reason.slice(0, 120) : "",
+                cached: true
+              };
+            }
+          }
+        }
+      } catch { /* 缓存损坏按未命中处理 */ }
+    }
+    if (hit) {
+      resultMap.set(item.sourceId, hit);
+      cachedCount++;
+    } else {
+      misses.push(item);
+    }
+  }
+
+  let model = cachedCount > 0 && misses.length === 0 ? "cache" : "rule-fallback";
+
+  // 2. 未命中条目合并成一次批量 prompt 调用现有 AI 链
+  if (misses.length > 0 && env.AI) {
+    const cfg = await getSyncConfig(env.BUCKET);
+    const defaultChain = [
+      "@cf/qwen/qwen3-30b-a3b-fp8",
+      "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+      "@cf/zai-org/glm-5.3-flash",
+      "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      "@cf/meta/llama-3.1-8b-instruct-fp8"
+    ];
+    const models = cfg.preferredAiModel
+      ? [cfg.preferredAiModel, ...defaultChain.filter(m => m !== cfg.preferredAiModel)]
+      : defaultChain;
+
+    // 每条只放判断必需的最小字段，不塞正文全文（控制 token 与限额消耗）
+    const promptItems = misses.map(item => ({
+      sourceType: item.sourceType,
+      title: item.title || "",
+      questionTitle: item.questionTitle || "",
+      excerpt: (item.excerpt || "").slice(0, 200),
+      voteupCount: Number(item.voteupCount) || 0,
+      commentCount: Number(item.commentCount) || 0,
+      favoriteCount: Number(item.favoriteCount) || 0,
+      isCollapsed: Boolean(item.isCollapsed),
+      isLabeled: Boolean(item.isLabeled),
+      ruleRiskScore: Math.min(100, Math.max(0, Math.round(Number(item.riskScore) || 0))),
+      ruleRiskTags: Array.isArray(item.riskTags) ? item.riskTags.slice(0, 6) : []
+    }));
+
+    const prompt = `你是知乎内容归档与防和谐风险评估助手。请判断下列关注答主的内容是否值得备份保存，特别关注容易被知乎折叠/删除/限流的敏感内容（时政、社会争议、审查相关、禁评迹象等），同时保留信息密度高、有长期收藏价值的干货。
+只输出一个 JSON 数组，不要输出任何解释、前后缀或 markdown 代码块。数组元素格式：
+[{"sourceId":"原文id","worth":true,"risk":78,"reason":"不超过20字的中文理由"}]
+字段说明：worth 是否值得备份（布尔值），risk 被和谐风险 0-100 整数，reason 简短中文理由。
+待判断内容（JSON）：
+${JSON.stringify(promptItems)}`;
+
+    for (const m of models) {
+      try {
+        const resp: unknown = await env.AI.run(m, {
+          messages: [
+            { role: "system", content: "你是知乎内容归档助手，只输出 JSON 数组，不输出任何其它文字。" },
+            { role: "user", content: prompt }
+          ],
+          max_tokens: 900
+        });
+        const parsed = parseFollowingAiArray(extractWorkersAiText(resp));
+        if (!parsed) continue;
+
+        const allowed = new Set(misses.map(i => i.sourceId));
+        const adopted: FollowingEvalResult[] = [];
+        for (const r of parsed) {
+          if (!allowed.has(r.sourceId)) continue;
+          resultMap.set(r.sourceId, { ...r, cached: false });
+          adopted.push(r);
+        }
+        // 模型没给出任何有效条目视为本模型失败，继续尝试下一个
+        if (adopted.length === 0) continue;
+
+        model = m;
+        // 3. 仅解析成功的结果写回 R2 缓存（规则降级的条目下轮仍可重试）
+        if (env.BUCKET) {
+          for (const r of adopted) {
+            const key = cacheKeyMap.get(r.sourceId);
+            if (!key) continue;
+            try {
+              await env.BUCKET.put(key, JSON.stringify(r), {
+                httpMetadata: { contentType: "application/json; charset=utf-8" }
+              });
+            } catch { /* 缓存写入失败不影响本次结果 */ }
+          }
+        }
+        break;
+      } catch {
+        // 尝试下一个免费模型
+      }
+    }
+  }
+
+  // 4. 仍无结论的条目统一走规则降级，保证结果完整且不抛错
+  for (const item of misses) {
+    if (!resultMap.has(item.sourceId)) {
+      resultMap.set(item.sourceId, { ...fallbackFollowingResult(item), cached: false });
+    }
+  }
+
+  const results = capped
+    .map(item => resultMap.get(item.sourceId))
+    .filter((r): r is FollowingEvalResult & { cached: boolean } => Boolean(r));
+
+  return { results, model, cachedCount };
 }

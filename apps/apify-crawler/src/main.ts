@@ -981,6 +981,84 @@ export async function runUpvotesScraper() {
   }
 }
 
+// 关注答主「AI 价值/风险复核」候选：规则未通过但落在候选池（高赞/长文/中风险）的条目。
+// 额度保护：每位答主每轮最多 10 条，整个 run 最多调用 3 次 AI 复核接口。
+type FollowingAiCandidate = {
+  sourceType: "answer" | "article";
+  sourceId: string;
+  title: string;
+  questionTitle: string;
+  excerpt: string;
+  voteupCount: number;
+  commentCount: number;
+  favoriteCount: number;
+  isCollapsed: boolean;
+  isLabeled: boolean;
+  riskScore: number;
+  riskTags: string[];
+  contentInput: Record<string, unknown>;
+};
+
+let aiEvalCalls = 0;
+const MAX_AI_EVAL_CALLS = 3;
+
+async function evaluateFollowingCandidatesWithAI(
+  userName: string,
+  candidates: FollowingAiCandidate[]
+): Promise<FollowingAiCandidate[]> {
+  const capped = candidates.slice(0, 10);
+  if (capped.length === 0) return [];
+  if (aiEvalCalls >= MAX_AI_EVAL_CALLS) {
+    console.log(`  ⏭️ [${userName}] 本轮 AI 复核已达 ${MAX_AI_EVAL_CALLS} 次上限，${capped.length} 条候选按规则跳过`);
+    return [];
+  }
+  aiEvalCalls++;
+  try {
+    const res = await post("/api/recommend/evaluate-following", {
+      items: capped.map(c => ({
+        sourceId: c.sourceId,
+        sourceType: c.sourceType,
+        title: c.title,
+        questionTitle: c.questionTitle,
+        excerpt: c.excerpt,
+        voteupCount: c.voteupCount,
+        commentCount: c.commentCount,
+        favoriteCount: c.favoriteCount,
+        isCollapsed: c.isCollapsed,
+        isLabeled: c.isLabeled,
+        riskScore: c.riskScore,
+        riskTags: c.riskTags
+      }))
+    });
+    const rawResults: unknown = res?.results;
+    if (!Array.isArray(rawResults)) return [];
+    const worthMap = new Map<string, { risk: number; reason: string }>();
+    for (const row of rawResults) {
+      if (!row || typeof row !== "object") continue;
+      const rec = row as Record<string, unknown>;
+      const sid = typeof rec.sourceId === "string" ? rec.sourceId : "";
+      if (!sid || rec.worth !== true) continue;
+      const riskNum = Number(rec.risk);
+      worthMap.set(sid, {
+        risk: Number.isFinite(riskNum) ? riskNum : 0,
+        reason: typeof rec.reason === "string" ? rec.reason : ""
+      });
+    }
+    const kept: FollowingAiCandidate[] = [];
+    for (const c of capped) {
+      const verdict = worthMap.get(c.sourceId);
+      if (!verdict) continue;
+      console.log(`🤖 [AI判定值得备份] risk=${verdict.risk} reason=${verdict.reason}: ${c.title}`);
+      kept.push(c);
+    }
+    return kept;
+  } catch (e) {
+    // 异常/非 2xx：整批回退规则判定（按未通过处理，跳过），绝不中断抓取
+    console.warn(`⚠️ [${userName}] AI 复核调用失败，本批 ${capped.length} 条候选回退规则判定（跳过）: ${sanitizeErrorForLog(e)}`);
+    return [];
+  }
+}
+
 export async function runFollowingScraper(onlyList = false) {
   const browser = await setupBrowser();
   console.log("🚀 开始同步你关注的人...");
@@ -1061,7 +1139,7 @@ export async function runFollowingScraper(onlyList = false) {
 
   // 同步关注答主的回答：
   // - 开启了「全量备份（full）」的答主优先排在前面，抓取全量（快速模式下连续 15 条未变则早停）
-  // - 默认精选模式的答主：每人最多抓取前 50 篇（快速模式下只看最新第 1 页且连续 5 条未变即停）
+  // - 默认精选模式的答主：首次历史摸底只抓「最热 60 篇」，由风险/价值规则 + AI 复核决定是否入库
   const sortedUsers = [...followedUsers].sort((a, b) => {
     const aFull = fullModeSet.has(a.urlToken) ? 1 : 0;
     const bFull = fullModeSet.has(b.urlToken) ? 1 : 0;
@@ -1164,6 +1242,9 @@ export async function runFollowingScraper(onlyList = false) {
     const isHistoryDone = Boolean(prog.historyDone);
     const lastMarkAnswerId = String(prog.lastCheckedAnswerId || "");
     let newestSeenAnswerId = "";
+    // 规则未通过但值得 AI 复核的候选（每类最多 10 条，扫描结束后批量复核一次）
+    const answerAiCandidates: FollowingAiCandidate[] = [];
+    const articleAiCandidates: FollowingAiCandidate[] = [];
 
     // 核心分流逻辑：
     // - 若该答主已完成首次历史存量扫描（historyDone === true）且当前为日常快速同步（isFast === true）：
@@ -1179,7 +1260,7 @@ export async function runFollowingScraper(onlyList = false) {
           ? "日常增量 · 扫描最新动态至上次标记点"
           : isUserFull
           ? `全量断点续传 · 从第 ${prog.resumeOffset || 0} 篇继续 (共 ${u.answerCount} 回答)`
-          : "首次历史摸底 · 扫描最新+最高赞并自动抢救高危/精品回答"
+          : "首次历史摸底 · 抓取最热 60 篇并做风险/价值筛选"
       })...`
     );
 
@@ -1196,10 +1277,7 @@ export async function runFollowingScraper(onlyList = false) {
                 : []),
               { sortBy: "created" as const, startOffset: prog.resumeOffset || 0, maxScan: 100000, earlyStop: 999999, trackResume: true }
             ]
-          : [
-              { sortBy: "created", startOffset: 0, maxScan: 60, earlyStop: 999999, trackResume: false },
-              { sortBy: "voteups", startOffset: 0, maxScan: 60, earlyStop: 999999, trackResume: false }
-            ];
+          : [{ sortBy: "voteups", startOffset: 0, maxScan: 60, earlyStop: 999999, trackResume: false }];
 
       let savedForUser = 0;
       for (const plan of plans) {
@@ -1236,14 +1314,7 @@ export async function runFollowingScraper(onlyList = false) {
             }
 
             const cleanedHtml = cleanHtml(item.content);
-
-            if (!isUserFull) {
-              const evalRes = evaluateForAutoBackup(item, cleanedHtml);
-              if (!evalRes.shouldBackup) {
-                continue; // 普通低风险水贴直接跳过，不占 D1 / R2 容量
-              }
-              console.log(`  🛡️ [自动抢救 ${u.name}] 风险${evalRes.riskScore}分/质量${evalRes.valueScore}分 (${evalRes.reason}): ${item.question?.title || item.id}`);
-            }
+            const evalRes = isUserFull ? null : evaluateForAutoBackup(item, cleanedHtml);
 
             const contentInput = {
               sourceType: "answer" as const,
@@ -1270,6 +1341,36 @@ export async function runFollowingScraper(onlyList = false) {
               createdTime: toIsoOrNull(item.created_time),
               updatedTime: toIsoOrNull(item.updated_time)
             };
+
+            if (evalRes) {
+              if (evalRes.shouldBackup) {
+                // 规则已通过：直接保存，不浪费 AI 额度
+                console.log(`  🛡️ [自动抢救 ${u.name}] 风险${evalRes.riskScore}分/质量${evalRes.valueScore}分 (${evalRes.reason}): ${item.question?.title || item.id}`);
+              } else {
+                // 规则未通过：只有落在候选池（高赞/长文/中风险）才进入本轮的 AI 复核队列
+                const plainTextLen = cleanedHtml.replace(/<[^>]+>/g, "").trim().length;
+                const voteup = Number(item.voteup_count) || 0;
+                const isAiCandidate = voteup >= 100 || plainTextLen >= 600 || evalRes.riskScore >= 18;
+                if (isAiCandidate && answerAiCandidates.length < 10) {
+                  answerAiCandidates.push({
+                    sourceType: "answer",
+                    sourceId: String(item.id),
+                    title: item.question?.title || "未知问题",
+                    questionTitle: item.question?.title || "",
+                    excerpt: item.excerpt || "",
+                    voteupCount: voteup,
+                    commentCount: Number(item.comment_count) || 0,
+                    favoriteCount: Number(item.favorite_count) || 0,
+                    isCollapsed: Boolean(item.is_collapsed),
+                    isLabeled: Boolean(item.is_labeled) || Boolean(item.label_info),
+                    riskScore: evalRes.riskScore,
+                    riskTags: evalRes.reason ? evalRes.reason.split("+").filter(Boolean) : [],
+                    contentInput
+                  });
+                }
+                continue; // 普通低风险水贴直接跳过，不占 D1 / R2 容量
+              }
+            }
 
             try {
               const dbRes = await sendContent(contentInput);
@@ -1311,6 +1412,28 @@ export async function runFollowingScraper(onlyList = false) {
           await new Promise(r => setTimeout(r, 500));
         }
       }
+      // 扫描结束后对本轮候选做一次批量 AI 复核（最多 10 条/答主、全局最多 3 次调用）
+      if (answerAiCandidates.length > 0 && !stats.circuitBroken) {
+        const aiKept = await evaluateFollowingCandidatesWithAI(u.name, answerAiCandidates);
+        for (const cand of aiKept) {
+          if (stats.circuitBroken) break;
+          try {
+            const dbRes = await sendContent(cand.contentInput);
+            if (
+              cfg.commentsFollowing !== "none" &&
+              cand.commentCount > (Number(dbRes?.prevCommentCount) || 0) &&
+              !stats.circuitBroken
+            ) {
+              await syncHotCommentsForContent(context, "answer", cand.sourceId, cfg.commentsFollowing);
+            }
+            savedForUser++;
+          } catch (err) {
+            completedAllPlans = false;
+            console.error(`❌ 保存 AI 判定回答失败: ${sanitizeErrorForLog(err)}`);
+            if (stats.circuitBroken) break;
+          }
+        }
+      }
       if (!isUserFull && savedForUser > 0) {
         console.log(`  ✅ [${u.name}] 智能风险抢救共入库 ${savedForUser} 篇高危/精品回答`);
       }
@@ -1341,11 +1464,7 @@ export async function runFollowingScraper(onlyList = false) {
         for (const item of artJson.data) {
           if (!item?.id) continue;
           const cleanedHtml = cleanHtml(item.content);
-          if (!isUserFull) {
-            const evalRes = evaluateForAutoBackup(item, cleanedHtml);
-            if (!evalRes.shouldBackup) continue;
-            console.log(`  🛡️ [自动抢救文章 ${u.name}] 风险${evalRes.riskScore}分/质量${evalRes.valueScore}分 (${evalRes.reason}): ${item.title}`);
-          }
+          const evalRes = isUserFull ? null : evaluateForAutoBackup(item, cleanedHtml);
           const contentInput = {
             sourceType: "article" as const,
             sourceId: String(item.id),
@@ -1368,6 +1487,35 @@ export async function runFollowingScraper(onlyList = false) {
             updatedTime: toIsoOrNull(item.updated || item.updated_time)
           };
 
+          if (evalRes) {
+            if (evalRes.shouldBackup) {
+              console.log(`  🛡️ [自动抢救文章 ${u.name}] 风险${evalRes.riskScore}分/质量${evalRes.valueScore}分 (${evalRes.reason}): ${item.title}`);
+            } else {
+              // 文章路径同一套候选池与 AI 复核策略：规则通过直接存，否则入候选池
+              const plainTextLen = cleanedHtml.replace(/<[^>]+>/g, "").trim().length;
+              const voteup = Number(item.voteup_count) || 0;
+              const isAiCandidate = voteup >= 100 || plainTextLen >= 600 || evalRes.riskScore >= 18;
+              if (isAiCandidate && articleAiCandidates.length < 10) {
+                articleAiCandidates.push({
+                  sourceType: "article",
+                  sourceId: String(item.id),
+                  title: item.title || "未知文章",
+                  questionTitle: "",
+                  excerpt: item.excerpt || "",
+                  voteupCount: voteup,
+                  commentCount: Number(item.comment_count) || 0,
+                  favoriteCount: Number(item.favorite_count) || 0,
+                  isCollapsed: Boolean(item.is_collapsed),
+                  isLabeled: Boolean(item.is_labeled) || Boolean(item.label_info),
+                  riskScore: evalRes.riskScore,
+                  riskTags: evalRes.reason ? evalRes.reason.split("+").filter(Boolean) : [],
+                  contentInput
+                });
+              }
+              continue;
+            }
+          }
+
           try {
             const dbRes = await sendContent(contentInput);
             if (!dbRes.created && !dbRes.changed) {
@@ -1389,6 +1537,21 @@ export async function runFollowingScraper(onlyList = false) {
         if (!artIsEnd) artIsEnd = Boolean(artJson.paging?.is_end);
         artOffset += batchLimit;
         await new Promise(r => setTimeout(r, 500));
+      }
+
+      // 文章候选同样批量 AI 复核（共用全局 3 次调用上限，失败按规则跳过）
+      if (articleAiCandidates.length > 0 && !stats.circuitBroken) {
+        const aiKept = await evaluateFollowingCandidatesWithAI(u.name, articleAiCandidates);
+        for (const cand of aiKept) {
+          if (stats.circuitBroken) break;
+          try {
+            await sendContent(cand.contentInput);
+          } catch (err) {
+            completedAllPlans = false;
+            console.error(`❌ 保存 AI 判定文章失败: ${sanitizeErrorForLog(err)}`);
+            if (stats.circuitBroken) break;
+          }
+        }
       }
     }
 
