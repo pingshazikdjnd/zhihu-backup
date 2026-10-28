@@ -117,7 +117,7 @@ local-sync.bat           手动双击运行本地同步的快捷入口
 | **文本 (Text)** | `ZHIHU_USERNAME` | 你的知乎个人主页 `url_token`（例如主页是 `zhihu.com/people/zhang-san`，就填 `zhang-san`） |
 | **文本 (Text)** | `ALLOWED_ORIGIN` | 填你的前端域名 `https://zhihu-backup.pages.dev`（多个用英文逗号隔开） |
 | **机密 (Secret)** | `API_SECRET` | 随便生成一串 32 位以上随机字符串，用于爬虫入库鉴权 |
-| **机密 (Secret)** | `COOKIE_WRITE_TOKEN` | **凭据页（`/auth`）操作密码**（如 `8367274466`），设置后修改/清除 Cookie 必须输此密码 |
+| **机密 (Secret)** | `COOKIE_WRITE_TOKEN` | **凭据页（`/auth`）操作密码**（自行设定的一串强密码），设置后修改/清除 Cookie 必须输此密码 |
 | **机密 (Secret)** | `APIFY_TOKEN` | 下一步在 Apify 网页端获取的 API Token（`apify_api_...`） |
 | **机密 (Secret)** | `APIFY_ACTOR_ID` | 下一步在 Apify 网页端创建的 Actor ID（形如 `用户名~gemini-zhihu-crawler`） |
 
@@ -200,7 +200,7 @@ local-sync.bat           手动双击运行本地同步的快捷入口
    - 切到 **Network（网络）** 面板，刷新页面，点击列表里任意一条 `www.zhihu.com` 的请求。
    - 在右侧 **Headers → Request Headers** 中找到 `cookie:`，把冒号后面的**整行内容**复制下来，粘贴到 `/auth` 页面的文本框中。
 3. **验证凭据操作密码**：
-   - 页面带有 `🔒 已开启操作密码保护` 标记。在下方 **「凭据操作密码（口令验证）」** 输入框中输入你设置的密码（当前已设为 `8367274466`）。
+   - 页面带有 `🔒 已开启操作密码保护` 标记。在下方 **「凭据操作密码（口令验证）」** 输入框中输入你设置的密码（即你设置的操作密码）。
    - 点击 **「保存 cookie」**（或点 **「在本机记住密码」**），当前浏览器会自动记住该密码，下次更新 Cookie 无需重复输入。
 4. **在线设置 / 修改密码**：
    - 点击密码框右侧的 **「⚙️ 设置 / 修改密码」** 按钮，展开密码管理面板。

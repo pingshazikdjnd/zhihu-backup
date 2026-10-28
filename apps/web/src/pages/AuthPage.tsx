@@ -118,7 +118,7 @@ export default function AuthPage() {
 
   const saveConfig = async () => {
     if (needToken && !token.trim()) {
-      setCfgMsg({ type: "err", text: "请先在下方【操作密码验证】框中输入密码（如 8367274466）" });
+      setCfgMsg({ type: "err", text: "请先在下方【操作密码验证】框中输入你设置的操作密码" });
       return;
     }
     setSavingCfg(true);
