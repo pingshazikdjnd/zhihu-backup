@@ -51,6 +51,21 @@ const stats = {
   estimatedWrites: 0
 };
 
+// 异常信息脱敏：cookie / authorization 一旦被拼进日志或 Actor.fail 消息，
+// 就会随 run 记录永久留在 Apify 控制台，等于把账号凭据公开
+function sanitizeErrorForLog(err: unknown): string {
+  const raw =
+    err instanceof Error
+      ? err.message
+      : err && typeof err === "object" && "message" in err
+      ? String((err as { message?: unknown }).message ?? "")
+      : String(err ?? "");
+  return raw
+    .replace(/cookie:[^\r\n]*/gi, "cookie: [REDACTED]")
+    .replace(/authorization:[^\r\n]*/gi, "authorization: [REDACTED]")
+    .slice(0, 500);
+}
+
 async function post(path: string, body: unknown): Promise<any> {
   // apiUrl 尾斜杠归一，避免拼出 //ingest/content 的 404
   const base = apiUrl.endsWith("/") ? apiUrl.slice(0, -1) : apiUrl;
@@ -74,13 +89,13 @@ async function post(path: string, body: unknown): Promise<any> {
     stats.failed++;
     stats.consecutiveFailures++;
     if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
-    throw e;
+    throw new Error(sanitizeErrorForLog(e));
   }
   if (!res.ok) {
     stats.failed++;
     stats.consecutiveFailures++;
     if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
-    throw new Error(`${path} -> ${res.status} ${await res.text()}`);
+    throw new Error(sanitizeErrorForLog(`${path} -> ${res.status} ${await res.text()}`));
   }
   // 成功计数放在 JSON 解析之后：200+非 JSON 体时避免 saved/failed 双计
   let json: any;
@@ -279,7 +294,7 @@ export async function runScraper() {
           existingCount = 0;
         }
       } catch (err: any) {
-        console.error(`❌ 保存回答失败: ${err.message}`);
+        console.error(`❌ 保存回答失败: ${sanitizeErrorForLog(err)}`);
         if (stats.circuitBroken) {
           console.error("🛑 连续 5 次入库失败（可能触发 D1 每日写入限额），暂停回答同步。");
           isEnd = true;
@@ -422,13 +437,13 @@ export async function runScraper() {
               // 瞬时失败重试一次：分批一旦断在中间，content 的 comment_count 已是
               // 全量值，下轮不会再进评论抓取队列，缺口会挂到该回答有新评论为止。
               // 幂等可重发：已入库批次会被 replaceComments 识别为 UPDATE
-              console.warn(`⚠️ 评论批次失败，重试一次 (第 ${Math.floor(i / CHUNK) + 1} 批): ${e?.message || e}`);
+              console.warn(`⚠️ 评论批次失败，重试一次 (第 ${Math.floor(i / CHUNK) + 1} 批): ${sanitizeErrorForLog(e)}`);
               await sendComments(payload);
             }
           }
           console.log(`✅ 保存评论: ${allComments.length} 条 (回答 ID: ${task.answerId})${cIncomplete ? " [partial]" : ""}`);
         } catch (err: any) {
-           console.error(`❌ 保存评论失败: ${err.message}`);
+           console.error(`❌ 保存评论失败: ${sanitizeErrorForLog(err)}`);
            if (stats.circuitBroken) break;
         }
       } else if (cIncomplete) {
@@ -463,7 +478,6 @@ async function syncHotCommentsForContent(
   try {
     let cOffset = 0;
     let cIsEnd = false;
-    let cIncomplete = false;
     const allComments: any[] = [];
     const maxPages = mode === "full" ? 200 : 1;
     let pagesFetched = 0;
@@ -473,12 +487,10 @@ async function syncHotCommentsForContent(
         `https://www.zhihu.com/api/v4/${endpointType}/${sourceId}/root_comments?limit=20&offset=${cOffset}`
       );
       if (!cRes.ok()) {
-        cIncomplete = true;
         break;
       }
       const cJson = await cRes.json();
       if (!cJson.data || cJson.data.length === 0) {
-        if (!cJson.paging?.is_end) cIncomplete = true;
         break;
       }
 
@@ -541,17 +553,17 @@ async function syncHotCommentsForContent(
       const CHUNK = 500;
       for (let i = 0; i < finalComments.length; i += CHUNK) {
         if (stats.circuitBroken) break;
-        const isLast = i + CHUNK >= finalComments.length;
         await sendComments({
           contentPk: `${sourceType}:${sourceId}`,
           comments: finalComments.slice(i, i + CHUNK),
-          partial: mode === "hot" ? true : (isLast ? (cIncomplete || !cIsEnd) : true),
-          ...(mode === "full" && isLast && cIsEnd && !cIncomplete ? { allIds: finalComments.map(c => c.id) } : {})
+          // 这里只抓内联子评论、不翻页，无法保证是全集；带 allIds 会让服务端
+          // 把深层子评论误判为已删除，因此一律 partial，不做删除对账
+          partial: true
         });
       }
     }
   } catch (e: any) {
-    console.warn(`⚠️ 抓取评论跳过 (${sourceType}:${sourceId}): ${e?.message || e}`);
+    console.warn(`⚠️ 抓取评论跳过 (${sourceType}:${sourceId}): ${sanitizeErrorForLog(e)}`);
   }
 }
 
@@ -707,7 +719,7 @@ export async function runCollectionScraper() {
               } catch (e: any) {
                 contentSaved = false;
                 cIncomplete = true;
-                console.error(`❌ 收藏条目入库失败: ${title}`, e?.message || e);
+                console.error(`❌ 收藏条目入库失败: ${title}`, sanitizeErrorForLog(e));
                 if (stats.circuitBroken) {
                   console.error("🛑 连续 5 次入库失败（可能触发 D1 每日写入限额），暂停收藏夹同步。");
                   cIsEnd = true;
@@ -749,7 +761,7 @@ export async function runCollectionScraper() {
             items: overflow ? items.slice(0, MAX_ITEMS) : items
           });
         } catch (e: any) {
-           console.error(`❌ 收藏夹保存失败: ${e.message}`);
+           console.error(`❌ 收藏夹保存失败: ${sanitizeErrorForLog(e)}`);
         }
       } else if (!stats.circuitBroken) {
         console.log(`⚠️ 收藏夹 [${coll.title}] 为空或未抓取到条目`);
@@ -915,7 +927,7 @@ export async function runUpvotesScraper() {
       } catch (err: any) {
         pageFailures++;
         consecutiveFailures++;
-        console.error(`❌ 保存赞同失败: ${title}`, err.message);
+        console.error(`❌ 保存赞同失败: ${title}`, sanitizeErrorForLog(err));
         if (consecutiveFailures >= 5 || stats.circuitBroken) {
           console.error("🛑 连续 5 次入库失败（可能触发 D1 每日写入限额），暂停抓取并保留当前断点游标，下次从本页继续。");
           break;
@@ -1038,7 +1050,7 @@ export async function runFollowingScraper(onlyList = false) {
       });
       console.log(`✅ 已同步 ${followedUsers.length} 位关注答主名录`);
     } catch (e: any) {
-      console.error(`❌ 上报关注答主名录失败: ${e?.message || e}`);
+      console.error(`❌ 上报关注答主名录失败: ${sanitizeErrorForLog(e)}`);
     }
   }
 
@@ -1201,7 +1213,12 @@ export async function runFollowingScraper(onlyList = false) {
           const aRes = await context.request.get(
             `https://www.zhihu.com/api/v4/members/${u.urlToken}/answers?include=${includeStr}&limit=${batchLimit}&offset=${aOffset}&sort_by=${plan.sortBy}`
           );
-          if (!aRes.ok()) { completedAllPlans = false; break; }
+          if (!aRes.ok()) {
+            if (aRes.status() === 401 || aRes.status() === 403) stats.authRejected++;
+            else stats.failed++;
+            completedAllPlans = false;
+            break;
+          }
           const aJson = await aRes.json();
           if (!aJson.data || aJson.data.length === 0) break;
 
@@ -1276,7 +1293,7 @@ export async function runFollowingScraper(onlyList = false) {
             } catch (err: any) {
               pageFailed = true;
               completedAllPlans = false;
-              console.error(`❌ 保存关注答主回答失败: ${err.message}`);
+              console.error(`❌ 保存关注答主回答失败: ${sanitizeErrorForLog(err)}`);
               if (stats.circuitBroken) break;
             }
           }
@@ -1312,7 +1329,12 @@ export async function runFollowingScraper(onlyList = false) {
         const artRes = await context.request.get(
           `https://www.zhihu.com/api/v4/members/${u.urlToken}/articles?include=${articleIncludeStr}&limit=${batchLimit}&offset=${artOffset}`
         );
-        if (!artRes.ok()) break;
+        if (!artRes.ok()) {
+          if (artRes.status() === 401 || artRes.status() === 403) stats.authRejected++;
+          else stats.failed++;
+          completedAllPlans = false;
+          break;
+        }
         const artJson = await artRes.json();
         if (!artJson.data || artJson.data.length === 0) break;
 
@@ -1359,7 +1381,7 @@ export async function runFollowingScraper(onlyList = false) {
             }
           } catch (err: any) {
             completedAllPlans = false;
-            console.error(`❌ 保存关注答主文章失败: ${err.message}`);
+            console.error(`❌ 保存关注答主文章失败: ${sanitizeErrorForLog(err)}`);
             if (stats.circuitBroken) break;
           }
         }
@@ -1371,7 +1393,12 @@ export async function runFollowingScraper(onlyList = false) {
     }
 
     if (completedAllPlans && !stats.circuitBroken && (!isHistoryDone || (newestSeenAnswerId && newestSeenAnswerId !== lastMarkAnswerId))) {
-      await reportUserProgress(u.urlToken, 0, true, newestSeenAnswerId || lastMarkAnswerId || undefined);
+      await reportUserProgress(
+        u.urlToken,
+        onlyIncrementalNow ? (prog.resumeOffset || 0) : 0,
+        true,
+        newestSeenAnswerId || lastMarkAnswerId || undefined
+      );
     }
   }
 
@@ -1407,9 +1434,10 @@ try {
       await runFollowingScraper(false);
     }
   }
-} catch (e: any) {
-  log.error(e?.message || String(e));
-  await Actor.fail(`crawler_error: ${e?.message || String(e)}`);
+} catch (e) {
+  const errMsg = sanitizeErrorForLog(e);
+  log.error(errMsg);
+  await Actor.fail(`crawler_error: ${errMsg}`);
   process.exit(1);
 }
 

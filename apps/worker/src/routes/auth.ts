@@ -22,7 +22,8 @@ export type SyncConfig = {
 
 export const DEFAULT_SYNC_CONFIG: SyncConfig = {
   commentsMyAnswers: "full",
-  commentsCollections: "hot",
+  // 收藏内容按用户要求默认全量抓评论；赞同基数太大（2.9 万条），默认只抓热门前 20 条 + 楼中楼
+  commentsCollections: "full",
   commentsUpvotes: "hot",
   commentsFollowing: "hot",
   followingSensitivity: "standard",

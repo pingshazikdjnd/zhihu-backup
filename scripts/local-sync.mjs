@@ -123,6 +123,16 @@ async function main() {
     else if (arg === "--collections") runType = "collections";
     else if (arg === "--fast") isFast = true;
     else if (arg === "--dry-run") dryRun = true;
+    else if (arg.startsWith("--")) console.warn(`⚠️ 忽略了未知参数: ${arg}（可能是拼写错误，本次按已知参数执行）`);
+  }
+
+  // 白名单校验：手滑成 --type=answer 之类的拼写错误会让爬虫按未知 runType
+  // 走完所有分支都不匹配、直接空跑成功，这里必须提前失败
+  const VALID_TYPES = new Set(["all", "answers", "collections", "upvotes", "following", "following-list"]);
+  if (!VALID_TYPES.has(runType)) {
+    console.error(`❌ 未知 --type=${runType}；可用：${[...VALID_TYPES].join(" / ")}`);
+    process.exitCode = 1;
+    return;
   }
 
   // 3. 单实例文件锁检查（防止计划任务与手动运行并发冲突）
