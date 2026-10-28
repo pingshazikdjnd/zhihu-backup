@@ -113,7 +113,7 @@
 
 | # | 位置 | 错误 | 状态 |
 |---|---|---|---|
-| B1 | 文章段 + **关注答主回答段 + 自动抢救评分器** | 赞数无 `reaction.statistics.like_count` 兜底 → 恒 0 | **仍存在，且范围比初版更大（3 处）** → 文章/关注答主的"精品"识别整体失效 |
+| B1 | 文章段 + **关注答主回答段 + 自动抢救评分器** | 赞数无 `reaction.statistics.like_count` 兜底 → 恒 0 | **本地实测修正**：文章段**带 include 时 `voteup_count` 有值**（B1 对文章不成立）；真正失效的是**关注答主回答段 + 评分器**。文章段的真实错误是 `favorite_count`/`visit_count` 恒 0 |
 | B2 | 回答列表 | `visit_count` 不存在 → 回答浏览量恒 0 | 仍存在 |
 | B3 | 收藏夹条目 | `favorite_count \|\| thanks_count \|\| reaction.favorites` → 收藏数取成感谢数 | **部分过时**：回答列表用 reaction 兜底是对的；真正取错只有收藏夹条目；关注答主/文章两处则完全没兜底 |
 | B4 | 收藏夹列表 | 读 `item.updated_time`，接口不返回 → 落库回退 now | 仍存在（去掉后 `collections.updated_time` 会退化为"最后同步时间"） |
@@ -152,6 +152,7 @@
 | E5 | 内容单字段（`source_url`/`question_title`/`author_name`/`label_info`/`excerpt`/时间）不参与变更比较 | `contents.ts` 变更组只含 title/hash/折叠/标签 |
 | E6 | `changed=false` 仍每次重 PUT R2（html + versions 双写） | `ingest.ts` 无条件 put；实测稳态 fast 轮每轮约 100-600 条上报 → 200-1200 次 Class A，全量轮才会到 5 万级 |
 | E7 | 全量评论直写 D1 不可行（769 万条 = 2,317 万行、14.4GB） | TEST_REPORT |
+| **E8** | **answers 分页重叠导致假早停（本地实测，最严重）**：answers 接口忽略 `limit=20`，实测 offset=0/20/40 分别返回 37/38/20 条；爬虫按 `offset+=20` 翻页 → 约 40% 重复提交；重复项在空库上凑满「连续 20 条无变化」→ **562 篇只备份了 57 篇就 exit 0** | 本地验证：3 页/95 提交/57 新增/38 无变化 |
 
 ---
 
@@ -226,6 +227,12 @@ for page in pages(offset = 0, 20, 40, ...):
 3. R2 对象带 `complete` 标志：只有抓到 `is_end=true` 才允许整对象覆盖；否则与旧 JSON 合并。
 4. `comments` 加 `child_count`；新建 `comment_threads`。
 5. 前端 `CommentTree` 已是"首批 50 条 + 滚动加载"，但**数据仍是一次性全量拉取**（`/api/contents/:pk/comments` 无分页）；需要把懒加载下沉到数据层（根分页 + 子评论按需）。
+
+**本地实测补充（合成 5,000 根 + 500 根×5-80 子）**：
+- 索引查询：热度 OFFSET 0/1000/4000 分别 0.09/0.21/0.68ms，时间 OFFSET 1000 = 0.20ms，COUNT = 0.71ms；EXPLAIN 均为 `SEARCH ... USING INDEX`，无 TEMP B-TREE。
+- 子评论对象体积：p50 24KB / p95 **41.9KB** / max 44.7KB（不是初版估的 p95 9.4KB；9.4KB 是本地真实深抓样本，两者分布不同）。
+- 回填体积：5,581 个有子根按 5-80 子重放约 **124MB**（PLAN 初版 4-9MB 偏低 10 倍以上），回填策略需用真实 25,495 条样本重算。
+- 子请求：20 根（partial 时 20 GET + 20 PUT + 2 SELECT + 1 batch）= **43 < 50**，余量仅 7；40 根 = 83 超限。
 6. 孤儿清理：根删除/内容删除时删 R2 对象与 `comment_threads` 记录（每周 cron）。
 
 **索引与查询**：
@@ -257,8 +264,21 @@ CREATE INDEX IF NOT EXISTS idx_comments_root_time
 
 ### 期 0：停云端旧镜像 + 建立基线（不改业务代码）
 
-1. **停 Apify cron**：注释 `apps/worker/wrangler.toml` 的 `[triggers]`（或重部署 Actor），`wrangler deploy`。
+1. **停 Apify cron**：把 `apps/worker/wrangler.toml` 的 `crons` 显式改为 `crons = []` 后 `wrangler deploy`（只注释 `[triggers]` **不会**删除已部署的 cron；Cloudflare 文档：`triggers` 为 undefined 时保留现有 cron，只有 `crons = []` 才移除）。
 2. 跑一次本地同步，记录：扫描页数 / 提交条数 / 无变化条数 / 写入行数（Cloudflare 面板）/ 耗时。
+
+**本地实测基线（2026-10-28，`data/plan-verify-a`，`commentsMyAnswers=none`）**：
+
+| 指标 | 冷启动 | 稳态（第二次） |
+|---|---|---|
+| 扫描页数 | 3 | 1 |
+| 提交条数 | 95 | 20 |
+| 新增 | 57 | 0 |
+| 无变化 | 38 | 20 |
+| D1 写入行 | 190（171 INSERT + 19 UPDATE） | 7 |
+| R2 html 对象 | 57 / 237KB | 0 新增 |
+
+> ⚠️ 冷启动暴露 E8：answers 接口忽略 `limit`（offset=0/20/40 返回 37/38/20 条），`offset+=20` 产生 40% 重复，重复凑满早停 → **562 篇只入库 57 篇**。**任何全量同步前必须先修 E8。**
 
 **验证**：`/api/stats` 正常；本地日志出现 `📊 本轮…` 统计行；云端不再产生新 run。
 
@@ -304,19 +324,30 @@ CREATE INDEX IF NOT EXISTS idx_comments_root_time
 2. `POST /ingest/sync-state` 的 key 白名单从仅 `upvotes_cursor` 扩展为上述 key；**值校验当前只允许 `https://`，需要放宽为"`https://` 或纯 id"**（新游标是 id）。
 3. `GET /ingest/sync-state` 的 SELECT 也要带上这些新 key（当前只查 `upvotes_cursor` 与 `zhihu_cookie`），并同步加进 `scripts/local-sync.mjs` 的 `inputPayload`。
 4. 爬虫在 `runScraper` / `runCollectionScraper` 撞到游标 id 时停止，并上报新游标。
+5. **`apify.ts` 的 `triggerApifyRun` 也必须注入新游标**（当前只注入 `upvotesCursor`），否则云端 cron 仍每轮从头翻。
+
+**本地实测**：`app_settings` 存纯 id 与 `collections_cursor.<folderId>` 完全可行（103 个 key 下点查 avg 15.6µs；key 4,019 字符仍成功；无 CHECK，服务端校验是唯一防线）。
 
 **验证**：第二次跑同一批数据时，请求页数应降到 1 页。
 
 ### 期 5：批量接口（批大小 5，不是 10）
 
-- 新增 `POST /ingest/batch`，每请求 **≤5 条 content**：单条 content 实际 4-6 个子请求，5 条约 20-30，留余量给哈希与事件。
-- 若先做 hash 前置计算，最多放宽到 **6 条**（8×6=48 已贴 50 上限，不要用 8）。
+- 新增 `POST /ingest/batch`，每请求 **≤5 条 content**：
+  - 本地实测单条子请求：新内容 **6**、无变化 **4**、仅计数 **5**、**正文变更 8**（含 2 HEAD + 2 PUT）；
+  - 5 条/批最坏 40（安全）、6 条最坏 48（仅剩 2 余量）、**8 条正文变更 = 64，必超 50**；
+  - 若先做 hash 前置（一次 SELECT 批量取回旧 hash，跳过相等项的 HEAD/PUT）并把 D1 写合并为 1 个 batch，可放宽到 6。
 - 评论仍按根分组（≤20 根/请求，见 §4.4）。
+- 注意：D1 单语句绑定参数 ≤100，不能把多条 content 拼成一条多行 INSERT，必须逐条语句入 batch。
 
 ### 期 6：补自己的专栏文章（功能缺失）
 
 新增 `runArticleScraper()`：`GET /v4/members/{me}/articles?limit=20&offset=N`，翻到撞 `oldest_article_id` 停。
 需同步注册 **4 处**：`main.ts` 的 `runType` 联合类型、`INPUT_SCHEMA.json`、`scripts/local-sync.mjs` 的 `VALID_TYPES`、`main.ts` 的入口分发（if/else 分支）。`apify.ts` 无 target 映射（`/api/sync` 的 target 是任意透传），不在改动范围。
+
+**真机实测（limit=2 两次 GET）**：
+- 字段：`id/title/created/updated/excerpt` 必有；`content` 需 include；赞数在 `reaction.statistics.like_count`、收藏在 `reaction.statistics.favorites`；**`comment_count` 即使 include 也不返回**（要显示评论数得走详情接口或留空）。
+- 时间戳：`created`/`updated` 是 **10 位秒**，`toIsoOrNull` 已是秒×1000，可直接复用。
+- **停止游标 `articles_cursor` 需同期 4 一起加**（PLAN 初版只说撞 `oldest_article_id`，未定义存储位置）。
 注意：文章时间字段是 `created`/`updated`（秒），需确认后走 `toIsoOrNull`。
 
 ### 期 7：评论双层存储（新增，见 §4.4）
