@@ -150,7 +150,7 @@
 | E3 | 评论补抓只按"计数增长"触发（5 处均为 `commentCount > prevCommentCount`），**删除/替换/风控截断不会触发**；hot 模式只取第一页（20 条） | `main.ts:300/724/912/1412/1457`、`:351-354` |
 | E4 | 评论 partial 缺口永不修复（`comment_count` 先更新，中断后 `prev==cc`） | `contents.ts` 只判 `cnt===0` |
 | E5 | 内容单字段（`source_url`/`question_title`/`author_name`/`label_info`/`excerpt`/时间）不参与变更比较 | `contents.ts` 变更组只含 title/hash/折叠/标签 |
-| E6 | `changed=false` 仍每次重 PUT R2 | `ingest.ts` 无条件 put |
+| E6 | `changed=false` 仍每次重 PUT R2（html + versions 双写） | `ingest.ts` 无条件 put；实测稳态 fast 轮每轮约 100-600 条上报 → 200-1200 次 Class A，全量轮才会到 5 万级 |
 | E7 | 全量评论直写 D1 不可行（769 万条 = 2,317 万行、14.4GB） | TEST_REPORT |
 
 ---
@@ -268,11 +268,13 @@ CREATE INDEX IF NOT EXISTS idx_comments_root_time
 |---|---|---|
 | 删 `comment_versions` 整表 | 新增 `0004_drop_comment_versions.sql`；`comments.ts` 去掉两处 INSERT | 评论写入 3→2 行 |
 | 删 `change_events.payload_json` 写入 | `changes.ts` 两处 INSERT | 查询侧已排除该列 |
-| 删 R2 `versions/` 双写 | `ingest.ts` 的 PUT | 存储减半 |
+| 删 R2 `versions/` 双写 | `ingest.ts` 的 PUT | 存储减半；全仓库仅 put 无 get |
+| R2 写入改为「HEAD 兜底」 | `ingest.ts`：`created` 直接 PUT；否则先 `BUCKET.head(key)`，miss 才 PUT；`md/` 同理 | **不要裸用 `created \|\| changed`**：D1 已写成功但 R2 PUT 失败时，下一轮 `changed=false` 会永久缺正文。HEAD 为 Class B（1000 万/月免费，稳态约 3.6 万/月），miss 即自愈 |
 | 删死列 | `contents.deleted_at/first_seen_at`、`content_versions` 的 4 个正文列、`collections.owner_token`、`collection_items.removed_at`、`upvotes.first/last_seen_at`、`comments.last_seen_at/deleted_at` | **跨 4 个 service 约 14 条写入 SQL**（comments 4、contents 3、collections 5、upvotes 1 等）；`comments.last_seen_at` 上有索引 `idx_comments_last_seen`，migration 必须先 `DROP INDEX` 再 `DROP COLUMN` |
 | 删废弃模块 | `apps/api/`、`apps/collector/` | **必须重新生成 `pnpm-lock.yaml`**（其中仍含两个 importer；`--frozen-lockfile` 会报 ERR_PNPM_OUTDATED_LOCKFILE）。`pnpm-workspace.yaml` 是 `apps/*`、根 `package.json` 无引用，无需改 |
 
 **验证**：`(cd apps/worker && npx tsc --noEmit)` + `pnpm --filter apify-crawler build` + 跑一次同步，写入行数应显著下降（评论部分降 33%）。
+**R2 侧验证**：部署前后各记录 R2 面板 24h 的 Class A/B；部署后跑一轮 `--type=all --fast`，预期 Class A/轮 ≈ 0-10、Class B/轮 ≈ 上报条数；抽查 5 篇正文可读；手动删一个 `html/{pk}/{hash}` 后重发，确认 HEAD miss 自动补回。
 
 **回滚**：migration 配套写回滚 SQL；代码按文件 `git revert`。
 
