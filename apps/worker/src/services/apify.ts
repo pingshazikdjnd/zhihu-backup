@@ -72,12 +72,24 @@ export async function triggerApifyRun(
 
   let fullModeUsers: string[] = [];
   let syncConfig: any = undefined;
+  // 每位关注答主的断点进度：不注入的话爬虫每轮都从头发翻，
+  // 历史段重复抓取既拖慢同步也白烧写入额度
+  const followedProgress: Record<string, { resumeOffset: number; historyDone: boolean; syncMode: "default" | "full"; lastCheckedAnswerId?: string }> = {};
   try {
     const followedMap = await getFollowedUsersMap(env.BUCKET);
     fullModeUsers = Object.values(followedMap)
       .filter(u => !u.is_unfollowed && u.sync_mode === "full")
       .map(u => u.url_token);
     syncConfig = await getSyncConfig(env.BUCKET);
+    for (const u of Object.values(followedMap)) {
+      if (u.is_unfollowed) continue;
+      followedProgress[u.url_token] = {
+        resumeOffset: u.resume_offset ?? 0,
+        historyDone: Boolean(u.history_done),
+        syncMode: u.sync_mode === "full" ? "full" : "default",
+        lastCheckedAnswerId: u.last_checked_answer_id || ""
+      };
+    }
   } catch {
     // ignore
   }
@@ -92,6 +104,7 @@ export async function triggerApifyRun(
     cookieString: cookieStr,
     ...(upvotesCursor ? { upvotesCursor } : {}),
     ...(fullModeUsers.length > 0 ? { fullModeUsers } : {}),
+    ...(Object.keys(followedProgress).length > 0 ? { followedProgress } : {}),
     ...(syncConfig ? { syncConfig } : {})
   };
 

@@ -26,13 +26,17 @@ async function replaceCommentsInner(input: IngestCommentsInput) {
   const now = new Date().toISOString();
 
   const existingRows = await db.prepare(`
-    SELECT id, comment_hash, is_deleted
+    SELECT id, comment_hash, is_deleted, author_avatar, likes, time_text, location
     FROM comments
     WHERE content_pk = ?
   `).all(input.contentPk) as Array<{
     id: string;
     comment_hash: string;
     is_deleted: number;
+    author_avatar: string | null;
+    likes: number;
+    time_text: string | null;
+    location: string | null;
   }>;
 
   const existingMap = new Map(existingRows.map(row => [row.id, row]));
@@ -154,14 +158,25 @@ async function replaceCommentsInner(input: IngestCommentsInput) {
       continue;
     }
 
-    // 内容没变，只刷新头像/点赞/时间/位置
-    stmts.push(db.prepare(`
-      UPDATE comments
-      SET author_avatar = COALESCE(NULLIF(?, ''), author_avatar),
-          last_seen_at = ?, likes = ?, time_text = ?, location = ?,
-          is_deleted = 0, deleted_at = NULL
-      WHERE id = ?
-    `).raw(c.authorAvatar, now, c.likes, c.time, c.location, c.id));
+    // 内容没变，只在头像/点赞/时间/位置确有变化（或从删除态复活）时才刷新，
+    // 全部相同则一条语句都不产生：否则每轮同步都会重写全量评论行，
+    // D1 每日写入额度瞬间打满、增量同步退化成全量
+    const needsRefresh =
+      (!!c.authorAvatar && c.authorAvatar !== exists.author_avatar) ||
+      exists.likes !== c.likes ||
+      exists.time_text !== c.time ||
+      exists.location !== c.location ||
+      exists.is_deleted === 1;
+
+    if (needsRefresh) {
+      stmts.push(db.prepare(`
+        UPDATE comments
+        SET author_avatar = COALESCE(NULLIF(?, ''), author_avatar),
+            last_seen_at = ?, likes = ?, time_text = ?, location = ?,
+            is_deleted = 0, deleted_at = NULL
+        WHERE id = ?
+      `).raw(c.authorAvatar, now, c.likes, c.time, c.location, c.id));
+    }
   }
 
   // 删除检测：抓取不完整时整段跳过，避免误标

@@ -10,7 +10,15 @@ export async function upsertUpvote(contentPk: string, upvoteTime: string) {
     return { created: false, skipped: true };
   }
 
-  const existing = await db.prepare(`SELECT 1 FROM upvotes WHERE content_pk = ?`).get(contentPk);
+  // 赞同时间没变就是没有新信息：无谓的 ON CONFLICT DO UPDATE 会每轮重写全量赞同行，
+  // 直接跳过写库，把每日写入额度留给真正的新数据
+  const existing = await db.prepare(
+    `SELECT upvote_time FROM upvotes WHERE content_pk = ?`
+  ).get(contentPk) as { upvote_time: string } | null;
+
+  if (existing && existing.upvote_time === upvoteTime) {
+    return { created: false, unchanged: true };
+  }
 
   await db.prepare(`
     INSERT INTO upvotes (content_pk, first_seen_at, last_seen_at, upvote_time)

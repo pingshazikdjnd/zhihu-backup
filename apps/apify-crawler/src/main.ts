@@ -40,7 +40,7 @@ const cfg = {
 
 // 失败上报：所有异常都被吞掉的爬虫在 Apify 上永远显示 SUCCEEDED，
 // cookie 失效后零数据入库也毫无感知。这里集中统计，结束时据此决定 run 状态。
-const MAX_DAILY_ESTIMATED_WRITES = 120000; // 设为 120k：充分吃满 CF 官方 100k 免费额度并多薅 20% 边缘突发，安全高效
+const MAX_DAILY_ESTIMATED_WRITES = 90000; // 90000 < D1 免费版硬顶 100000 行/天：留 10% 余量给配置写入与并发，避免撞墙后整轮 500
 const stats = {
   saved: 0,
   failed: 0,

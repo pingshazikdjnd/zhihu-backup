@@ -26,13 +26,16 @@ async function upsertCollectionSnapshotInner(input: IngestCollectionSnapshotInpu
   // 一次性查全量（不过滤 is_removed=0）：已移除的行也要查出来，
   // 命中时走「更新并复位」，与旧版逐条 SELECT（无 is_removed 过滤）→ 无行才 INSERT 的判断等价
   const existingItems = await db.prepare(`
-    SELECT id, source_type, source_id, is_removed
+    SELECT id, source_type, source_id, title, author_name, source_url, is_removed
     FROM collection_items
     WHERE collection_id = ?
   `).all(collectionId) as Array<{
     id: number;
     source_type: string;
     source_id: string;
+    title: string | null;
+    author_name: string | null;
+    source_url: string | null;
     is_removed: number;
   }>;
 
@@ -117,6 +120,16 @@ async function upsertCollectionSnapshotInner(input: IngestCollectionSnapshotInpu
 
       added++;
       } else {
+        // 条目字段完全一致且未处于移除态：没有新信息，跳过 UPDATE 与事件。
+        // 旧逻辑每轮同步都把全量条目重写一遍，收藏夹稍大就会打满 D1 每日写入额度
+        if (
+          (row.title || "") === (item.title || "") &&
+          (row.author_name || "") === (item.authorName || "") &&
+          (row.source_url || "") === (item.sourceUrl || "") &&
+          row.is_removed === 0
+        ) {
+          continue;
+        }
         stmts.push(db.prepare(`
           UPDATE collection_items
           SET title = ?, author_name = ?, source_url = ?, last_seen_at = ?, is_removed = 0, removed_at = NULL

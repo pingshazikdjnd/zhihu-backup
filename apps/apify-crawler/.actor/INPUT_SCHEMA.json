@@ -54,6 +54,18 @@
             "type": "array",
             "description": "URL tokens of followed users configured for full backup",
             "editor": "json"
+        },
+        "syncConfig": {
+            "title": "Sync Config",
+            "type": "object",
+            "description": "Global comment sync and following sensitivity settings injected by Worker",
+            "editor": "json"
+        },
+        "followedProgress": {
+            "title": "Followed Users Progress",
+            "type": "object",
+            "description": "Per-followed-user resume offsets and history flags injected by Worker",
+            "editor": "json"
         }
     },
     "required": ["apiUrl", "zhihuUsername", "cookieString"]

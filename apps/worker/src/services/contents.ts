@@ -168,45 +168,66 @@ async function upsertContentInner(input: IngestContentInput) {
     // 优先用本次生成的可搜索正文，否则保留库里的旧值
     const safeContentMd = searchText || existing.content_md || "";
 
-    const changes: string[] = [];
+    // 变更分两组：body 组必须整行落库并留版本/发事件；counter 组只是热度数字在动，
+    // 用一条轻量 UPDATE 落库即可（不写版本、不发事件、不计 changed），
+    // 否则每次同步都追加 content_versions + 事件，D1 每日写入额度被计数抖动打满，
+    // 爬虫也永远等不到 changed=false 而无法早停。
+    const bodyChanges: string[] = [];
+    const counterChanges: string[] = [];
     let isBodyChanged = false;
 
     // title 参与变更检测：否则"仅改标题"的更新走零事件分支，标题根本不落库
     if (existing.title !== safeTitle) {
-      changes.push(`标题(${existing.title || "无"} -> ${safeTitle || "无"})`);
+      bodyChanges.push(`标题(${existing.title || "无"} -> ${safeTitle || "无"})`);
     }
     if (existing.content_hash !== contentHash) {
-      changes.push("正文已更新");
+      bodyChanges.push("正文已更新");
       isBodyChanged = true;
     }
     if (existing.voteup_count !== safeVoteupCount) {
-      changes.push(`点赞数(${existing.voteup_count} -> ${safeVoteupCount})`);
+      counterChanges.push(`点赞数(${existing.voteup_count} -> ${safeVoteupCount})`);
     }
     if (existing.comment_count !== safeCommentCount) {
-      changes.push(`评论数(${existing.comment_count} -> ${safeCommentCount})`);
+      counterChanges.push(`评论数(${existing.comment_count} -> ${safeCommentCount})`);
     }
     if (existing.favorite_count !== safeFavoriteCount) {
-      changes.push(`收藏数(${existing.favorite_count} -> ${safeFavoriteCount})`);
+      counterChanges.push(`收藏数(${existing.favorite_count} -> ${safeFavoriteCount})`);
     }
     if (existing.visit_count !== safeVisitCount) {
-      changes.push(`浏览量(${existing.visit_count} -> ${safeVisitCount})`);
+      counterChanges.push(`浏览量(${existing.visit_count} -> ${safeVisitCount})`);
     }
     if (existing.author_avatar !== safeAuthorAvatar) {
-      changes.push("作者头像更新");
+      bodyChanges.push("作者头像更新");
     }
     if (existing.author_headline !== safeAuthorHeadline) {
-      changes.push("作者简介更新");
+      bodyChanges.push("作者简介更新");
     }
     const inputCollapsed = input.isCollapsed ? 1 : 0;
     if (existing.is_collapsed !== inputCollapsed) {
-      changes.push("折叠状态更新");
+      bodyChanges.push("折叠状态更新");
     }
     const inputLabeled = input.isLabeled ? 1 : 0;
     if (existing.is_labeled !== inputLabeled) {
-      changes.push("标签更新");
+      bodyChanges.push("标签更新");
     }
 
-    if (changes.length > 0) {
+    // comments 表尚无评论或存在旧格式评论（头像未迁移）时强制返回 0，
+    // 触发爬虫补抓；两条「无 body 变更」的返回路径都必须带上这个修正
+    const resolvePrevCommentCount = async () => {
+      let prevCommentCount = existing.comment_count;
+      if (prevCommentCount > 0) {
+        const cStat = await db.prepare(
+          `SELECT COUNT(*) AS cnt, SUM(CASE WHEN author_avatar IS NULL THEN 1 ELSE 0 END) AS unmigrated FROM comments WHERE content_pk = ?`
+        ).get<{ cnt: number; unmigrated: number }>(pk);
+        if (!cStat || Number(cStat.cnt) === 0 || Number(cStat.unmigrated) > 0) {
+          prevCommentCount = 0;
+        }
+      }
+      return prevCommentCount;
+    };
+
+    if (bodyChanges.length > 0) {
+      const changes = bodyChanges.concat(counterChanges);
       // D1 没有交互式事务，batch 是唯一的原子手段：
       // 「更新 contents」和「写 content_versions」必须同生共死。
       const stmts: any[] = [];
@@ -289,26 +310,27 @@ async function upsertContentInner(input: IngestContentInput) {
       return { pk, changed: true, created: false, prevCommentCount, hash: contentHash };
     }
 
-    let prevCommentCount = existing.comment_count;
-    if (prevCommentCount > 0) {
-      const cStat = await db.prepare(
-        `SELECT COUNT(*) AS cnt, SUM(CASE WHEN author_avatar IS NULL THEN 1 ELSE 0 END) AS unmigrated FROM comments WHERE content_pk = ?`
-      ).get<{ cnt: number; unmigrated: number }>(pk);
-      if (!cStat || Number(cStat.cnt) === 0 || Number(cStat.unmigrated) > 0) {
-        prevCommentCount = 0; // comments 表中尚无评论或存在旧格式评论，强制返回 0 触发爬虫补抓
-      }
+    if (counterChanges.length > 0) {
+      // 只更新计数字段：单条 UPDATE（4 个数字 + last_seen_at），不写版本、不发事件、
+      // changed 保持 false，让爬虫的早停判定生效
+      await db.prepare(`
+        UPDATE contents
+        SET voteup_count = ?, comment_count = ?, favorite_count = ?, visit_count = ?, last_seen_at = ?
+        WHERE pk = ?
+      `).run(
+        safeVoteupCount,
+        safeCommentCount,
+        safeFavoriteCount,
+        safeVisitCount,
+        now,
+        pk
+      );
+
+      return { pk, changed: false, created: false, prevCommentCount: await resolvePrevCommentCount(), hash: contentHash };
     }
 
-    await db.prepare(`
-      UPDATE contents
-      SET last_seen_at = ?, is_deleted = 0, deleted_at = NULL
-      WHERE pk = ?
-    `).run(
-      now,
-      pk
-    );
-
-    return { pk, changed: false, created: false, prevCommentCount, hash: contentHash };
+    // 什么都没变：不执行任何 UPDATE（无谓的 last_seen_at 写入同样是每日额度黑洞）
+    return { pk, changed: false, created: false, prevCommentCount: await resolvePrevCommentCount(), hash: contentHash };
   });
 }
 
