@@ -240,7 +240,10 @@ export async function runScraper() {
   // 极速模式下 20 条重复就能凑满早停阈值，562 篇只入库 57 篇。
   // 改为跟随服务端 paging.next 翻页，并用 seenIds 去重后计早停。
   let nextUrl: string = `https://www.zhihu.com/api/v4/members/${ZHIHU_USERNAME}/answers?include=${includeStr}&limit=20&offset=0`;
-  let fallbackOffset = 0;
+  // 服务端 offset 坐标系：记录当前页请求实际使用的 offset。
+  // paging.next 缺失时按服务端步长（limit=20）推进；不能按「实际返回条数」累加，
+  // 否则第 1 页 37 条 + 第 2 页 38 条会让下一跳 offset=75，而服务端坐标系应为 40，漏抓 40~74。
+  let currentOffset = 0;
   const seenIds = new Set<string>();
 
   while (!isEnd && nextUrl) {
@@ -346,10 +349,21 @@ export async function runScraper() {
 
     if (stats.circuitBroken) break;
     if (!isEnd) isEnd = Boolean(json.paging?.is_end);
-    fallbackOffset += pageLen || 20;
     const nextFromApi = typeof json.paging?.next === "string" ? json.paging.next : "";
-    // paging.next 优先；缺失时按实际返回条数推进 offset 兜底（limit 被忽略时也不会跳页）
-    nextUrl = nextFromApi || (isEnd ? "" : `https://www.zhihu.com/api/v4/members/${ZHIHU_USERNAME}/answers?include=${includeStr}&limit=20&offset=${fallbackOffset}`);
+    if (nextFromApi) {
+      // 跟随服务端分页游标，并同步记录它使用的 offset（服务端坐标系）
+      try {
+        const o = new URL(nextFromApi).searchParams.get("offset");
+        if (o !== null && Number.isFinite(Number(o))) currentOffset = Number(o);
+        else currentOffset += 20;
+      } catch {
+        currentOffset += 20;
+      }
+      nextUrl = nextFromApi;
+    } else {
+      currentOffset += 20; // limit 参数固定 20，服务端 offset 步长同为 20
+      nextUrl = isEnd ? "" : `https://www.zhihu.com/api/v4/members/${ZHIHU_USERNAME}/answers?include=${includeStr}&limit=20&offset=${currentOffset}`;
+    }
     await new Promise(r => setTimeout(r, 1000));
   }
   if (duplicateSkipped > 0) {
@@ -1294,6 +1308,12 @@ export async function runFollowingScraper(onlyList = false) {
     // 规则未通过但值得 AI 复核的候选（每类最多 10 条，扫描结束后批量复核一次）
     const answerAiCandidates: FollowingAiCandidate[] = [];
     const articleAiCandidates: FollowingAiCandidate[] = [];
+    // 每个答主独立的页内去重集合：answers/articles 端点相邻页重叠严重（answers 实测约 47%），
+    // 重复项若参与 eval/sendContent/unchanged，会凑满 earlyStop 触发假早停。按答主隔离避免 id 冲突。
+    const seenAnswerIds = new Set<string>();
+    const seenArticleIds = new Set<string>();
+    let duplicateAnswerSkipped = 0;
+    let duplicateArticleSkipped = 0;
 
     // 核心分流逻辑：
     // - 若该答主已完成首次历史存量扫描（historyDone === true）且当前为日常快速同步（isFast === true）：
@@ -1367,6 +1387,12 @@ export async function runFollowingScraper(onlyList = false) {
           for (const item of aJson.data) {
             if (!item?.id) continue;
             const itemIdStr = String(item.id);
+            // 分页重叠去重：重复项不参与 eval、不 sendContent、不计入 unchanged/savedForUser
+            if (seenAnswerIds.has(itemIdStr)) {
+              duplicateAnswerSkipped++;
+              continue;
+            }
+            seenAnswerIds.add(itemIdStr);
             if (plan.sortBy === "created" && aOffset === 0 && !newestSeenAnswerId) {
               newestSeenAnswerId = itemIdStr;
             }
@@ -1469,7 +1495,8 @@ export async function runFollowingScraper(onlyList = false) {
           }
 
           if (!aIsEnd) aIsEnd = Boolean(aJson.paging?.is_end);
-          aOffset += batchLimit;
+          // 按实际返回条数推进（服务端忽略 limit 时避免与上一页大面积重叠），seenAnswerIds 兜底去重
+          aOffset += (aJson.data?.length || batchLimit);
           if (plan.trackResume && !aIsEnd) {
             await reportUserProgress(u.urlToken, aOffset, false);
           }
@@ -1535,6 +1562,13 @@ export async function runFollowingScraper(onlyList = false) {
 
         for (const item of artJson.data) {
           if (!item?.id) continue;
+          const articleIdStr = String(item.id);
+          // 文章端点去重兜底：重复项不参与 eval/sendContent/unchanged
+          if (seenArticleIds.has(articleIdStr)) {
+            duplicateArticleSkipped++;
+            continue;
+          }
+          seenArticleIds.add(articleIdStr);
           const cleanedHtml = cleanHtml(item.content);
           const evalRes = isUserFull ? null : evaluateForAutoBackup(item, cleanedHtml);
           const contentInput = {
@@ -1608,7 +1642,8 @@ export async function runFollowingScraper(onlyList = false) {
         }
 
         if (!artIsEnd) artIsEnd = Boolean(artJson.paging?.is_end);
-        artOffset += batchLimit;
+        // 按实际返回条数推进，seenArticleIds 兜底去重
+        artOffset += (artJson.data?.length || batchLimit);
         await new Promise(r => setTimeout(r, 500));
       }
 
@@ -1626,6 +1661,11 @@ export async function runFollowingScraper(onlyList = false) {
           }
         }
       }
+    }
+
+    const duplicateTotal = duplicateAnswerSkipped + duplicateArticleSkipped;
+    if (duplicateTotal > 0) {
+      console.log(`🔁 [${u.name}] 分页重叠去重 ${duplicateTotal} 条`);
     }
 
     if (completedAllPlans && !stats.circuitBroken && (!isHistoryDone || (newestSeenAnswerId && newestSeenAnswerId !== lastMarkAnswerId))) {
