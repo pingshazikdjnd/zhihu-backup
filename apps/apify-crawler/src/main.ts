@@ -807,20 +807,22 @@ export async function runCollectionScraper() {
       }
       
       if (items.length > 0 && !stats.circuitBroken) {
-        // schema 单请求上限 1000 条：超大的收藏夹截断提交并跳过移除对账
-        // （incremental=true），避免整个快照被 400 拒掉导致全部丢失
+        // schema 单请求上限 1000 条：大收藏夹分片提交，只有最后一片才可带全量移除对账
         const MAX_ITEMS = 1000;
-        const overflow = items.length > MAX_ITEMS;
-        if (overflow) {
-          console.warn(`⚠️ 收藏夹 [${coll.title}] 共 ${items.length} 条超出单请求上限，本轮只提交前 ${MAX_ITEMS} 条并跳过移除对账`);
-        }
+        const chunks: any[][] = [];
+        for (let i = 0; i < items.length; i += MAX_ITEMS) chunks.push(items.slice(i, i + MAX_ITEMS));
+        const stopReconcile = cIncomplete || (cIsEnd && isFast);
         try {
-          await sendCollectionSnapshot({
-            collection: { id: coll.id, title: coll.title, ownerToken: ZHIHU_USERNAME || "", updatedTime: coll.updatedTime },
-            // 抓取中断时必须跳过移除检测，防止把未抓到的条目误标移除
-            incremental: cIncomplete || (cIsEnd && isFast) || overflow,
-            items: overflow ? items.slice(0, MAX_ITEMS) : items
-          });
+          for (let ci = 0; ci < chunks.length; ci++) {
+            const isLastChunk = ci === chunks.length - 1;
+            if (stats.circuitBroken) break;
+            await sendCollectionSnapshot({
+              collection: { id: coll.id, title: coll.title, ownerToken: ZHIHU_USERNAME || "", updatedTime: coll.updatedTime },
+              // 中间片一律 incremental（不做移除对账）；只有最后一片且抓取完整时才允许全量对账
+              incremental: !isLastChunk || stopReconcile,
+              items: chunks[ci]
+            });
+          }
         } catch (e: any) {
            console.error(`❌ 收藏夹保存失败: ${sanitizeErrorForLog(e)}`);
         }
@@ -1339,7 +1341,9 @@ export async function runFollowingScraper(onlyList = false) {
       const plans: Array<{ sortBy: "created" | "voteups"; startOffset: number; maxScan: number; earlyStop: number; trackResume: boolean }> =
         onlyIncrementalNow
           ? [
-              { sortBy: "created", startOffset: 0, maxScan: 40, earlyStop: 5, trackResume: false },
+              // 有标记点时按它继续翻到撞见为止：两次同步之间新增 >40 篇也不能漏；
+              // 没有标记点时仍限 40 条（首次增量摸底）。
+              { sortBy: "created", startOffset: 0, maxScan: lastMarkAnswerId ? 100000 : 40, earlyStop: 5, trackResume: false },
               // 补一轮「最热 20」：后来涨赞或被折叠的内容早已沉出 created 最新 40 条，
               // 只有按 voteups 重扫才能捞进规则/AI 候选池；不做早停、不跟踪断点
               { sortBy: "voteups", startOffset: 0, maxScan: 20, earlyStop: 999999, trackResume: false }
@@ -1535,7 +1539,7 @@ export async function runFollowingScraper(onlyList = false) {
       let artOffset = 0;
       let artIsEnd = false;
       let unchanged = 0;
-      const maxArticles = isUserFull ? 100000 : (isFast ? 20 : 40);
+      const maxArticles = isUserFull ? 100000 : (onlyIncrementalNow ? 100000 : (isFast ? 20 : 40));
       const artEarlyStop = isFast ? 5 : 999999;
 
       while (!artIsEnd && artOffset < maxArticles && !stats.circuitBroken) {

@@ -16,6 +16,9 @@ const SEARCH_TEXT_LIMIT = 4000;
 function normalizeHtmlForHash(html: string): string {
   return html
     .replace(/https?:\/\/pic[0-9a-z]*\.zhimg\.com/gi, "https://zhimg.com")
+    // 同一篇内容在不同抓取时刻可能返回不同尺寸后缀（_720w / _1440w 等），
+    // 参与哈希会误判「正文已更新」；src 里的查询签名同理。
+    .replace(/_\d+w(?=[.\/"'?\s])/g, "")
     .replace(/(<img\b[^>]*?\ssrc="[^"]*?)\?[^"]*"/gi, '$1"');
 }
 
