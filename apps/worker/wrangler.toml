@@ -32,10 +32,11 @@ ZHIHU_USERNAME = "yang-xu-heng-94"
 # 同源访问（直接打开 worker 域名）不需要 CORS，不受此限制。
 ALLOWED_ORIGIN = "https://zhihu-backup.pages.dev"
 
-# 定时触发 Apify（UTC 时间）。0 2,14 * * * = 北京时间每天 10:00 / 22:00。
-# 注意：每次触发都是一次 Apify run，会产生费用，按需调整频率。
+# 云端 Apify 已停用：镜像为旧代码，且与本地 08:05/20:05 任务并发双写。
+# 必须用空数组才能移除已部署的 cron（只注释掉该段不会删除）。
+# 重新启用时改回 ["0 2,14 * * *"] 并重新部署 Actor。
 [triggers]
-crons = ["0 2,14 * * *"]
+crons = []
 
 # 以下四项不要写在这里，用 secret 注入：
 #   npx wrangler secret put API_SECRET
