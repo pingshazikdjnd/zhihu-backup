@@ -16,10 +16,11 @@ const SEARCH_TEXT_LIMIT = 4000;
 function normalizeHtmlForHash(html: string): string {
   return html
     .replace(/https?:\/\/pic[0-9a-z]*\.zhimg\.com/gi, "https://zhimg.com")
-    // 同一篇内容在不同抓取时刻可能返回不同尺寸后缀（_720w / _1440w 等），
-    // 参与哈希会误判「正文已更新」；src 里的查询签名同理。
-    .replace(/_\d+w(?=[.\/"'?\s])/g, "")
-    .replace(/(<img\b[^>]*?\ssrc="[^"]*?)\?[^"]*"/gi, '$1"');
+    // 仅对 <img src> 归一化尺寸后缀与查询签名；正文纯文本里的 _720w 不得被剥掉，
+    // 否则不同正文（如教程里的文件名对比）可能归一成同一串、变更漏检
+    .replace(/(<img\b[^>]*?\ssrc=")([^"]*)"/gi, (_m, prefix, url) =>
+      `${prefix}${String(url).replace(/_\d+w(?=[.\/]?)/, "").replace(/\?.*$/, "")}"`
+    );
 }
 
 export function upsertContent(input: IngestContentInput) {
@@ -387,9 +388,12 @@ export async function listContents(params: { type?: string; q?: string; author?:
   }
 
   if (params.q) {
+    // q 钳制：过长的关键词会让三字段 LIKE 撞 SQLite 的
+    // "LIKE or GLOB pattern too complex" 上限直接 500，截断到 100 字符
+    const q = params.q.slice(0, 100);
     conditions.push(`(c.title LIKE ? ESCAPE '\\' OR c.question_title LIKE ? ESCAPE '\\' OR c.content_md LIKE ? ESCAPE '\\')`);
     // 转义 LIKE 通配符：否则搜 "%" 会全表命中、"50%" 按 50* 通配匹配
-    const kw = `%${params.q.replace(/[\\%_]/g, m => "\\" + m)}%`;
+    const kw = `%${q.replace(/[\\%_]/g, m => "\\" + m)}%`;
     values.push(kw, kw, kw);
   }
 

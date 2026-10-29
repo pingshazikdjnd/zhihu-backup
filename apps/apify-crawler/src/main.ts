@@ -807,19 +807,26 @@ export async function runCollectionScraper() {
       }
       
       if (items.length > 0 && !stats.circuitBroken) {
-        // schema 单请求上限 1000 条：大收藏夹分片提交，只有最后一片才可带全量移除对账
+        // schema 单请求上限 1000 条：大收藏夹分片提交。
+        // 分片提交时不做移除对账，避免末片把前片条目标删（服务端以「本片 items」
+        // 为全量基准，非 incremental 快照会把不在本片内的现有条目全部标 is_removed=1）。
+        // 会话内聚合 allKeys 后统一对账的协议尚未实现，多片本轮一律跳过对账。
         const MAX_ITEMS = 1000;
         const chunks: any[][] = [];
         for (let i = 0; i < items.length; i += MAX_ITEMS) chunks.push(items.slice(i, i + MAX_ITEMS));
         const stopReconcile = cIncomplete || (cIsEnd && isFast);
+        const multiChunk = chunks.length > 1;
+        if (multiChunk) {
+          console.warn(`⚠️ 收藏夹 [${coll.title}] 共 ${items.length} 条，分 ${chunks.length} 片提交；本轮跳过移除对账（分片与会话聚合未实现）`);
+        }
         try {
           for (let ci = 0; ci < chunks.length; ci++) {
             const isLastChunk = ci === chunks.length - 1;
             if (stats.circuitBroken) break;
             await sendCollectionSnapshot({
               collection: { id: coll.id, title: coll.title, ownerToken: ZHIHU_USERNAME || "", updatedTime: coll.updatedTime },
-              // 中间片一律 incremental（不做移除对账）；只有最后一片且抓取完整时才允许全量对账
-              incremental: !isLastChunk || stopReconcile,
+              // 多片时所有片一律 incremental（跳过移除对账）；单片且抓取完整时才允许全量对账
+              incremental: multiChunk || !isLastChunk || stopReconcile,
               items: chunks[ci]
             });
           }
@@ -1024,8 +1031,12 @@ export async function runUpvotesScraper() {
       // 当存在历史断点且尚未进入 resuming 阶段时（正在扫最新动态），
       // 严禁上报游标（不论快速/全量），否则第 1 页未凑齐 20 条已存在记录时就会把深水区断点覆盖回第 2 页！
       const inHeadBeforeResume = Boolean(upvotesCursor) && !resuming && !isEnd;
-      if (!inHeadBeforeResume && (resuming || !isFast)) {
-        await reportCursor(isEnd ? null : nextUrl);
+      // isEnd 时必须无条件清游标：否则 fast 模式下头部自然翻到末尾且未进入上报分支，
+      // 失效游标会一直留在服务端，之后每轮都从它空转
+      if (isEnd) {
+        await reportCursor(null);
+      } else if (!inHeadBeforeResume && (resuming || !isFast)) {
+        await reportCursor(nextUrl);
       }
     }
 
