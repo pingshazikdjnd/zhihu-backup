@@ -48,6 +48,8 @@ export const IngestCommentSchema = z.object({
   beReplied: z.string().nullable().optional().default(null),
   content: z.string().optional().default(""),
   img: z.string().optional().default(""),
+  // 旧通道/新通道的图片字段归一：img 仍是标准字段，imageUrl 仅作兼容回退
+  imageUrl: z.string().optional().default(""),
   time: z.string().optional().default(""),
   location: z.string().optional().default(""),
   likes: z.number().int().optional().default(0),

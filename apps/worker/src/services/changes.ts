@@ -10,6 +10,36 @@ export type ChangeParams = {
 };
 
 /**
+ * 评论事件只持久化引用字段：正文/头像/点赞等快照在 comments/comment_versions 里，
+ * 再复制进 change_events 既浪费 D1 空间，也会让事件流变成第二份正文存档。
+ * 这里做兜底裁剪，防止调用方再传整段评论对象。
+ */
+function compactCommentPayload(payload: unknown, contentPk?: string | null): unknown {
+  if (payload === null || payload === undefined || typeof payload !== "object") return null;
+  const record = payload as Record<string, unknown>;
+  const commentId = typeof record.commentId === "string" && record.commentId
+    ? record.commentId
+    : typeof record.id === "string" && record.id
+      ? record.id
+      : "";
+  const pk = typeof record.contentPk === "string" && record.contentPk
+    ? record.contentPk
+    : contentPk;
+  const ref: Record<string, string> = {};
+  if (commentId) ref.commentId = commentId;
+  if (pk) ref.contentPk = pk;
+  return ref;
+}
+
+function serializePayload(params: ChangeParams): string {
+  // content / collection_item 事件的摘要与 payload 保持原样，仅裁剪评论事件
+  if (params.entityType === "comment") {
+    return JSON.stringify(compactCommentPayload(params.payload, params.contentPk)) ?? "null";
+  }
+  return JSON.stringify(params.payload ?? null) ?? "null";
+}
+
+/**
  * 构造一条 change_events 的 prepared statement，供 db.batch() 批量提交。
  * 评论同步一条一条 emitChange 的话，200 条评论就是 200 次 D1 往返。
  */
@@ -25,7 +55,7 @@ export function buildChangeStatement(params: ChangeParams) {
     params.entityPk,
     params.contentPk ?? null,
     params.summary ?? "",
-    JSON.stringify(params.payload ?? null),
+    serializePayload(params),
     now
   );
 }
@@ -42,7 +72,7 @@ export async function emitChange(params: ChangeParams) {
     params.entityPk,
     params.contentPk ?? null,
     params.summary ?? "",
-    JSON.stringify(params.payload ?? null),
+    serializePayload(params),
     now
   );
 }

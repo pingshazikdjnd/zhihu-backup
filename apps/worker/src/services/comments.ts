@@ -47,6 +47,19 @@ async function replaceCommentsInner(input: IngestCommentsInput) {
   for (const c of input.comments) {
     uniqueComments.set(c.id, c);
   }
+  // 图片与 hash 在写语句循环外一次算好：
+  // - img 是标准字段，imageUrl 是旧通道兼容字段，标准 img 优先；
+  // - hash 输入仍是 `${content}|${img}|${likes}`，同一评论换通道不会因字段名不同而反复产生版本/事件。
+  const preparedComments = new Map<string, {
+    comment: typeof input.comments[number];
+    img: string;
+    hash: string;
+  }>();
+  for (const c of uniqueComments.values()) {
+    const img = c.img || c.imageUrl || "";
+    const hash = await sha256(normalizeForHash(`${c.content}|${img}|${c.likes}`));
+    preparedComments.set(c.id, { comment: c, img, hash });
+  }
   // 分批提交时对账基准是 allIds（全量），单发时是本批 comments 的 id
   const incomingIds = new Set(input.allIds ?? input.comments.map(c => c.id));
 
@@ -57,8 +70,7 @@ async function replaceCommentsInner(input: IngestCommentsInput) {
   // 语句顺序很重要：comments 必须先于 comment_versions（外键）
   const stmts: any[] = [];
 
-  for (const c of uniqueComments.values()) {
-    const hash = await sha256(normalizeForHash(`${c.content}|${c.img}|${c.likes}`));
+  for (const { comment: c, img, hash } of preparedComments.values()) {
     const exists = existingMap.get(c.id);
 
     if (!exists) {
@@ -76,7 +88,7 @@ async function replaceCommentsInner(input: IngestCommentsInput) {
         c.authorAvatar,
         c.beReplied ?? null,
         c.content,
-        c.img,
+        img,
         c.time,
         c.location,
         c.likes,
@@ -92,7 +104,7 @@ async function replaceCommentsInner(input: IngestCommentsInput) {
         INSERT INTO comment_versions (
           comment_id, content_pk, version_hash, content_md, img_url, likes, snapshot_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).raw(c.id, input.contentPk, hash, c.content, c.img, c.likes, now));
+      `).raw(c.id, input.contentPk, hash, c.content, img, c.likes, now));
 
       stmts.push(buildChangeStatement({
         eventType: "comment.added",
@@ -100,7 +112,7 @@ async function replaceCommentsInner(input: IngestCommentsInput) {
         entityPk: c.id,
         contentPk: input.contentPk,
         summary: `${c.author}: ${c.content.slice(0, 30)}`,
-        payload: c
+        payload: { commentId: c.id, contentPk: input.contentPk }
       }));
 
       added++;
@@ -127,7 +139,7 @@ async function replaceCommentsInner(input: IngestCommentsInput) {
         c.authorAvatar,
         c.beReplied ?? null,
         c.content,
-        c.img,
+        img,
         c.time,
         c.location,
         c.likes,
@@ -143,7 +155,7 @@ async function replaceCommentsInner(input: IngestCommentsInput) {
         INSERT INTO comment_versions (
           comment_id, content_pk, version_hash, content_md, img_url, likes, snapshot_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).raw(c.id, input.contentPk, hash, c.content, c.img, c.likes, now));
+      `).raw(c.id, input.contentPk, hash, c.content, img, c.likes, now));
 
       stmts.push(buildChangeStatement({
         eventType: "comment.updated",
@@ -151,22 +163,21 @@ async function replaceCommentsInner(input: IngestCommentsInput) {
         entityPk: c.id,
         contentPk: input.contentPk,
         summary: `${c.author}: ${c.content.slice(0, 30)}`,
-        payload: c
+        payload: { commentId: c.id, contentPk: input.contentPk }
       }));
 
       updated++;
       continue;
     }
 
-    // 内容没变，只在头像/点赞/时间/位置确有变化（或从删除态复活）时才刷新，
-    // 全部相同则一条语句都不产生：否则每轮同步都会重写全量评论行，
-    // D1 每日写入额度瞬间打满、增量同步退化成全量
+    // 内容没变，只在头像/时间/位置确有变化时才刷新；
+    // 点赞数已纳入 comment_hash，不再单独判断。删除态复活由上面的更新分支处理。
+    // 旧行 time_text/location 可能是 NULL，本次抓取缺失时是空串：二者视为相同，
+    // 否则每次同步都会因 NULL !== "" 再发一条刷新 UPDATE。
     const needsRefresh =
       (!!c.authorAvatar && c.authorAvatar !== exists.author_avatar) ||
-      exists.likes !== c.likes ||
-      exists.time_text !== c.time ||
-      exists.location !== c.location ||
-      exists.is_deleted === 1;
+      (exists.time_text || "") !== (c.time || "") ||
+      (exists.location || "") !== (c.location || "");
 
     if (needsRefresh) {
       stmts.push(db.prepare(`

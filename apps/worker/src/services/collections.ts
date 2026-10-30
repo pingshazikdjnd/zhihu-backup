@@ -56,7 +56,63 @@ async function upsertCollectionSnapshotInner(input: IngestCollectionSnapshotInpu
   let added = 0;
   let removed = 0;
 
-  const existsCollection = await db.prepare(`SELECT id FROM collections WHERE id = ?`).get(collectionId);
+  const existsCollection = await db.prepare(`
+    SELECT id, title, owner_token, updated_time
+    FROM collections
+    WHERE id = ?
+  `).get(collectionId) as {
+    id: string;
+    title: string;
+    owner_token: string | null;
+    updated_time: string;
+  } | null;
+
+  // 完全重复快照直接 0 写：最近一次快照的 item_count 与当前有效条目一致，
+  // 且标题/owner、每个当前有效条目字段都没变时，collections UPDATE 与
+  // collection_snapshots INSERT 都是纯写入放大。
+  // 不能只信 collections.updated_time（弱数据源并不可靠），必须逐条比较字段；
+  // 历史已移除行只要不在本次输入中就不影响判断，增删改与恢复仍走原对账流程。
+  if (existsCollection) {
+    const latestSnapshot = await db.prepare(`
+      SELECT item_count
+      FROM collection_snapshots
+      WHERE collection_id = ?
+      ORDER BY snapshot_at DESC, id DESC
+      LIMIT 1
+    `).get(collectionId) as { item_count: number } | null;
+
+    if (latestSnapshot) {
+      const activeItems = existingItems.filter(i => i.is_removed === 0);
+      // uniqueItems 必须与当前有效条目集合完全一致：
+      // 数量相同且每个有效条目都能在输入中找到，才算“本次快照覆盖全部有效条目”。
+      // 增量分片若只带了部分条目，数量/覆盖条件不满足，仍会走原修复流程。
+      const itemsUnchanged =
+        latestSnapshot.item_count === activeItems.length &&
+        uniqueItems.size === activeItems.length &&
+        activeItems.every(row => {
+          const item = uniqueItems.get(`${row.source_type}:${row.source_id}`);
+          if (!item) return false;
+          return (row.title || "") === (item.title || "") &&
+            (row.author_name || "") === (item.authorName || "") &&
+            (row.source_url || "") === (item.sourceUrl || "");
+        });
+
+      // 爬虫通常拿不到收藏夹 updated_time（输入固定为空串），而库里是每次保存时的历史时间：
+      // 只有本次输入明确给出非空可信值时才比较，空值不得否定完全重复，也不能因此写库。
+      const updatedTimeUnchanged =
+        !input.collection.updatedTime ||
+        (existsCollection.updated_time || "") === input.collection.updatedTime;
+
+      if (
+        itemsUnchanged &&
+        updatedTimeUnchanged &&
+        (existsCollection.title || "") === (input.collection.title || "") &&
+        (existsCollection.owner_token || "") === (input.collection.ownerToken || "")
+      ) {
+        return { added: 0, removed: 0, count: activeItems.length, unchanged: true };
+      }
+    }
+  }
 
   const stmts: any[] = [];
 

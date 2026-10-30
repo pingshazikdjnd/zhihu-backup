@@ -214,6 +214,34 @@ function cleanHtml(html: any) {
   return cleaned;
 }
 
+/**
+ * 评论图片归一化：主回答链路与收藏/赞同/关注链路必须产出同一份 content/img，
+ * 否则同一评论换通道后 comment_hash 变化，会反复追加 comment_versions + change_events。
+ * 优先级：标准 img 字段 > imageUrl 兼容字段 > 正文里的「查看图片」链接。
+ * 图片 URL 只落在 img/imageUrl，正文中的链接会被移除，不把 URL 写进正文。
+ */
+function pickCommentImageUrl(comment: { img?: unknown; imageUrl?: unknown; image_url?: unknown }): string {
+  for (const value of [comment.img, comment.imageUrl, comment.image_url]) {
+    if (typeof value === "string" && value) return value;
+  }
+  return "";
+}
+
+function normalizeCommentImage(
+  rawContent: unknown,
+  comment: { img?: unknown; imageUrl?: unknown; image_url?: unknown }
+): { content: string; img: string; imageUrl: string } {
+  let text = typeof rawContent === "string" ? rawContent : "";
+  let contentImg = "";
+  const imgMatch = text.match(/<a[^>]+href="([^"]+)"[^>]*>.*?查看图片.*?<\/a>/i);
+  if (imgMatch) {
+    contentImg = imgMatch[1];
+    text = text.replace(imgMatch[0], "").trim();
+  }
+  const img = pickCommentImageUrl(comment) || contentImg;
+  return { content: cleanHtml(text), img, imageUrl: img };
+}
+
 export async function runScraper() {
   const browser = await setupBrowser();
   console.log("🚀 开始知乎回答自动同步...");
@@ -396,14 +424,16 @@ export async function runScraper() {
         }
         
         for (const c of cJson.data) {
+          const normalizedImage = normalizeCommentImage(c.content, c);
           allComments.push({
             id: String(c.id),
             parentId: c.reply_to_comment_id ? String(c.reply_to_comment_id) : null,
             author: c.author?.member?.name || "匿名",
             authorAvatar: c.author?.member?.avatar_url || "",
             beReplied: c.reply_to_author?.member?.name || null,
-            content: cleanHtml(c.content),
-            img: "",
+            content: normalizedImage.content,
+            img: normalizedImage.img,
+            imageUrl: normalizedImage.imageUrl,
             time: toIsoOrNull(c.created_time),
             location: c.address_text || "",
             likes: c.vote_count || c.reaction?.statistics?.like_count || 0,
@@ -427,14 +457,16 @@ export async function runScraper() {
                 }
                 
                 for (const child of chJson.data) {
+                const normalizedImage = normalizeCommentImage(child.content, child);
                 allComments.push({
                  id: String(child.id),
                  parentId: String(c.id),
                  author: child.author?.member?.name || "匿名",
                  authorAvatar: child.author?.member?.avatar_url || "",
                  beReplied: child.reply_to_author?.member?.name || null,
-                 content: cleanHtml(child.content),
-                 img: "",
+                 content: normalizedImage.content,
+                 img: normalizedImage.img,
+                 imageUrl: normalizedImage.imageUrl,
                  time: toIsoOrNull(child.created_time),
                  location: child.address_text || "",
                  likes: child.vote_count || child.reaction?.statistics?.like_count || 0,
@@ -449,14 +481,16 @@ export async function runScraper() {
             }
           } else if (c.child_comments && c.child_comments.length > 0) {
             for (const child of c.child_comments) {
+               const normalizedImage = normalizeCommentImage(child.content, child);
                allComments.push({
                  id: String(child.id),
                  parentId: String(c.id),
                  author: child.author?.member?.name || "匿名",
                  authorAvatar: child.author?.member?.avatar_url || "",
                  beReplied: child.reply_to_author?.member?.name || null,
-                 content: cleanHtml(child.content),
-                 img: "",
+                 content: normalizedImage.content,
+                 img: normalizedImage.img,
+                 imageUrl: normalizedImage.imageUrl,
                  time: toIsoOrNull(child.created_time),
                  location: child.address_text || "",
                  likes: child.vote_count || child.reaction?.statistics?.like_count || 0,
@@ -525,7 +559,7 @@ export async function runScraper() {
  * 按设置策略（none: 不抓 / hot: 前1页20条高赞热评+内联子评论 / full: 全量分页抓取）
  * 为收藏夹/赞同/关注答主的回答或文章抓取评论。
  */
-async function syncHotCommentsForContent(
+export async function syncHotCommentsForContent(
   context: any,
   sourceType: "answer" | "article" | "pin",
   sourceId: string,
@@ -556,21 +590,16 @@ async function syncHotCommentsForContent(
       }
 
       for (const c of cJson.data) {
-        let imgUrl = "";
-        let textContent = c.content || "";
-        const imgMatch = textContent.match(/<a[^>]+href="([^"]+)"[^>]*>.*?查看图片.*?<\/a>/i);
-        if (imgMatch) {
-          imgUrl = imgMatch[1];
-          textContent = textContent.replace(imgMatch[0], "").trim();
-        }
+        const normalizedImage = normalizeCommentImage(c.content, c);
         allComments.push({
           id: String(c.id),
           parentId: c.reply_to_comment_id ? String(c.reply_to_comment_id) : null,
           author: c.author?.member?.name || "匿名",
           authorAvatar: c.author?.member?.avatar_url || "",
           beReplied: null,
-          content: cleanHtml(textContent),
-          img: imgUrl,
+          content: normalizedImage.content,
+          img: normalizedImage.img,
+          imageUrl: normalizedImage.imageUrl,
           time: toIsoOrNull(c.created_time),
           location: c.address_text || "",
           likes: c.vote_count || c.reaction?.statistics?.like_count || 0,
@@ -581,14 +610,16 @@ async function syncHotCommentsForContent(
 
         if (Array.isArray(c.child_comments)) {
           for (const child of c.child_comments) {
+            const normalizedImage = normalizeCommentImage(child.content, child);
             allComments.push({
               id: String(child.id),
               parentId: String(c.id),
               author: child.author?.member?.name || "匿名",
               authorAvatar: child.author?.member?.avatar_url || "",
               beReplied: child.reply_to_author?.member?.name || null,
-              content: cleanHtml(child.content),
-              img: "",
+              content: normalizedImage.content,
+              img: normalizedImage.img,
+              imageUrl: normalizedImage.imageUrl,
               time: toIsoOrNull(child.created_time),
               location: child.address_text || "",
               likes: child.vote_count || child.reaction?.statistics?.like_count || 0,
