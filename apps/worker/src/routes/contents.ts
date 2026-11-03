@@ -1,9 +1,38 @@
 import { Hono } from "hono";
 import { getContentDetail, listContents } from "../services/contents.js";
 import { getChildComments, listComments, listRootComments } from "../services/comments.js";
+import {
+  listReadableContentOffloadTargets,
+  readOffloadedContentHtml,
+  type ExternalStorageTarget
+} from "./auth.js";
+import { getR2TextWithEdgeCache } from "../utils/r2-cache.js";
 import type { Bindings } from "../types.js";
 
 export const contentRoutes = new Hono<{ Bindings: Bindings }>();
+
+/**
+ * 主 R2 未命中时，从外部扩容库透明回读正文 HTML。
+ * 正文被 offload 到 Turso / 跨账号 D1 的 content_blobs 或外部 S3 时，详情页依然无感可读。
+ */
+async function readOffloadedHtml(
+  pk: string,
+  hash: string | null | undefined,
+  bucket: any
+): Promise<string | null> {
+  if (!bucket) return null;
+  let targets: ExternalStorageTarget[] = [];
+  try {
+    targets = await listReadableContentOffloadTargets(bucket);
+  } catch {
+    return null;
+  }
+  for (const target of targets) {
+    const html = await readOffloadedContentHtml(target, pk, hash || undefined).catch(() => null);
+    if (html) return html;
+  }
+  return null;
+}
 
 contentRoutes.get("/", async c => {
   const type = c.req.query("type");
@@ -19,20 +48,39 @@ contentRoutes.get("/:pk", async c => {
   const pk = c.req.param("pk");
   const detail = await getContentDetail(pk);
   if (detail && detail.content) {
-    if (c.env.BUCKET) {
-      // 新 key 带 content_hash（旧版本不会被覆盖）；读不到就回落旧 key，兼容历史数据
-      const hash = detail.content.content_hash;
-      let htmlObj = hash ? await c.env.BUCKET.get(`html/${pk}/${hash}`) : null;
-      if (!htmlObj) htmlObj = await c.env.BUCKET.get(`html/${pk}`);
-      if (htmlObj) detail.content.content_html = await htmlObj.text();
+    // 新 key 带 content_hash（旧版本不会被覆盖）；读不到就回落旧 key，兼容历史数据
+    const hash = detail.content.content_hash as string | null | undefined;
+    let htmlFound = false;
 
-      // 详情页渲染只用 HTML：HTML 命中时 md/ 读取必然 miss（旧通道从不写 md/），
-      // 跳过可以省掉 2 次 R2 Class B 读取
-      if (!htmlObj) {
-        let mdObj = hash ? await c.env.BUCKET.get(`md/${pk}/${hash}`) : null;
-        if (!mdObj) mdObj = await c.env.BUCKET.get(`md/${pk}`);
-        if (mdObj) detail.content.content_md = await mdObj.text();
+    if (c.env.BUCKET) {
+      // 带 content_hash 的正文对象不可变：边缘缓存一年（immutable）；
+      // 旧 key html/{pk} 会被同 key 覆盖，只缓存 1 小时，写入方负责失效。
+      const hashedHtml = hash
+        ? await getR2TextWithEdgeCache(c.env.BUCKET, `html/${pk}/${hash}`, { immutable: true })
+        : null;
+      const html =
+        hashedHtml ?? (await getR2TextWithEdgeCache(c.env.BUCKET, `html/${pk}`, { ttlSeconds: 3600 }));
+      if (html !== null) {
+        detail.content.content_html = html;
+        htmlFound = true;
       }
+    }
+
+    // 主 R2 没有：正文可能被 offload 到外部扩容库（content_blobs / 外部 S3）
+    if (!htmlFound) {
+      const remoteHtml = await readOffloadedHtml(pk, hash, c.env.BUCKET);
+      if (remoteHtml) {
+        detail.content.content_html = remoteHtml;
+        htmlFound = true;
+      }
+    }
+
+    // 详情页渲染只用 HTML：HTML 命中时 md/ 读取必然 miss（旧通道从不写 md/），
+    // 跳过可以省掉 2 次 R2 Class B 读取
+    if (!htmlFound && c.env.BUCKET) {
+      let mdObj = hash ? await c.env.BUCKET.get(`md/${pk}/${hash}`) : null;
+      if (!mdObj) mdObj = await c.env.BUCKET.get(`md/${pk}`);
+      if (mdObj) detail.content.content_md = await mdObj.text();
     }
   }
   return c.json(detail);
@@ -44,11 +92,12 @@ contentRoutes.get("/:pk/comments", async c => {
 });
 
 // 根评论分页（热度序）。子评论按需从 R2 读取，不再随根列表一次性返回。
+// 传 BUCKET 让 service 能在主 D1 为空时透明回源外部扩容库。
 contentRoutes.get("/:pk/root-comments", async c => {
   const pk = c.req.param("pk");
   const limit = parseInt(c.req.query("limit") || "20", 10);
   const offset = parseInt(c.req.query("offset") || "0", 10);
-  const data = await listRootComments(c.env.DB, pk, { limit, offset });
+  const data = await listRootComments(c.env.DB, pk, { limit, offset }, c.env.BUCKET);
   return c.json({
     data,
     limit: Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 20,
@@ -57,9 +106,12 @@ contentRoutes.get("/:pk/root-comments", async c => {
 });
 
 // 点「展开 N 条回复」时读取某个根评论下的子评论。
-// R2 未命中时回退读 D1（历史子评论还没搬进 R2），所以 BUCKET 缺失也照样能展开。
+// 读取顺序：主 R2 → 外部扩容库（楼中楼 JSON / 子评论行）→ 主 D1 历史数据。
 contentRoutes.get("/:pk/comments/:rootId/children", async c => {
   const rootId = c.req.param("rootId");
+  // 楼中楼的更新由 /ingest/comments-by-root 写 R2 后立即 purge 边缘缓存；
+  // 这里 30s 的短缓存只吸收「展开/收起」抖动与并发重复点击。
+  c.header("Cache-Control", "public, max-age=30, stale-while-revalidate=300");
   return c.json({ data: await getChildComments(c.env.BUCKET, rootId, c.env.DB) });
 });
 

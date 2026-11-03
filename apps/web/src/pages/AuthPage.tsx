@@ -3,6 +3,32 @@ import { api } from "../lib/api.js";
 
 type CommentSyncMode = "full" | "hot" | "none";
 
+type ExternalProviderType = "turso" | "cloudflare_d1" | "supabase" | "s3_r2" | "webhook";
+type ExternalSyncScope = "contents" | "comments" | "collections" | "upvotes";
+// offload=直接分流扩容（不占主库空间）｜overflow=主库满额自动溢出｜mirror=双写灾备
+type ExternalStorageRole = "offload" | "overflow" | "mirror";
+
+const DEFAULT_OVERFLOW_THRESHOLD_ROWS = 1_500_000;
+
+type ClientExternalStorageTarget = {
+  id: string;
+  name: string;
+  provider: ExternalProviderType;
+  enabled: boolean;
+  syncScopes: ExternalSyncScope[];
+  storageRole: ExternalStorageRole;
+  overflowThresholdRows: number;
+  endpointUrl: string;
+  databaseId?: string;
+  hasToken: boolean;
+  maskedToken: string;
+  createdAt: string;
+  updatedAt: string;
+  lastTestAt?: string | null;
+  lastTestOk?: boolean | null;
+  lastTestMsg?: string | null;
+};
+
 type SyncConfig = {
   commentsMyAnswers: CommentSyncMode;
   commentsCollections: CommentSyncMode;
@@ -31,6 +57,7 @@ type ZhihuStatus = {
   } | null;
   syncConfig?: SyncConfig;
   upvotesCursor?: string | null;
+  externalTargetsCount?: number;
 };
 
 const DEFAULT_CFG: SyncConfig = {
@@ -87,7 +114,37 @@ export default function AuthPage() {
   const [savingPwd, setSavingPwd] = useState(false);
   const [pwdMsg, setPwdMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
+  // 外部存储与多云扩展状态
+  const [targets, setTargets] = useState<ClientExternalStorageTarget[]>([]);
+  const [loadingTargets, setLoadingTargets] = useState(false);
+  const [showTargetForm, setShowTargetForm] = useState(false);
+  const [editingTargetId, setEditingTargetId] = useState<string | null>(null);
+  const [targetName, setTargetName] = useState("");
+  const [targetProvider, setTargetProvider] = useState<ExternalProviderType>("turso");
+  const [targetEndpoint, setTargetEndpoint] = useState("");
+  const [targetDatabaseId, setTargetDatabaseId] = useState("");
+  const [targetAuthToken, setTargetAuthToken] = useState("");
+  const [targetSyncScopes, setTargetSyncScopes] = useState<ExternalSyncScope[]>(["contents", "comments"]);
+  const [targetStorageRole, setTargetStorageRole] = useState<ExternalStorageRole>("offload");
+  const [targetOverflowThreshold, setTargetOverflowThreshold] = useState(String(DEFAULT_OVERFLOW_THRESHOLD_ROWS));
+  const [targetEnabled, setTargetEnabled] = useState(true);
+  const [savingTarget, setSavingTarget] = useState(false);
+  const [testingTarget, setTestingTarget] = useState(false);
+  const [targetActionMsg, setTargetActionMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  const [testingTargetId, setTestingTargetId] = useState<string | null>(null);
+
+  const loadTargets = () => {
+    setLoadingTargets(true);
+    api<{ targets: ClientExternalStorageTarget[] }>("/api/auth/external-targets")
+      .then(res => {
+        setTargets(res.targets || []);
+      })
+      .catch(() => {})
+      .finally(() => setLoadingTargets(false));
+  };
+
   const load = (syncForm = false) => {
+    loadTargets();
     api<ZhihuStatus>("/api/auth/zhihu-status")
       .then(s => {
         setStatus(s);
@@ -241,6 +298,233 @@ export default function AuthPage() {
       setPwdMsg({ type: "err", text: extractErrText(e, "修改密码失败") });
     } finally {
       setSavingPwd(false);
+    }
+  };
+
+  const resetTargetForm = () => {
+    setShowTargetForm(false);
+    setEditingTargetId(null);
+    setTargetName("");
+    setTargetProvider("turso");
+    setTargetEndpoint("");
+    setTargetDatabaseId("");
+    setTargetAuthToken("");
+    setTargetSyncScopes(["contents", "comments"]);
+    setTargetStorageRole("offload");
+    setTargetOverflowThreshold(String(DEFAULT_OVERFLOW_THRESHOLD_ROWS));
+    setTargetEnabled(true);
+    setTargetActionMsg(null);
+  };
+
+  const openAddTargetForm = () => {
+    resetTargetForm();
+    setShowTargetForm(true);
+  };
+
+  const openEditTargetForm = (t: ClientExternalStorageTarget) => {
+    setEditingTargetId(t.id);
+    setTargetName(t.name);
+    setTargetProvider(t.provider);
+    setTargetEndpoint(t.endpointUrl);
+    setTargetDatabaseId(t.databaseId || "");
+    setTargetAuthToken(""); // 密码留空表示不修改
+    setTargetSyncScopes(t.syncScopes || ["contents", "comments"]);
+    setTargetStorageRole(t.storageRole || "offload");
+    setTargetOverflowThreshold(String(t.overflowThresholdRows || DEFAULT_OVERFLOW_THRESHOLD_ROWS));
+    setTargetEnabled(t.enabled);
+    setTargetActionMsg(null);
+    setShowTargetForm(true);
+  };
+
+  const toggleTargetScope = (scope: ExternalSyncScope) => {
+    setTargetSyncScopes(prev => {
+      if (prev.includes(scope)) {
+        if (prev.length === 1) return prev; // 至少选一个
+        return prev.filter(s => s !== scope);
+      } else {
+        return [...prev, scope];
+      }
+    });
+  };
+
+  const saveTarget = async () => {
+    const name = targetName.trim();
+    if (!name) {
+      setTargetActionMsg({ type: "err", text: "请输入存储源名称" });
+      return;
+    }
+    let endpoint = targetEndpoint.trim();
+    if (targetProvider === "cloudflare_d1" && !endpoint) {
+      endpoint = "https://api.cloudflare.com";
+    }
+    if (!endpoint) {
+      setTargetActionMsg({ type: "err", text: "请输入连接地址" });
+      return;
+    }
+    if (needToken && !token.trim()) {
+      setTargetActionMsg({ type: "err", text: "请在上方操作密码框中输入密码" });
+      return;
+    }
+
+    const overflowThresholdRows = Math.trunc(Number(targetOverflowThreshold));
+    if (
+      targetStorageRole === "overflow" &&
+      (!Number.isFinite(overflowThresholdRows) || overflowThresholdRows <= 0)
+    ) {
+      setTargetActionMsg({ type: "err", text: "请填写有效的主库溢出水位线（评论行数）" });
+      return;
+    }
+
+    setSavingTarget(true);
+    setTargetActionMsg(null);
+    try {
+      const res = await api<{ ok: boolean; targets: ClientExternalStorageTarget[] }>("/api/auth/external-targets", {
+        method: "POST",
+        headers: buildHeaders(),
+        body: JSON.stringify({
+          id: editingTargetId || undefined,
+          name,
+          provider: targetProvider,
+          endpointUrl: endpoint,
+          databaseId: targetDatabaseId.trim() || undefined,
+          authToken: targetAuthToken.trim() || undefined,
+          syncScopes: targetSyncScopes,
+          storageRole: targetStorageRole,
+          overflowThresholdRows:
+            Number.isFinite(overflowThresholdRows) && overflowThresholdRows > 0
+              ? overflowThresholdRows
+              : DEFAULT_OVERFLOW_THRESHOLD_ROWS,
+          enabled: targetEnabled
+        })
+      });
+      if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
+      setTargets(res.targets || []);
+      setTargetActionMsg({ type: "ok", text: "外部存储源保存成功！" });
+      setTimeout(() => {
+        resetTargetForm();
+      }, 1000);
+      load(false);
+    } catch (e: any) {
+      setTargetActionMsg({ type: "err", text: extractErrText(e, "保存外部存储源失败") });
+    } finally {
+      setSavingTarget(false);
+    }
+  };
+
+  const testConnection = async (targetId?: string) => {
+    if (needToken && !token.trim()) {
+      setTargetActionMsg({ type: "err", text: "测试连接需要先输入操作密码" });
+      return;
+    }
+    if (targetId) {
+      setTestingTargetId(targetId);
+    } else {
+      setTestingTarget(true);
+      setTargetActionMsg(null);
+    }
+
+    try {
+      let reqBody: any;
+      if (targetId) {
+        reqBody = { id: targetId };
+      } else {
+        let endpoint = targetEndpoint.trim();
+        if (targetProvider === "cloudflare_d1" && !endpoint) {
+          endpoint = "https://api.cloudflare.com";
+        }
+        if (!endpoint) {
+          setTargetActionMsg({ type: "err", text: "请输入连接地址后再测试" });
+          return;
+        }
+        reqBody = {
+          // 编辑已有目标时带上 id：密码框留空（不重填 authToken）时后端才能回退到已保存的 token
+          id: editingTargetId || undefined,
+          provider: targetProvider,
+          endpointUrl: endpoint,
+          databaseId: targetDatabaseId.trim() || undefined,
+          authToken: targetAuthToken.trim() || undefined
+        };
+      }
+
+      const res = await api<{ ok: boolean; latencyMs: number; message: string; target?: ClientExternalStorageTarget }>(
+        "/api/auth/external-targets/test",
+        {
+          method: "POST",
+          headers: buildHeaders(),
+          body: JSON.stringify(reqBody)
+        }
+      );
+
+      if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
+
+      const msgText = `${res.ok ? "🟢 连接成功" : "🔴 连接失败"} (${res.latencyMs}ms): ${res.message}`;
+      if (targetId) {
+        loadTargets();
+        alert(msgText);
+      } else {
+        setTargetActionMsg({ type: res.ok ? "ok" : "err", text: msgText });
+      }
+    } catch (e: any) {
+      const errText = extractErrText(e, "测试连接失败");
+      if (targetId) {
+        alert("测试连接失败: " + errText);
+      } else {
+        setTargetActionMsg({ type: "err", text: errText });
+      }
+    } finally {
+      if (targetId) {
+        setTestingTargetId(null);
+      } else {
+        setTestingTarget(false);
+      }
+    }
+  };
+
+  const toggleTargetEnabled = async (t: ClientExternalStorageTarget) => {
+    if (needToken && !token.trim()) {
+      alert("操作需要先输入操作密码");
+      return;
+    }
+    try {
+      const res = await api<{ ok: boolean; targets: ClientExternalStorageTarget[] }>("/api/auth/external-targets", {
+        method: "POST",
+        headers: buildHeaders(),
+        body: JSON.stringify({
+          id: t.id,
+          name: t.name,
+          provider: t.provider,
+          endpointUrl: t.endpointUrl,
+          databaseId: t.databaseId,
+          syncScopes: t.syncScopes,
+          enabled: !t.enabled
+        })
+      });
+      if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
+      setTargets(res.targets || []);
+      load(false);
+    } catch (e: any) {
+      alert("切换失败: " + extractErrText(e, "未知错误"));
+    }
+  };
+
+  const deleteTarget = async (t: ClientExternalStorageTarget) => {
+    if (needToken && !token.trim()) {
+      alert("删除外部存储源需要先输入操作密码");
+      return;
+    }
+    if (!window.confirm(`确定删除外部存储源【${t.name}】吗？删除后将停止向其镜像分流。`)) return;
+    try {
+      const res = await api<{ ok: boolean; targets: ClientExternalStorageTarget[] }>("/api/auth/external-targets/delete", {
+        method: "POST",
+        headers: buildHeaders(),
+        body: JSON.stringify({ id: t.id })
+      });
+      if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
+      setTargets(res.targets || []);
+      if (editingTargetId === t.id) resetTargetForm();
+      load(false);
+    } catch (e: any) {
+      alert("删除失败: " + extractErrText(e, "未知错误"));
     }
   };
 
@@ -537,6 +821,548 @@ export default function AuthPage() {
               {savingCfg ? "保存中…" : "保存 AI 与扩展设置"}
             </button>
           </div>
+        </div>
+      </div>
+
+      {/* 模块：外部数据库与多云存储扩展（突破单号免费额度） */}
+      <div className="card">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <h3 style={{ margin: "0 0 6px 0", display: "flex", alignItems: "center", gap: 8 }}>
+              <span>🗄️ 外部数据库与多云存储扩展</span>
+              <span
+                style={{
+                  fontSize: 12,
+                  fontWeight: 500,
+                  padding: "2px 8px",
+                  borderRadius: 12,
+                  background: "#dcfce7",
+                  color: "#15803d",
+                  border: "1px solid #bbf7d0"
+                }}
+              >
+                分流扩容 · 透明回读
+              </span>
+            </h3>
+            <div style={{ fontSize: 13, color: "var(--zhihu-meta)", lineHeight: 1.6, maxWidth: 760 }}>
+              可挂载其他平台的免费数据库（Turso 9GB SQLite、跨账号 Cloudflare D1/R2、S3 对象存储等），把评论、楼中楼或正文<strong>真正分流</strong>到外部库：主 D1 的 5GB 与主 R2 的 10GB 不再是天花板，网页浏览时自动透明回源读取，完全无感。
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={openAddTargetForm}
+            style={{ padding: "7px 14px", fontSize: 13 }}
+          >
+            ➕ 添加外部存储源
+          </button>
+        </div>
+
+        {/* 顶部主库状态指示条 */}
+        <div
+          style={{
+            marginTop: 14,
+            padding: "10px 14px",
+            borderRadius: 8,
+            background: "rgba(22, 163, 74, 0.05)",
+            border: "1px solid rgba(22, 163, 74, 0.2)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            flexWrap: "wrap",
+            gap: 10,
+            fontSize: 13
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 16 }}>🟢</span>
+            <span>
+              <strong>主存储状态：</strong>Cloudflare D1 (5GB) + R2 (10GB) 已绑定并正常运行
+            </span>
+          </div>
+          <div style={{ color: "var(--zhihu-meta)", fontSize: 12 }}>
+            已启用 {targets.filter(t => t.enabled).length} / {targets.length} 个外部存储节点
+          </div>
+        </div>
+
+        {/* 表单面板（添加/编辑） */}
+        {showTargetForm && (
+          <div
+            style={{
+              marginTop: 16,
+              padding: 16,
+              borderRadius: 8,
+              background: "#f8fafc",
+              border: "1px solid #e2e8f0"
+            }}
+          >
+            <div style={{ fontWeight: 600, fontSize: 15, marginBottom: 14, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <span>{editingTargetId ? "✏️ 编辑外部存储源" : "➕ 添加外部数据库 / 存储源"}</span>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={resetTargetForm}
+                style={{ padding: "3px 8px", fontSize: 12 }}
+              >
+                ✕ 取消
+              </button>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 14 }}>
+              <div>
+                <label style={{ display: "block", fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
+                  存储源类型 (Provider)
+                </label>
+                <select
+                  style={{ ...selectStyle, width: "100%", minWidth: "auto", boxSizing: "border-box" }}
+                  value={targetProvider}
+                  onChange={e => {
+                    const p = e.target.value as ExternalProviderType;
+                    setTargetProvider(p);
+                    if (p === "cloudflare_d1" && !targetEndpoint) {
+                      setTargetEndpoint("https://api.cloudflare.com");
+                    }
+                  }}
+                >
+                  <option value="turso">Turso / LibSQL（SQLite 兼容云数据库 · 免费 9GB，推荐）</option>
+                  <option value="cloudflare_d1">Cloudflare D1 REST API（跨账号第二套 CF D1 数据库）</option>
+                  <option value="supabase">Supabase / PostgreSQL（REST API 模式）</option>
+                  <option value="s3_r2">S3 兼容对象存储（外部 R2 / Backblaze B2 / MinIO / 阿里云 OSS）</option>
+                  <option value="webhook">自定义 Webhook / 自建同步镜像节点（HTTP Ingest 转发）</option>
+                </select>
+              </div>
+
+              <div>
+                <label style={{ display: "block", fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
+                  存储源名称 (Name)
+                </label>
+                <input
+                  type="text"
+                  placeholder="例如：备用 Turso 评论库 / 跨账号备份 D1"
+                  value={targetName}
+                  onChange={e => setTargetName(e.target.value)}
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    padding: "8px 12px",
+                    borderRadius: 6,
+                    border: "1px solid var(--zhihu-border, #d1d5db)",
+                    fontSize: 13
+                  }}
+                />
+              </div>
+
+              <div style={{ gridColumn: "1 / -1" }}>
+                <label style={{ display: "block", fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
+                  连接地址 (Endpoint URL)
+                </label>
+                <input
+                  type="text"
+                  placeholder={
+                    targetProvider === "turso"
+                      ? "https://your-db-org.turso.io"
+                      : targetProvider === "cloudflare_d1"
+                      ? "https://api.cloudflare.com（默认即可）"
+                      : targetProvider === "supabase"
+                      ? "https://your-project.supabase.co"
+                      : targetProvider === "s3_r2"
+                      ? "https://<account_id>.r2.cloudflarestorage.com 或 S3 Endpoint"
+                      : "https://your-nas.example.com/api/webhook"
+                  }
+                  value={targetEndpoint}
+                  onChange={e => setTargetEndpoint(e.target.value)}
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    padding: "8px 12px",
+                    borderRadius: 6,
+                    border: "1px solid var(--zhihu-border, #d1d5db)",
+                    fontSize: 13,
+                    fontFamily: "ui-monospace, monospace"
+                  }}
+                />
+              </div>
+
+              <div>
+                <label style={{ display: "block", fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
+                  {targetProvider === "cloudflare_d1"
+                    ? "数据库标识 (AccountId/DatabaseId)"
+                    : targetProvider === "s3_r2"
+                    ? "Bucket 名称 (Bucket Name)"
+                    : "数据库标识 / 前缀 (可选)"}
+                </label>
+                <input
+                  type="text"
+                  placeholder={
+                    targetProvider === "cloudflare_d1"
+                      ? "例如：4a9b.../d1-database-uuid"
+                      : targetProvider === "s3_r2"
+                      ? "例如：my-zhihu-backup"
+                      : "可选，库名或前缀"
+                  }
+                  value={targetDatabaseId}
+                  onChange={e => setTargetDatabaseId(e.target.value)}
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    padding: "8px 12px",
+                    borderRadius: 6,
+                    border: "1px solid var(--zhihu-border, #d1d5db)",
+                    fontSize: 13
+                  }}
+                />
+              </div>
+
+              <div>
+                <label style={{ display: "block", fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
+                  访问凭据 / Token (Auth Token / Secret)
+                </label>
+                <input
+                  type="password"
+                  placeholder={editingTargetId ? "已保存密钥，留空则保持不变" : "Database Auth Token / CF API Token / Bearer Secret"}
+                  value={targetAuthToken}
+                  onChange={e => setTargetAuthToken(e.target.value)}
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    padding: "8px 12px",
+                    borderRadius: 6,
+                    border: "1px solid var(--zhihu-border, #d1d5db)",
+                    fontSize: 13
+                  }}
+                />
+              </div>
+            </div>
+
+            <div style={{ marginTop: 14 }}>
+              <label style={{ display: "block", fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+                工作模式 (storageRole) — 决定这个外部库是「真扩容」还是「只备份」
+              </label>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {[
+                  {
+                    role: "offload" as const,
+                    title: "🚀 直接分流扩容（推荐）",
+                    desc: "勾选的数据直接存入外部库，不再写入主 D1 / 主 R2，网页读取时自动透明回源拉取，真实节省主库空间与写入配额"
+                  },
+                  {
+                    role: "overflow" as const,
+                    title: "📈 主库满额自动溢出",
+                    desc: "主 D1 评论行数达到设定水位后，新数据自动切入该外部库接力存储；未达水位前不启用"
+                  },
+                  {
+                    role: "mirror" as const,
+                    title: "🛡️ 双写灾备镜像",
+                    desc: "主库与外部库同时写入，只做异地防丢备份，不节省主库空间"
+                  }
+                ].map(item => (
+                  <label
+                    key={item.role}
+                    style={{
+                      display: "flex",
+                      alignItems: "flex-start",
+                      gap: 8,
+                      padding: "8px 10px",
+                      borderRadius: 6,
+                      border: targetStorageRole === item.role ? "1px solid #16a34a" : "1px solid #e2e8f0",
+                      background: targetStorageRole === item.role ? "rgba(22, 163, 74, 0.06)" : "#ffffff",
+                      cursor: "pointer"
+                    }}
+                  >
+                    <input
+                      type="radio"
+                      name="storageRole"
+                      checked={targetStorageRole === item.role}
+                      onChange={() => setTargetStorageRole(item.role)}
+                      style={{ marginTop: 3 }}
+                    />
+                    <span>
+                      <span style={{ display: "block", fontSize: 13, fontWeight: 600 }}>{item.title}</span>
+                      <span style={{ display: "block", fontSize: 12, color: "var(--zhihu-meta)", marginTop: 2 }}>
+                        {item.desc}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+
+              {targetStorageRole === "overflow" && (
+                <div style={{ marginTop: 10 }}>
+                  <label style={{ display: "block", fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
+                    主库溢出水位线（评论行数）
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={targetOverflowThreshold}
+                    onChange={e => setTargetOverflowThreshold(e.target.value)}
+                    style={{
+                      width: 220,
+                      boxSizing: "border-box",
+                      padding: "8px 12px",
+                      borderRadius: 6,
+                      border: "1px solid var(--zhihu-border, #d1d5db)",
+                      fontSize: 13
+                    }}
+                  />
+                  <div style={{ fontSize: 12, color: "var(--zhihu-meta)", marginTop: 4 }}>
+                    默认 1,500,000 条 ≈ 约 3.5GB D1 水位；想验证行为可改小，例如 100。
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div style={{ marginTop: 14 }}>
+              <label style={{ display: "block", fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+                同步分流范围 (Sync Scopes)
+              </label>
+              <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+                {[
+                  { scope: "contents" as const, label: "回答与文章正文 (contents)" },
+                  { scope: "comments" as const, label: "评论与楼中楼 (comments)" },
+                  { scope: "collections" as const, label: "收藏夹快照 (collections)" },
+                  { scope: "upvotes" as const, label: "赞同记录 (upvotes)" }
+                ].map(item => (
+                  <label key={item.scope} style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 13, cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={targetSyncScopes.includes(item.scope)}
+                      onChange={() => toggleTargetScope(item.scope)}
+                    />
+                    <span>{item.label}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 8 }}>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 13, cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={targetEnabled}
+                  onChange={e => setTargetEnabled(e.target.checked)}
+                />
+                <span style={{ fontWeight: 500 }}>立即启用此备份节点</span>
+              </label>
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={saveTarget}
+                disabled={savingTarget || testingTarget}
+                style={{ padding: "7px 16px", fontSize: 13 }}
+              >
+                {savingTarget ? "保存中…" : "💾 保存外部存储源"}
+              </button>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => testConnection()}
+                disabled={savingTarget || testingTarget}
+                style={{ padding: "7px 14px", fontSize: 13 }}
+              >
+                {testingTarget ? "测试中…" : "🔌 先测试连接"}
+              </button>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={resetTargetForm}
+                disabled={savingTarget || testingTarget}
+                style={{ padding: "7px 12px", fontSize: 13 }}
+              >
+                取消
+              </button>
+              {targetActionMsg && (
+                <span style={{ fontSize: 13, color: targetActionMsg.type === "ok" ? "#16a34a" : "#dc2626" }}>
+                  {targetActionMsg.text}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* 外部存储源列表 */}
+        <div style={{ marginTop: 16 }}>
+          {loadingTargets && targets.length === 0 ? (
+            <div style={{ textAlign: "center", padding: 20, color: "var(--zhihu-meta)", fontSize: 13 }}>
+              加载外部存储列表中…
+            </div>
+          ) : targets.length === 0 ? (
+            <div
+              style={{
+                textAlign: "center",
+                padding: "28px 16px",
+                border: "1px dashed #cbd5e1",
+                borderRadius: 8,
+                color: "var(--zhihu-meta)",
+                fontSize: 13
+              }}
+            >
+              尚未添加任何外部存储目标。点击右上角「➕ 添加外部存储源」，即可挂载免费的 Turso 9GB 或第二套 D1/R2，把评论 / 正文直接分流出去，帮主库突破 5GB 上限。
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {targets.map(t => {
+                const isTesting = testingTargetId === t.id;
+                const providerNames: Record<ExternalProviderType, { name: string; icon: string }> = {
+                  turso: { name: "Turso (LibSQL)", icon: "⚡" },
+                  cloudflare_d1: { name: "跨账号 Cloudflare D1", icon: "☁️" },
+                  supabase: { name: "Supabase Postgres", icon: "🐘" },
+                  s3_r2: { name: "S3 / 外部 R2", icon: "📦" },
+                  webhook: { name: "自定义 Webhook", icon: "🔗" }
+                };
+                const pInfo = providerNames[t.provider] || { name: t.provider, icon: "🗄️" };
+                const roleInfo =
+                  t.storageRole === "overflow"
+                    ? {
+                        label: `📈 满额溢出待命 (阈值 ${(t.overflowThresholdRows || DEFAULT_OVERFLOW_THRESHOLD_ROWS).toLocaleString("zh-CN")} 行)`,
+                        bg: "#fef3c7",
+                        color: "#92400e",
+                        border: "#fde68a"
+                      }
+                    : t.storageRole === "mirror"
+                    ? { label: "🛡️ 双写镜像", bg: "#dbeafe", color: "#1e40af", border: "#bfdbfe" }
+                    : { label: "🚀 分流扩容中", bg: "#ede9fe", color: "#6d28d9", border: "#ddd6fe" };
+
+                return (
+                  <div
+                    key={t.id}
+                    style={{
+                      border: "1px solid #e2e8f0",
+                      borderRadius: 8,
+                      padding: "14px 16px",
+                      background: t.enabled ? "#ffffff" : "#f8fafc",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 10
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ fontSize: 18 }}>{pInfo.icon}</span>
+                        <strong style={{ fontSize: 15 }}>{t.name}</strong>
+                        <span style={{ fontSize: 12, color: "var(--zhihu-meta)" }}>（{pInfo.name}）</span>
+                        <span
+                          style={{
+                            fontSize: 11,
+                            padding: "1px 6px",
+                            borderRadius: 10,
+                            background: t.enabled ? "#dcfce7" : "#fee2e2",
+                            color: t.enabled ? "#15803d" : "#b91c1c",
+                            fontWeight: 500
+                          }}
+                        >
+                          {t.enabled ? "运行中" : "已暂停"}
+                        </span>
+                        <span
+                          style={{
+                            fontSize: 11,
+                            padding: "1px 6px",
+                            borderRadius: 10,
+                            background: roleInfo.bg,
+                            color: roleInfo.color,
+                            border: `1px solid ${roleInfo.border}`,
+                            fontWeight: 500
+                          }}
+                        >
+                          {roleInfo.label}
+                        </span>
+                      </div>
+
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          onClick={() => testConnection(t.id)}
+                          disabled={isTesting}
+                          style={{ padding: "4px 10px", fontSize: 12 }}
+                        >
+                          {isTesting ? "测试中…" : "🔌 测试连接"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          onClick={() => toggleTargetEnabled(t)}
+                          style={{ padding: "4px 10px", fontSize: 12 }}
+                        >
+                          {t.enabled ? "⏸️ 暂停" : "▶️ 启用"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          onClick={() => openEditTargetForm(t)}
+                          style={{ padding: "4px 10px", fontSize: 12 }}
+                        >
+                          ✏️ 编辑
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          onClick={() => deleteTarget(t)}
+                          style={{ padding: "4px 10px", fontSize: 12, color: "#dc2626" }}
+                        >
+                          🗑️ 删除
+                        </button>
+                      </div>
+                    </div>
+
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 20px", fontSize: 12, color: "var(--zhihu-meta)" }}>
+                      <div>
+                        <strong>地址：</strong>
+                        <code style={{ fontSize: 11, background: "#f1f5f9", padding: "2px 6px", borderRadius: 4 }}>
+                          {t.endpointUrl}
+                        </code>
+                      </div>
+                      {t.databaseId && (
+                        <div>
+                          <strong>标识：</strong>
+                          <code style={{ fontSize: 11, background: "#f1f5f9", padding: "2px 6px", borderRadius: 4 }}>
+                            {t.databaseId}
+                          </code>
+                        </div>
+                      )}
+                      <div>
+                        <strong>密钥：</strong>
+                        <span>{t.hasToken ? (t.maskedToken || "已配置密钥") : "无密钥"}</span>
+                      </div>
+                      <div>
+                        <strong>分流范围：</strong>
+                        <span>
+                          {t.syncScopes
+                            .map(s => {
+                              if (s === "contents") return "回答/文章";
+                              if (s === "comments") return "评论与楼中楼";
+                              if (s === "collections") return "收藏夹";
+                              if (s === "upvotes") return "赞同记录";
+                              return s;
+                            })
+                            .join("、")}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* 测试结果行 */}
+                    <div style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 6, paddingTop: 6, borderTop: "1px dashed #f1f5f9" }}>
+                      <strong>连通状态：</strong>
+                      {t.lastTestAt ? (
+                        <span style={{ color: t.lastTestOk ? "#16a34a" : "#dc2626" }}>
+                          {t.lastTestOk ? "🟢" : "🔴"} {t.lastTestMsg || (t.lastTestOk ? "探测正常" : "探测失败")}
+                          <span style={{ color: "var(--zhihu-meta)", marginLeft: 6 }}>
+                            ({fmtTime(t.lastTestAt)})
+                          </span>
+                        </span>
+                      ) : (
+                        <span style={{ color: "var(--zhihu-meta)" }}>⚪ 尚未进行连通性测试</span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>
 

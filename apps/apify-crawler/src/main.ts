@@ -992,7 +992,7 @@ export async function syncHotCommentsForContent(
   const isArticle = sourceType === "article";
   const buildUrl = (offset: number) =>
     isArticle
-      ? `https://www.zhihu.com/api/v4/comment_v5/articles/${sourceId}/root_comment?order_by=score&limit=20&offset=${offset}`
+      ? `https://www.zhihu.com/api/v4/comment_v5/articles/${sourceId}/root_comment?order_by=score&limit=20&offset=${offset === 0 ? "" : offset}`
       : `https://www.zhihu.com/api/v4/answers/${sourceId}/root_comments?limit=20&offset=${offset}`;
 
   try {

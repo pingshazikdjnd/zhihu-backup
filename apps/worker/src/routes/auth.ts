@@ -8,8 +8,589 @@ const COOKIE_KEY = "zhihu_cookie";
 const WRITE_TOKEN_KEY = "cookie_write_token";
 const SYNC_CONFIG_KEY = "sync_config";
 const R2_SYNC_CONFIG_KEY = "meta/sync_config.json";
+export const EXTERNAL_TARGETS_KEY = "external_storage_targets";
+export const R2_EXTERNAL_TARGETS_KEY = "meta/external_storage_targets.json";
+
+export type ExternalProviderType = "turso" | "cloudflare_d1" | "supabase" | "s3_r2" | "webhook";
+export type ExternalSyncScope = "contents" | "comments" | "collections" | "upvotes";
+
+/**
+ * 外部库的工作模式（决定它到底是「扩容」还是「备份」）：
+ * - offload  ：直接分流扩容。勾选的数据只写外部库，主 D1 / 主 R2 零写入，网页读取时透明回源。
+ * - overflow ：主库满额溢出。主 D1 评论行数达到 overflowThresholdRows 后自动切换成 offload。
+ * - mirror   ：双写灾备。主库照写，同时异步复制一份到外部库（不省主库空间，只防丢）。
+ */
+export type ExternalStorageRole = "offload" | "overflow" | "mirror";
+
+export const DEFAULT_STORAGE_ROLE: ExternalStorageRole = "offload";
+/** 150 万条评论行 ≈ 3.5GB D1 水位（D1 免费额度 5GB，留 1.5GB 给正文/元数据/索引） */
+export const DEFAULT_OVERFLOW_THRESHOLD_ROWS = 1_500_000;
+const MAX_OVERFLOW_THRESHOLD_ROWS = 1_000_000_000;
+
+export type ExternalStorageTarget = {
+  id: string;
+  name: string;
+  provider: ExternalProviderType;
+  enabled: boolean;
+  syncScopes: ExternalSyncScope[];
+  /** 默认 offload（直接分流扩容），老配置没有该字段时按扩容处理 */
+  storageRole: ExternalStorageRole;
+  /** overflow 模式的触发水位：主 D1 comments 行数达到该值后开始向外部库分流 */
+  overflowThresholdRows: number;
+  endpointUrl: string;        // Turso HTTP URL / Supabase URL / S3 Endpoint / Webhook URL / CF API URL
+  databaseId?: string;        // CF AccountId:DatabaseId 或 Bucket 名称或表前缀
+  authToken?: string;         // 仅在服务端内部存储，GET 返回前端时必须脱敏！
+  createdAt: string;
+  updatedAt: string;
+  lastTestAt?: string | null;
+  lastTestOk?: boolean | null;
+  lastTestMsg?: string | null;
+};
+
+export type ClientExternalStorageTarget = Omit<ExternalStorageTarget, "authToken"> & {
+  hasToken: boolean;
+  maskedToken: string;
+};
+
+const VALID_PROVIDERS = new Set<ExternalProviderType>([
+  "turso",
+  "cloudflare_d1",
+  "supabase",
+  "s3_r2",
+  "webhook"
+]);
+const VALID_SYNC_SCOPES = new Set<ExternalSyncScope>([
+  "contents",
+  "comments",
+  "collections",
+  "upvotes"
+]);
+const VALID_STORAGE_ROLES = new Set<ExternalStorageRole>(["offload", "overflow", "mirror"]);
+
+function normalizeStorageRole(value: unknown, fallback: ExternalStorageRole = DEFAULT_STORAGE_ROLE): ExternalStorageRole {
+  return VALID_STORAGE_ROLES.has(value as ExternalStorageRole) ? (value as ExternalStorageRole) : fallback;
+}
+
+function normalizeOverflowThreshold(value: unknown, fallback = DEFAULT_OVERFLOW_THRESHOLD_ROWS): number {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return fallback;
+  return Math.min(Math.max(Math.trunc(num), 1), MAX_OVERFLOW_THRESHOLD_ROWS);
+}
+
+export function maskTargetForClient(t: ExternalStorageTarget): ClientExternalStorageTarget {
+  const { authToken, ...rest } = t;
+  const token = authToken || "";
+  return {
+    ...rest,
+    hasToken: Boolean(token),
+    maskedToken: token ? (token.length > 6 ? "••••••••" + token.slice(-4) : "••••••••") : ""
+  };
+}
+
+// 外部存储目标在 99% 的情况下是空的，而 /ingest/* 每收一条内容都要判断一次。
+// 没有缓存时每条内容都要打一次 D1 SELECT（D1 为空时还要再打一次 R2 GET），
+// 爬虫连续入库几百条就是几百次无意义的读放大。这里做 isolate 内存 60 秒缓存，
+// 写接口保存/删除/测试后立即刷新，保证配置变更在本 isolate 内即时生效。
+const EXTERNAL_TARGETS_CACHE_TTL_MS = 60_000;
+let cachedExternalTargets: { at: number; list: ExternalStorageTarget[] } | null = null;
+
+export function invalidateExternalTargetsCache(): void {
+  cachedExternalTargets = null;
+}
+
+/** 深拷贝一层：调用方修改返回数组/对象时不能污染内存缓存。 */
+function cloneTargets(list: ExternalStorageTarget[]): ExternalStorageTarget[] {
+  return list.map(t => ({ ...t, syncScopes: [...t.syncScopes] }));
+}
+
+export async function getExternalTargetsRaw(bucket?: any): Promise<ExternalStorageTarget[]> {
+  if (cachedExternalTargets && Date.now() - cachedExternalTargets.at < EXTERNAL_TARGETS_CACHE_TTL_MS) {
+    return cloneTargets(cachedExternalTargets.list);
+  }
+
+  let targets: any[] = [];
+  try {
+    const row = await db.prepare(
+      `SELECT value FROM app_settings WHERE key = ?`
+    ).get<{ value: string }>(EXTERNAL_TARGETS_KEY);
+    if (row?.value) {
+      targets = JSON.parse(row.value);
+    }
+  } catch { /* ignore D1 read error */ }
+
+  if ((!targets || !targets.length) && bucket) {
+    try {
+      const obj = await bucket.get(R2_EXTERNAL_TARGETS_KEY);
+      if (obj) {
+        targets = JSON.parse(await obj.text());
+      }
+    } catch { /* ignore R2 read error */ }
+  }
+
+  if (!Array.isArray(targets)) targets = [];
+
+  const cleaned: ExternalStorageTarget[] = [];
+  for (const raw of targets) {
+    if (!raw || typeof raw !== "object" || !raw.id || !raw.name) continue;
+    if (!VALID_PROVIDERS.has(raw.provider)) continue;
+    const scopes: ExternalSyncScope[] = Array.isArray(raw.syncScopes)
+      ? raw.syncScopes.filter((s: any): s is ExternalSyncScope => VALID_SYNC_SCOPES.has(s))
+      : ["contents", "comments"];
+    cleaned.push({
+      id: String(raw.id),
+      name: String(raw.name).trim().slice(0, 60),
+      provider: raw.provider,
+      enabled: Boolean(raw.enabled),
+      syncScopes: scopes.length ? scopes : ["contents", "comments"],
+      // 老配置没有 storageRole：默认按「直接分流扩容」处理，才能真正帮主 D1/R2 省空间
+      storageRole: normalizeStorageRole(raw.storageRole),
+      overflowThresholdRows: normalizeOverflowThreshold(raw.overflowThresholdRows),
+      endpointUrl: String(raw.endpointUrl || "").trim(),
+      databaseId: raw.databaseId ? String(raw.databaseId).trim() : undefined,
+      authToken: raw.authToken ? String(raw.authToken).trim() : undefined,
+      createdAt: raw.createdAt || new Date().toISOString(),
+      updatedAt: raw.updatedAt || new Date().toISOString(),
+      lastTestAt: raw.lastTestAt ?? null,
+      lastTestOk: raw.lastTestOk ?? null,
+      lastTestMsg: raw.lastTestMsg ?? null
+    });
+    if (cleaned.length >= 10) break;
+  }
+
+  cachedExternalTargets = { at: Date.now(), list: cloneTargets(cleaned) };
+  return cleaned;
+}
+
+export async function saveExternalTargetsRaw(bucket: any, targets: ExternalStorageTarget[]): Promise<void> {
+  const saved = targets.slice(0, 10);
+  const payload = JSON.stringify(saved);
+  // 先刷新内存缓存：即使下面的 D1/R2 写入失败，本 isolate 内也必须立刻看到新配置
+  cachedExternalTargets = { at: Date.now(), list: cloneTargets(saved) };
+  const now = new Date().toISOString();
+  if (bucket) {
+    try {
+      await bucket.put(R2_EXTERNAL_TARGETS_KEY, payload, {
+        httpMetadata: { contentType: "application/json; charset=utf-8" }
+      });
+    } catch { /* ignore */ }
+  }
+  try {
+    await db.prepare(`
+      INSERT INTO app_settings (key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run(EXTERNAL_TARGETS_KEY, payload, now);
+  } catch { /* ignore */ }
+}
+
+// ---------------------------------------------------------------------------
+// 远程 SQLite 执行器（Turso LibSQL / 跨账号 Cloudflare D1）
+//
+// 分流扩容的核心：评论、楼中楼 JSON、正文 HTML 都可以直接写进外部 SQLite 兼容库。
+// 只要外部库能执行远程 SQL，就能扮演「主 D1 / 主 R2」的替身，网页读取时透明回源。
+// ---------------------------------------------------------------------------
+
+export type RemoteSqlResult = { rows: Record<string, any>[]; changes: number };
+export type RemoteSqlStatement = { sql: string; params?: unknown[] };
+
+/** Turso v2 pipeline 的参数编码：整数/浮点/文本/NULL 四种标量 */
+function toTursoArg(p: unknown) {
+  if (p === null || p === undefined) return { type: "null" };
+  if (typeof p === "number") {
+    return Number.isInteger(p)
+      ? { type: "integer", value: String(p) }
+      : { type: "float", value: p };
+  }
+  if (typeof p === "boolean") return { type: "integer", value: p ? "1" : "0" };
+  if (p instanceof Uint8Array) {
+    // 本项目只存文本，真遇到二进制按 base64 blob 传，避免静默丢字段
+    let binary = "";
+    for (const byte of p) binary += String.fromCharCode(byte);
+    return { type: "blob", base64: btoa(binary) };
+  }
+  return { type: "text", value: String(p) };
+}
+
+/** Turso 返回的单元格 → JS 标量（integer/float 转 Number，null 转 null，其余转 String） */
+function fromTursoCell(cell: any): any {
+  if (cell === null || cell === undefined) return null;
+  if (typeof cell !== "object") return cell;
+  switch (cell.type) {
+    case "null":
+      return null;
+    case "integer":
+    case "float": {
+      const num = Number(cell.value);
+      return Number.isFinite(num) ? num : 0;
+    }
+    case "blob":
+      return cell.base64 ?? null;
+    default:
+      return cell.value === undefined || cell.value === null ? null : String(cell.value);
+  }
+}
+
+/** 单个 Turso pipeline 结果项 → { rows, changes } */
+function parseTursoExecuteResult(first: any, index: number): RemoteSqlResult {
+  if (!first) throw new Error(`Turso 返回缺少 results[${index}]`);
+  if (first.type === "error") {
+    throw new Error(`Turso SQL 错误: ${JSON.stringify(first.error ?? first).slice(0, 180)}`);
+  }
+  const result = first.response?.result ?? {};
+  const cols: Array<{ name?: string }> = Array.isArray(result.cols) ? result.cols : [];
+  const rawRows: any[][] = Array.isArray(result.rows) ? result.rows : [];
+  const rows = rawRows.map(cells => {
+    const row: Record<string, any> = {};
+    for (let i = 0; i < cols.length; i++) {
+      row[cols[i]?.name ?? String(i)] = fromTursoCell(Array.isArray(cells) ? cells[i] : undefined);
+    }
+    return row;
+  });
+  return { rows, changes: Number(result.affected_row_count ?? 0) || 0 };
+}
+
+function parseCloudflareD1DatabaseId(databaseId: string | undefined): { accId: string; dbId: string } | null {
+  const raw = (databaseId || "").trim();
+  if (!raw) return null;
+  const parts = raw.includes("/") ? raw.split("/") : raw.split(":");
+  const accId = parts[0]?.trim();
+  const dbId = parts[1]?.trim();
+  return accId && dbId ? { accId, dbId } : null;
+}
+
+async function executeTursoBatch(
+  target: ExternalStorageTarget,
+  statements: RemoteSqlStatement[]
+): Promise<RemoteSqlResult[]> {
+  const url = `${target.endpointUrl.replace(/\/+$/, "")}/v2/pipeline`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {})
+    },
+    body: JSON.stringify({
+      requests: [
+        ...statements.map(stmt => ({
+          type: "execute",
+          stmt: { sql: stmt.sql, args: (stmt.params ?? []).map(toTursoArg) }
+        })),
+        { type: "close" }
+      ]
+    })
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Turso ${res.status}: ${text.slice(0, 180)}`);
+  }
+  const json = await res.json().catch(() => null) as any;
+  const results = Array.isArray(json?.results) ? json.results : [];
+  // 每条 execute 都按序对应一个 result；close 的 result 在最后
+  return statements.map((_, i) => parseTursoExecuteResult(results[i], i));
+}
+
+async function executeD1Statement(
+  target: ExternalStorageTarget,
+  sql: string,
+  params: unknown[]
+): Promise<RemoteSqlResult> {
+  const ids = parseCloudflareD1DatabaseId(target.databaseId);
+  if (!ids) throw new Error("跨账号 D1 需要按 AccountID/DatabaseID 填写数据库标识");
+  // endpointUrl 默认 https://api.cloudflare.com；本地 mock 可传自定义 API 根地址
+  const base = (target.endpointUrl || "https://api.cloudflare.com")
+    .replace(/\/+$/, "")
+    .replace(/\/client\/v4$/i, "");
+  const url = `${base}/client/v4/accounts/${ids.accId}/d1/database/${ids.dbId}/query`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {})
+    },
+    body: JSON.stringify({ sql, params: params.map(p => (p === undefined ? null : p)) })
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Cloudflare D1 ${res.status}: ${text.slice(0, 180)}`);
+  }
+  const json = await res.json().catch(() => null) as any;
+  if (json?.success === false) {
+    throw new Error(`Cloudflare D1 错误: ${JSON.stringify(json?.errors || json).slice(0, 180)}`);
+  }
+  const first = json?.result?.[0];
+  const rows = Array.isArray(first?.results) ? (first.results as Record<string, any>[]) : [];
+  return { rows, changes: Number(first?.meta?.changes ?? 0) || 0 };
+}
+
+/**
+ * 在外部 SQLite 兼容云库上按序执行多条 SQL。
+ * - turso：一次 /v2/pipeline 里挂多个 execute request（20 根评论只占 1 个 Workers 子请求）
+ * - cloudflare_d1：REST /query 一次只接受一条语句，只能逐条串行
+ */
+export async function executeRemoteSqlBatch(
+  target: ExternalStorageTarget,
+  statements: RemoteSqlStatement[]
+): Promise<RemoteSqlResult[]> {
+  if (!statements.length) return [];
+  if (!target?.endpointUrl) throw new Error("外部库连接地址为空");
+
+  if (target.provider === "turso") {
+    return executeTursoBatch(target, statements);
+  }
+  if (target.provider === "cloudflare_d1") {
+    const results: RemoteSqlResult[] = [];
+    for (const statement of statements) {
+      results.push(await executeD1Statement(target, statement.sql, statement.params ?? []));
+    }
+    return results;
+  }
+  throw new Error(`外部存储类型 ${target.provider} 不支持远程 SQL`);
+}
+
+/**
+ * 在外部 SQLite 兼容云库上执行一条 SQL。
+ * 任何 HTTP/协议错误都抛出，调用方决定降级（回写主库或跳过）。
+ */
+export async function executeRemoteSql(
+  target: ExternalStorageTarget,
+  sql: string,
+  params: unknown[] = []
+): Promise<RemoteSqlResult> {
+  const results = await executeRemoteSqlBatch(target, [{ sql, params }]);
+  return results[0] ?? { rows: [], changes: 0 };
+}
+
+// 每个 target（isolate 生命周期内）只建一次表：CREATE TABLE IF NOT EXISTS 也是网络往返
+const initializedSchemaTargets = new Set<string>();
+
+/** 远程库表结构（与主 D1 comments / comment_threads 同构，另加楼中楼 JSON 与正文 HTML 大对象表） */
+const REMOTE_SCHEMA_STATEMENTS: string[] = [
+  `CREATE TABLE IF NOT EXISTS comments (
+    id TEXT PRIMARY KEY,
+    content_pk TEXT NOT NULL,
+    parent_comment_id TEXT,
+    author_name TEXT,
+    author_avatar TEXT,
+    be_replied TEXT,
+    content_md TEXT,
+    img_url TEXT,
+    time_text TEXT,
+    location TEXT,
+    likes INTEGER NOT NULL DEFAULT 0,
+    is_author INTEGER NOT NULL DEFAULT 0,
+    is_top INTEGER NOT NULL DEFAULT 0,
+    is_featured INTEGER NOT NULL DEFAULT 0,
+    comment_hash TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    deleted_at TEXT,
+    child_count INTEGER NOT NULL DEFAULT 0
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_ext_comments_content ON comments(content_pk);`,
+  `CREATE INDEX IF NOT EXISTS idx_ext_comments_parent ON comments(parent_comment_id);`,
+  `CREATE TABLE IF NOT EXISTS comment_threads (
+    root_id TEXT PRIMARY KEY,
+    content_pk TEXT NOT NULL,
+    r2_key TEXT NOT NULL,
+    child_count INTEGER NOT NULL DEFAULT 0,
+    is_complete INTEGER NOT NULL DEFAULT 0,
+    thread_hash TEXT NOT NULL DEFAULT '',
+    incoming_hash TEXT NOT NULL DEFAULT '',
+    preview_json TEXT NOT NULL DEFAULT '[]',
+    synced_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_ext_comment_threads_content ON comment_threads(content_pk);`,
+  // 楼中楼整份 JSON 存外部 SQL 库：主 R2 的 childcomments/* 也就不必再写
+  `CREATE TABLE IF NOT EXISTS child_comment_blobs (
+    root_id TEXT PRIMARY KEY,
+    content_pk TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    complete INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+  )`,
+  // 正文大体积 HTML 存外部库：主 R2 的 html/* 也就不必再写
+  `CREATE TABLE IF NOT EXISTS content_blobs (
+    pk TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    content_html TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`
+];
+
+/**
+ * 远程库建表（幂等）。每个 target 在一个 isolate 生命周期内只跑一次。
+ * 建表失败会抛出且不记入缓存：下一批数据会自动重试，绝不会在没表时静默丢数据。
+ */
+export async function ensureRemoteCommentSchema(target: ExternalStorageTarget): Promise<void> {
+  if (target.provider !== "turso" && target.provider !== "cloudflare_d1") return;
+  const key = `${target.id}|${target.provider}|${target.endpointUrl}|${target.databaseId ?? ""}`;
+  if (initializedSchemaTargets.has(key)) return;
+  // Turso 一次 pipeline 完成全部建表（1 个子请求）；D1 REST 内部会按条串行
+  await executeRemoteSqlBatch(
+    target,
+    REMOTE_SCHEMA_STATEMENTS.map(sql => ({ sql }))
+  );
+  initializedSchemaTargets.add(key);
+}
+
+/** 测试/配置切换用：清空「已建表」缓存 */
+export function resetRemoteSchemaCache(): void {
+  initializedSchemaTargets.clear();
+}
+
+// 主 D1 评论行数：overflow 水位判断用。每条 /ingest 都 COUNT(*) 太贵，缓存 5 分钟
+const MAIN_COMMENT_COUNT_TTL_MS = 5 * 60_000;
+let cachedMainCommentCount: { at: number; count: number } | null = null;
+
+export function invalidateMainCommentCountCache(): void {
+  cachedMainCommentCount = null;
+}
+
+async function getMainCommentRowCount(): Promise<number> {
+  if (cachedMainCommentCount && Date.now() - cachedMainCommentCount.at < MAIN_COMMENT_COUNT_TTL_MS) {
+    return cachedMainCommentCount.count;
+  }
+  try {
+    const row = await db.prepare(`SELECT COUNT(*) AS n FROM comments`).get<{ n: number }>();
+    const count = Number(row?.n ?? 0) || 0;
+    cachedMainCommentCount = { at: Date.now(), count };
+    return count;
+  } catch {
+    // 读不到就按「未达水位」处理：宁可继续写主库，也不能误判后把数据写进没配置好的外部库
+    return 0;
+  }
+}
+
+/** 该 provider 是否能真正承接同步分流（决定 /ingest 是否还要异步镜像转发） */
+export function supportsSyncOffload(target: ExternalStorageTarget, scope: ExternalSyncScope): boolean {
+  const sqlite = target.provider === "turso" || target.provider === "cloudflare_d1";
+  if (scope === "contents") return sqlite || target.provider === "s3_r2";
+  return scope === "comments" ? sqlite : false;
+}
+
+/**
+ * 选出当前生效的「分流扩容」目标（写路径用）。
+ * - offload  ：直接命中
+ * - overflow ：主 D1 comments 行数达到阈值后才命中
+ * - mirror   ：不参与分流（只做异步双写灾备）
+ * 多个目标同时命中时取配置顺序里的第一个，避免同一份数据被拆到两个库。
+ */
+export async function resolveActiveOffloadTarget(
+  bucket: any,
+  scope: ExternalSyncScope
+): Promise<ExternalStorageTarget | null> {
+  const targets = await getExternalTargetsRaw(bucket).catch(() => [] as ExternalStorageTarget[]);
+  for (const target of targets) {
+    if (!target.enabled) continue;
+    if (!Array.isArray(target.syncScopes) || !target.syncScopes.includes(scope)) continue;
+    if (!supportsSyncOffload(target, scope)) continue;
+    const role = target.storageRole || DEFAULT_STORAGE_ROLE;
+    if (role === "offload") return target;
+    if (role === "mirror") continue;
+    const threshold = normalizeOverflowThreshold(target.overflowThresholdRows);
+    if ((await getMainCommentRowCount()) >= threshold) return target;
+  }
+  return null;
+}
+
+/**
+ * 可透明回读评论的外部库列表（读路径用）。
+ * offload 与 overflow 都可能持有评论数据，读接口必须按顺序逐个回源查找。
+ */
+export async function listReadableCommentOffloadTargets(bucket: any): Promise<ExternalStorageTarget[]> {
+  const targets = await getExternalTargetsRaw(bucket).catch(() => [] as ExternalStorageTarget[]);
+  return targets.filter(t =>
+    t.enabled &&
+    Array.isArray(t.syncScopes) &&
+    t.syncScopes.includes("comments") &&
+    (t.provider === "turso" || t.provider === "cloudflare_d1") &&
+    (t.storageRole || DEFAULT_STORAGE_ROLE) !== "mirror"
+  );
+}
+
+/** 可透明回读正文的外部库列表（读路径用） */
+export async function listReadableContentOffloadTargets(bucket: any): Promise<ExternalStorageTarget[]> {
+  const targets = await getExternalTargetsRaw(bucket).catch(() => [] as ExternalStorageTarget[]);
+  return targets.filter(t =>
+    t.enabled &&
+    Array.isArray(t.syncScopes) &&
+    t.syncScopes.includes("contents") &&
+    (t.provider === "turso" || t.provider === "cloudflare_d1" || t.provider === "s3_r2") &&
+    (t.storageRole || DEFAULT_STORAGE_ROLE) !== "mirror"
+  );
+}
+
+// S3 兼容对象存储：path-style key，写入与读取必须用同一套编码
+function s3OffloadBase(target: ExternalStorageTarget): string | null {
+  const bucketName = (target.databaseId || "").trim().replace(/^\/+|\/+$/g, "");
+  if (!bucketName) return null;
+  return `${target.endpointUrl.replace(/\/+$/, "")}/${encodeURIComponent(bucketName)}`;
+}
+
+/** 正文 HTML 写入外部库（SQLite 兼容库的 content_blobs 或 S3 兼容对象存储） */
+export async function putOffloadedContentHtml(
+  target: ExternalStorageTarget,
+  pk: string,
+  hash: string,
+  html: string
+): Promise<void> {
+  if (target.provider === "s3_r2") {
+    const base = s3OffloadBase(target);
+    if (!base) throw new Error("S3 兼容存储需要填写 Bucket 名称");
+    const objectUrl = `${base}/html/${encodeURIComponent(pk)}/${encodeURIComponent(hash || "latest")}`;
+    const res = await fetch(objectUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        ...(target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {})
+      },
+      body: html
+    });
+    if (!res.ok) throw new Error(`S3 PUT ${res.status}`);
+    return;
+  }
+  await executeRemoteSql(
+    target,
+    `INSERT OR REPLACE INTO content_blobs (pk, content_hash, content_html, updated_at) VALUES (?, ?, ?, ?)`,
+    [pk, hash, html, new Date().toISOString()]
+  );
+}
+
+/** 正文 HTML 从外部库读回；未命中返回 null（调用方继续回落 md/ 或空正文） */
+export async function readOffloadedContentHtml(
+  target: ExternalStorageTarget,
+  pk: string,
+  hash?: string
+): Promise<string | null> {
+  if (target.provider === "s3_r2") {
+    const base = s3OffloadBase(target);
+    if (!base) return null;
+    const candidates = hash
+      ? [`${base}/html/${encodeURIComponent(pk)}/${encodeURIComponent(hash)}`, `${base}/html/${encodeURIComponent(pk)}`]
+      : [`${base}/html/${encodeURIComponent(pk)}`];
+    for (const objectUrl of candidates) {
+      const res = await fetch(objectUrl, {
+        headers: target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {}
+      }).catch(() => null);
+      if (res?.ok) {
+        const text = await res.text().catch(() => "");
+        if (text) return text;
+      }
+    }
+    return null;
+  }
+  const result = await executeRemoteSql(
+    target,
+    `SELECT content_html FROM content_blobs WHERE pk = ?`,
+    [pk]
+  );
+  const html = result.rows[0]?.content_html;
+  return typeof html === "string" && html ? html : null;
+}
 
 export type CommentSyncMode = "full" | "hot" | "none";
+
 export type SyncConfig = {
   commentsMyAnswers: CommentSyncMode;
   commentsCollections: CommentSyncMode;
@@ -121,6 +702,76 @@ export function isOriginAllowed(c: any, requireHeader = false): boolean {
     }
   }
   return false;
+}
+
+// ---------- 外部存储目标 SSRF 防护 ----------
+
+// 云厂商元数据地址：任何环境都必须拦截（包括本地开发，没有任何合法用途）
+const ALWAYS_BLOCKED_HOSTS = new Set([
+  "169.254.169.254",        // AWS / GCP / Azure / 阿里云元数据
+  "100.100.100.200",        // 阿里云元数据
+  "fd00:ec2::254",          // AWS IPv6 元数据
+  "metadata.google.internal",
+  "metadata"
+]);
+
+/** 是否为内网 / 回环 / 链路本地地址（不含元数据判断）。 */
+function isPrivateOrLoopbackHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h.endsWith(".localhost")) return true;
+  // IPv6 字面量必须带冒号：否则 "fc-xxx.turso.io" 这类正常域名会被误判为 fc00::/7
+  if (h.includes(":")) {
+    if (h === "::1" || h === "::") return true;
+    if (/^(fc|fd|fe80)/.test(h)) return true;
+  }
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (!m) return false;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  return false;
+}
+
+/**
+ * 当前请求是否来自本地开发（浏览器/脚本直连 localhost 或 127.0.0.1）。
+ * 生产环境（Pages/worker 域名）返回 false，此时内网地址一律拦截；
+ * 本地联调 Webhook 或自建 mock Turso 时允许 127.0.0.1。
+ */
+function isLocalDevRequest(c: any): boolean {
+  try {
+    const h = new URL(c.req.url).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    return h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "0.0.0.0";
+  } catch {
+    return false;
+  }
+}
+
+/** 校验外部存储目标 URL，返回错误文案；合法返回 null。 */
+function validateExternalTargetUrl(c: any, rawUrl: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return "无效的 URL 格式";
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return "连接地址必须是合法的 http:// 或 https:// URL";
+  }
+  if (parsed.username || parsed.password) {
+    return "连接地址不能包含账号密码，请把凭据填写到访问凭据( authToken )中";
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (ALWAYS_BLOCKED_HOSTS.has(host)) {
+    return "不允许访问云元数据或链路本地地址";
+  }
+  if (!isLocalDevRequest(c) && isPrivateOrLoopbackHost(host)) {
+    return "不允许访问内网/回环地址（仅本地开发环境允许）";
+  }
+  return null;
 }
 
 /**
@@ -377,6 +1028,9 @@ authRoutes.get("/zhihu-status", async c => {
     if (cRow?.value) upvotesCursor = cRow.value;
   } catch { /* ignore */ }
 
+  const externalTargets = await getExternalTargetsRaw(c.env.BUCKET).catch(() => []);
+  const externalTargetsCount = externalTargets.filter(t => t.enabled).length;
+
   return c.json({
     hasCookie: !!value,
     source,
@@ -392,7 +1046,8 @@ authRoutes.get("/zhihu-status", async c => {
     readAuthRequired: c.env.READ_AUTH_REQUIRED === "true",
     lastRun: await getLastApifyRun(c),
     syncConfig,
-    upvotesCursor
+    upvotesCursor,
+    externalTargetsCount
   });
 });
 
@@ -425,4 +1080,345 @@ authRoutes.post("/zhihu-cookie/clear", async c => {
   }
   await db.prepare(`DELETE FROM app_settings WHERE key = ?`).run(COOKIE_KEY);
   return c.json({ ok: true });
+});
+
+/**
+ * 外部存储与多云数据库扩展列表
+ */
+authRoutes.get("/external-targets", async c => {
+  const targets = await getExternalTargetsRaw(c.env.BUCKET);
+  return c.json({ targets: targets.map(maskTargetForClient) });
+});
+
+/**
+ * 新增或编辑外部存储目标
+ */
+authRoutes.post("/external-targets", async c => {
+  if (!(await authorizeWrite(c)).ok) {
+    return denyWrite(c, "操作密码错误或未填写，请先在设置页输入操作密码");
+  }
+
+  const body = await c.req.json().catch(() => null) as Partial<ExternalStorageTarget> | null;
+  if (!body || typeof body !== "object") {
+    return c.json({ error: "请求格式错误" }, 400);
+  }
+
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  if (!name || name.length > 60) {
+    return c.json({ error: "名称必填且长度在 1~60 个字符之间" }, 400);
+  }
+
+  const provider = body.provider as ExternalProviderType;
+  if (!VALID_PROVIDERS.has(provider)) {
+    return c.json({ error: "无效的外部存储类型" }, 400);
+  }
+
+  let endpointUrl = typeof body.endpointUrl === "string" ? body.endpointUrl.trim() : "";
+  if (provider === "cloudflare_d1" && !endpointUrl) {
+    endpointUrl = "https://api.cloudflare.com";
+  }
+
+  if (!endpointUrl || (!endpointUrl.startsWith("http://") && !endpointUrl.startsWith("https://"))) {
+    return c.json({ error: "连接地址必须是合法的 http:// 或 https:// URL" }, 400);
+  }
+  // 保存时也做 SSRF 校验：否则可以先存一个元数据地址，再靠每次 /ingest 转发去打内网
+  const urlError = validateExternalTargetUrl(c, endpointUrl);
+  if (urlError) {
+    return c.json({ error: urlError }, 400);
+  }
+
+  const databaseId = typeof body.databaseId === "string" ? body.databaseId.trim() : undefined;
+  const rawAuthToken = typeof body.authToken === "string" ? body.authToken.trim() : undefined;
+  const enabled = body.enabled !== false;
+  const scopes = Array.isArray(body.syncScopes)
+    ? (body.syncScopes.filter((s: any): s is ExternalSyncScope => VALID_SYNC_SCOPES.has(s)) as ExternalSyncScope[])
+    : (["contents", "comments"] as ExternalSyncScope[]);
+  const syncScopes: ExternalSyncScope[] = scopes.length ? scopes : ["contents", "comments"];
+
+  const currentTargets = await getExternalTargetsRaw(c.env.BUCKET);
+  const now = new Date().toISOString();
+
+  let targetId = typeof body.id === "string" ? body.id.trim() : "";
+  const existingIdx = targetId ? currentTargets.findIndex(t => t.id === targetId) : -1;
+  const existingTarget = existingIdx >= 0 ? currentTargets[existingIdx] : undefined;
+
+  // 老前端（未传 storageRole）编辑时保留原值；新建时默认直接分流扩容
+  const storageRole = normalizeStorageRole(
+    body.storageRole,
+    existingTarget?.storageRole ?? DEFAULT_STORAGE_ROLE
+  );
+  const overflowThresholdRows = normalizeOverflowThreshold(
+    body.overflowThresholdRows,
+    existingTarget?.overflowThresholdRows ?? DEFAULT_OVERFLOW_THRESHOLD_ROWS
+  );
+
+  let savedTarget: ExternalStorageTarget;
+
+  if (existingIdx >= 0) {
+    const existing = currentTargets[existingIdx];
+    // 如果前端传来的 authToken 为空串或 undefined，保留旧的 existing.authToken
+    const finalToken = rawAuthToken ? rawAuthToken : existing.authToken;
+    savedTarget = {
+      ...existing,
+      name,
+      provider,
+      enabled,
+      syncScopes,
+      storageRole,
+      overflowThresholdRows,
+      endpointUrl,
+      databaseId,
+      authToken: finalToken,
+      updatedAt: now
+    };
+    currentTargets[existingIdx] = savedTarget;
+  } else {
+    if (currentTargets.length >= 10) {
+      return c.json({ error: "外部存储目标已达到上限（最多 10 个）" }, 400);
+    }
+    targetId = "ext-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
+    savedTarget = {
+      id: targetId,
+      name,
+      provider,
+      enabled,
+      syncScopes,
+      storageRole,
+      overflowThresholdRows,
+      endpointUrl,
+      databaseId,
+      authToken: rawAuthToken || undefined,
+      createdAt: now,
+      updatedAt: now,
+      lastTestAt: null,
+      lastTestOk: null,
+      lastTestMsg: null
+    };
+    currentTargets.push(savedTarget);
+  }
+
+  await saveExternalTargetsRaw(c.env.BUCKET, currentTargets);
+
+  return c.json({
+    ok: true,
+    target: maskTargetForClient(savedTarget),
+    targets: currentTargets.map(maskTargetForClient)
+  });
+});
+
+/**
+ * 删除外部存储目标
+ */
+authRoutes.post("/external-targets/delete", async c => {
+  if (!(await authorizeWrite(c)).ok) {
+    return denyWrite(c, "操作密码错误或未填写，请先在设置页输入操作密码");
+  }
+
+  const body = await c.req.json().catch(() => null) as { id?: string } | null;
+  const id = typeof body?.id === "string" ? body.id.trim() : "";
+  if (!id) {
+    return c.json({ error: "缺少目标 ID" }, 400);
+  }
+
+  const currentTargets = await getExternalTargetsRaw(c.env.BUCKET);
+  const remaining = currentTargets.filter(t => t.id !== id);
+  await saveExternalTargetsRaw(c.env.BUCKET, remaining);
+
+  return c.json({
+    ok: true,
+    targets: remaining.map(maskTargetForClient)
+  });
+});
+
+/**
+ * 真实连通性探测
+ */
+authRoutes.post("/external-targets/test", async c => {
+  if (!(await authorizeWrite(c)).ok) {
+    return denyWrite(c, "操作密码错误或未填写，请先在设置页输入操作密码");
+  }
+
+  const body = await c.req.json().catch(() => null) as {
+    id?: string;
+    provider?: ExternalProviderType;
+    endpointUrl?: string;
+    databaseId?: string;
+    authToken?: string;
+  } | null;
+
+  if (!body || typeof body !== "object") {
+    return c.json({ error: "请求格式错误" }, 400);
+  }
+
+  const currentTargets = await getExternalTargetsRaw(c.env.BUCKET);
+  let targetId = typeof body.id === "string" ? body.id.trim() : "";
+  const existing = targetId ? currentTargets.find(t => t.id === targetId) : undefined;
+
+  let provider = body.provider || existing?.provider;
+  let endpointUrl = typeof body.endpointUrl === "string" ? body.endpointUrl.trim() : (existing?.endpointUrl || "");
+  let databaseId = typeof body.databaseId === "string" ? body.databaseId.trim() : (existing?.databaseId || "");
+  let authToken = typeof body.authToken === "string" && body.authToken.trim()
+    ? body.authToken.trim()
+    : (existing?.authToken || "");
+
+  if (provider === "cloudflare_d1" && !endpointUrl) {
+    endpointUrl = "https://api.cloudflare.com";
+  }
+
+  if (!provider || !VALID_PROVIDERS.has(provider)) {
+    return c.json({ ok: false, message: "请选择合法的外部存储类型" }, 400);
+  }
+  if (!endpointUrl || (!endpointUrl.startsWith("http://") && !endpointUrl.startsWith("https://"))) {
+    return c.json({ ok: false, message: "连接地址必须是合法的 http:// 或 https:// URL" }, 400);
+  }
+
+  // SSRF 防护：生产环境拦截内网/回环地址与云元数据地址；本地开发允许 127.0.0.1 联调 mock 服务
+  const urlError = validateExternalTargetUrl(c, endpointUrl);
+  if (urlError) {
+    return c.json({ ok: false, message: urlError }, 400);
+  }
+
+  const startTime = Date.now();
+  let testOk = false;
+  let testMsg = "";
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+
+    if (provider === "turso") {
+      const pingUrl = `${endpointUrl.replace(/\/+$/, "")}/v2/pipeline`;
+      const res = await fetch(pingUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {})
+        },
+        body: JSON.stringify({
+          requests: [
+            { type: "execute", stmt: { sql: "SELECT 1" } },
+            { type: "close" }
+          ]
+        }),
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+      if (res.ok) {
+        testOk = true;
+        testMsg = `Turso HTTP 探测成功 (${res.status} OK)`;
+      } else {
+        const text = await res.text().catch(() => "");
+        testOk = false;
+        testMsg = `Turso 响应异常: ${res.status} ${text.slice(0, 100)}`;
+      }
+    } else if (provider === "cloudflare_d1") {
+      const parts = databaseId.includes("/") ? databaseId.split("/") : databaseId.split(":");
+      const accId = parts[0]?.trim();
+      const dbId = parts[1]?.trim();
+      if (!accId || !dbId) {
+        clearTimeout(timer);
+        testOk = false;
+        testMsg = "请按 AccountID/DatabaseID 格式填写数据库标识";
+      } else {
+        const d1Url = `https://api.cloudflare.com/client/v4/accounts/${accId}/d1/database/${dbId}/query`;
+        const res = await fetch(d1Url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(authToken ? { Authorization: `Bearer ${authToken}` } : {})
+          },
+          body: JSON.stringify({ sql: "SELECT 1" }),
+          signal: controller.signal
+        });
+        clearTimeout(timer);
+        if (res.ok) {
+          const json = await res.json().catch(() => null) as any;
+          if (json?.success !== false) {
+            testOk = true;
+            testMsg = `Cloudflare D1 探测成功 (${res.status} OK)`;
+          } else {
+            testOk = false;
+            testMsg = `Cloudflare D1 错误: ${JSON.stringify(json?.errors || json)}`;
+          }
+        } else {
+          const text = await res.text().catch(() => "");
+          testOk = false;
+          testMsg = `Cloudflare API 响应异常: ${res.status} ${text.slice(0, 100)}`;
+        }
+      }
+    } else if (provider === "supabase") {
+      const supaUrl = `${endpointUrl.replace(/\/+$/, "")}/rest/v1/`;
+      const res = await fetch(supaUrl, {
+        method: "GET",
+        headers: {
+          ...(authToken ? { apikey: authToken, Authorization: `Bearer ${authToken}` } : {})
+        },
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+      if (res.ok) {
+        testOk = true;
+        testMsg = `Supabase REST API 探测成功 (${res.status} OK)`;
+      } else {
+        const text = await res.text().catch(() => "");
+        testOk = false;
+        testMsg = `Supabase 响应异常: ${res.status} ${text.slice(0, 100)}`;
+      }
+    } else {
+      // s3_r2 或 webhook
+      const reqHeaders: Record<string, string> = {};
+      if (authToken) reqHeaders.Authorization = `Bearer ${authToken}`;
+
+      let res = await fetch(endpointUrl, {
+        method: "GET",
+        headers: reqHeaders,
+        signal: controller.signal
+      }).catch(() => null);
+
+      if (!res) {
+        // 重试 HEAD
+        res = await fetch(endpointUrl, {
+          method: "HEAD",
+          headers: reqHeaders,
+          signal: controller.signal
+        }).catch(() => null);
+      }
+      clearTimeout(timer);
+
+      if (res && res.status < 500) {
+        testOk = true;
+        testMsg = `HTTP 连通成功 (响应码 ${res.status})`;
+      } else if (res) {
+        testOk = false;
+        testMsg = `目标返回服务器错误 (HTTP ${res.status})`;
+      } else {
+        testOk = false;
+        testMsg = "无法连接到目标服务，请检查网络或地址";
+      }
+    }
+  } catch (err: any) {
+    testOk = false;
+    testMsg = err?.name === "AbortError" ? "连接超时（>8秒）" : `连接失败: ${String(err?.message || err).slice(0, 100)}`;
+  }
+
+  const latencyMs = Date.now() - startTime;
+  const now = new Date().toISOString();
+
+  let updatedTarget: ExternalStorageTarget | undefined;
+  if (existing) {
+    existing.lastTestAt = now;
+    existing.lastTestOk = testOk;
+    // 目标服务的错误响应可能回显 Authorization；落库前抹掉 token，避免 GET 列表二次泄漏
+    const safeMsg = authToken ? testMsg.split(authToken).join("***") : testMsg;
+    existing.lastTestMsg = `${safeMsg} (${latencyMs}ms)`;
+    updatedTarget = existing;
+    await saveExternalTargetsRaw(c.env.BUCKET, currentTargets);
+  }
+
+  return c.json({
+    ok: testOk,
+    latencyMs,
+    message: testMsg,
+    target: updatedTarget ? maskTargetForClient(updatedTarget) : undefined
+  });
 });
