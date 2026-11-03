@@ -113,9 +113,9 @@ local-sync.bat           手动双击运行本地同步的快捷入口
 
 | 类型 (Type) | 变量名称 (Variable name) | 值 (Value) 说明 |
 |---|---|---|
-| **文本 (Text)** | `WORKER_URL` | 填你的 Pages 同源域名 `https://zhihu-backup.pages.dev`（或 Worker 域名） |
+| **文本 (Text)** | `WORKER_URL` | 填你的 Pages 域名 `https://zhihu-backup.pages.dev`（或自定义域名；国内访问免梯子直连，由 Pages 的 `_worker.js` 转发到 Worker） |
 | **文本 (Text)** | `ZHIHU_USERNAME` | 你的知乎个人主页 `url_token`（例如主页是 `zhihu.com/people/zhang-san`，就填 `zhang-san`） |
-| **文本 (Text)** | `ALLOWED_ORIGIN` | 填你的前端域名 `https://zhihu-backup.pages.dev`（多个用英文逗号隔开） |
+| **文本 (Text)** | `ALLOWED_ORIGIN` | 填你的前端域名，例如 `https://zhihu-backup.pages.dev`（若有自定义域名，用英文逗号隔开，如 `https://zhihu-backup.pages.dev,https://custom.domain.com`） |
 | **机密 (Secret)** | `API_SECRET` | 随便生成一串 32 位以上随机字符串，用于爬虫入库鉴权 |
 | **机密 (Secret)** | `COOKIE_WRITE_TOKEN` | **凭据页（`/auth`）操作密码**（自行设定的一串强密码），设置后修改/清除 Cookie 必须输此密码 |
 | **机密 (Secret)** | `APIFY_TOKEN` | 下一步在 Apify 网页端获取的 API Token（`apify_api_...`） |
@@ -164,14 +164,15 @@ local-sync.bat           手动双击运行本地同步的快捷入口
      - **根目录 (Root directory)**：**留空**（必须是仓库根目录，不能填 `apps/web`）
      - **构建命令 (Build command)**：`pnpm --filter web build`
      - **构建输出目录 (Build output directory)**：`apps/web/dist`
-  3. 展开下方的 **环境变量 (Environment variables)**，添加：
-     - `VITE_API_BASE` = `https://gemini-zhihu-api.<你的子域>.workers.dev`
+  3. 展开下方的 **环境变量 (Environment variables)**：
      - `VITE_ZHIHU_USERNAME` = `<你的知乎 url_token>`
+     - （注：生产构建默认走同源相对路径 `/api/*` 并由 Pages 的 `_worker.js` + Service Binding 内部转发 Worker，**不再需要配置 `VITE_API_BASE`**；切勿填被墙的 `*.workers.dev`）
   4. 点击 **保存并部署 (Save and Deploy)**。
 - **方式 B（本地终端直接打包上传）**：
-  在项目根目录新建 `.env.production`：
+  在项目根目录新建或检查 `.env.production`：
   ```env
-  VITE_API_BASE=https://gemini-zhihu-api.<你的子域>.workers.dev
+  # 留空即可：生产构建默认同源直通 Pages _worker.js
+  VITE_API_BASE=
   VITE_ZHIHU_USERNAME=<你的知乎 url_token>
   ```
   然后执行：
@@ -181,14 +182,15 @@ local-sync.bat           手动双击运行本地同步的快捷入口
   ```
 
 #### 第 2 步：在 Cloudflare 网页端绑定 Service Binding（关键步骤）
+由于 Cloudflare Pages 与 Worker 属于不同项目，且 Advanced Mode 下的 `apps/web/public/_worker.js` 需要在运行时调用 `env.API`，**必须在 Pages 控制台手动完成服务绑定**：
 1. 在 Cloudflare 网页端进入 **Workers 和 Pages** → 点击进入你的 Pages 项目 **`zhihu-backup`**。
-2. 点击顶部 **设置 (Settings)** → 左侧选择 **绑定 (Bindings)**（或 **函数 / Functions → Service bindings**）。
+2. 点击顶部 **设置 (Settings)** → 左侧选择 **绑定 (Bindings)**（部分版本在 **函数 / Functions → 服务绑定 / Service bindings**）。
 3. 点击 **添加 (Add)** → 选择 **服务绑定 (Service binding)**：
    - **变量名称 (Variable name)**：必须填 **`API`**（全大写，对应 `_worker.js` 中的 `env.API`）
-   - **服务 (Service)**：下拉选择 **`gemini-zhihu-api`**
+   - **服务 (Service)**：下拉选择 **`gemini-zhihu-api`**（即第一部分部署的 Worker 服务名）
    - **环境 (Environment)**：选择 **`Production`**
-4. 点击 **保存 (Save)**（Production 和 Preview 环境都绑上 `API -> gemini-zhihu-api`）。
-5. 保存后如果是在网页端新绑定的，重新触发一次 Pages 部署即可生效。此时直接访问 `https://zhihu-backup.pages.dev/api/health` 会返回 `{"ok":true}`。
+4. 点击 **保存 (Save)**（建议 Production 和 Preview 环境都绑上 `API -> gemini-zhihu-api`）。
+5. 保存后若未自动生效，重新触发一次 Pages 部署即可生效。此时访问 `https://zhihu-backup.pages.dev/api/health`（或自定义域名对应路径）应返回 `{"ok":true}`；若提示 `{"error":"service_binding_missing",...}` 则表示该步骤绑定未完成。
 
 ---
 

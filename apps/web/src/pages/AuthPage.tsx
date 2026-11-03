@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api.js";
 
 type CommentSyncMode = "full" | "hot" | "none";
@@ -21,6 +21,8 @@ type ZhihuStatus = {
   cookieCount: number;
   hasZC0: boolean;
   writeTokenRequired?: boolean;
+  // db=网页设的独立密码，env=COOKIE_WRITE_TOKEN，api_secret=暂用 API_SECRET 兜底，none=纯本地空环境
+  tokenSource?: "db" | "env" | "api_secret" | "none";
   lastRun?: {
     status: string | null;
     startedAt: string | null;
@@ -33,7 +35,7 @@ type ZhihuStatus = {
 
 const DEFAULT_CFG: SyncConfig = {
   commentsMyAnswers: "full",
-  commentsCollections: "hot",
+  commentsCollections: "full",
   commentsUpvotes: "hot",
   commentsFollowing: "hot",
   followingSensitivity: "standard",
@@ -63,12 +65,16 @@ function extractErrText(e: any, fallback: string): string {
 export default function AuthPage() {
   const [status, setStatus] = useState<ZhihuStatus | null>(null);
   const [cfg, setCfg] = useState<SyncConfig>(DEFAULT_CFG);
-  const [cfgInitialized, setCfgInitialized] = useState(false);
+  // 用 ref 而不是 state 做闸门：8 秒轮询的闭包永远读不到最新的 state
+  const cfgInitRef = useRef(false);
+  const cfgDirtyRef = useRef(false);
   const [savingCfg, setSavingCfg] = useState(false);
   const [cfgMsg, setCfgMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
   const [cookieInput, setCookieInput] = useState("");
-  const [token, setToken] = useState(() => localStorage.getItem("cookie_write_token") || "");
+  const [token, setToken] = useState(
+    () => localStorage.getItem("cookie_write_token") || localStorage.getItem("zhihu_write_token") || ""
+  );
   const [showToken, setShowToken] = useState(false);
   const [needToken, setNeedToken] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -86,12 +92,20 @@ export default function AuthPage() {
       .then(s => {
         setStatus(s);
         setNeedToken(!!s.writeTokenRequired);
-        if (s.syncConfig && (!cfgInitialized || syncForm)) {
+        // 只有首次初始化，或用户主动保存后（且当前没有未保存的修改）才回写表单，
+        // 后台每 8 秒轮询绝不能把用户改了一半的下拉框刷回旧值
+        if (s.syncConfig && (!cfgInitRef.current || (syncForm && !cfgDirtyRef.current))) {
           setCfg({ ...DEFAULT_CFG, ...s.syncConfig });
-          setCfgInitialized(true);
+          cfgInitRef.current = true;
         }
       })
       .catch(() => setStatus(null));
+  };
+
+  // 所有修改同步策略的入口都走这里，保证「有未保存修改」标记不遗漏
+  const updateCfg = (patch: Partial<SyncConfig>) => {
+    cfgDirtyRef.current = true;
+    setCfg(prev => ({ ...prev, ...patch }));
   };
 
   useEffect(() => {
@@ -131,6 +145,7 @@ export default function AuthPage() {
       });
       if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
       if (res.syncConfig) setCfg(res.syncConfig);
+      cfgDirtyRef.current = false;
       setCfgMsg({ type: "ok", text: "同步与评论策略已保存生效！下次自动或手动同步将按新策略执行。" });
       load(false);
     } catch (e: any) {
@@ -326,12 +341,29 @@ export default function AuthPage() {
           </div>
         </div>
 
+        {status?.tokenSource === "api_secret" && (
+          <div
+            style={{
+              marginTop: 12,
+              padding: "10px 12px",
+              borderRadius: 6,
+              background: "rgba(180, 83, 9, 0.08)",
+              border: "1px solid rgba(180, 83, 9, 0.35)",
+              color: "#b45309",
+              fontSize: 12.5,
+              lineHeight: 1.8
+            }}
+          >
+            当前尚未单独设置网页操作密码，默认使用 Worker 的 API_SECRET 作为初始操作密码（如需设置独立密码，请在「修改密码」的当前密码框输入 API_SECRET）。
+          </div>
+        )}
+
         {showPwdPanel && (
           <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px dashed var(--zhihu-border-light, #e2e8f0)" }}>
             <div style={{ fontSize: 13, color: "var(--zhihu-meta)", lineHeight: 1.7, marginBottom: 10 }}>
               • <strong>作用范围</strong>：锁定设置修改、全量开关、Cookie 更新与清除操作；日常浏览内容无需密码。
               <br />
-              • <strong>忘记密码重置方法</strong>：在 Cloudflare Worker（<code>gemini-zhihu-api</code>）→ <code>Settings → Variables and Secrets</code> 重置 <code>COOKIE_WRITE_TOKEN</code>。
+              • <strong>忘记密码重置方法</strong>：在 Cloudflare Worker（<code>gemini-zhihu-api</code>）→ <code>Settings → Variables and Secrets</code> 重置 <code>COOKIE_WRITE_TOKEN</code>。若已配置 Worker 环境变量 <code>COOKIE_WRITE_TOKEN</code>，也可直接在上方「当前密码」框输入该环境变量值作为恢复主钥重置密码。
             </div>
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
               {needToken && (
@@ -386,7 +418,7 @@ export default function AuthPage() {
             <select
               style={selectStyle}
               value={cfg.commentsMyAnswers}
-              onChange={e => setCfg({ ...cfg, commentsMyAnswers: e.target.value as CommentSyncMode })}
+              onChange={e => updateCfg({ commentsMyAnswers: e.target.value as CommentSyncMode })}
             >
               <option value="full">全量抓取全部评论 + 楼中楼回复（默认推荐）</option>
               <option value="hot">仅抓取前 20 条高赞热评 + 回复</option>
@@ -402,7 +434,7 @@ export default function AuthPage() {
             <select
               style={selectStyle}
               value={cfg.commentsCollections}
-              onChange={e => setCfg({ ...cfg, commentsCollections: e.target.value as CommentSyncMode })}
+              onChange={e => updateCfg({ commentsCollections: e.target.value as CommentSyncMode })}
             >
               <option value="hot">抓取前 20 条高赞/置顶热评 + 回复（推荐）</option>
               <option value="full">全量抓取全部评论（消耗较多 D1 每日写入配额）</option>
@@ -418,7 +450,7 @@ export default function AuthPage() {
             <select
               style={selectStyle}
               value={cfg.commentsUpvotes}
-              onChange={e => setCfg({ ...cfg, commentsUpvotes: e.target.value as CommentSyncMode })}
+              onChange={e => updateCfg({ commentsUpvotes: e.target.value as CommentSyncMode })}
             >
               <option value="hot">抓取前 20 条高赞/置顶热评 + 回复（推荐）</option>
               <option value="full">全量抓取全部评论（不建议，赞同基数大易超每日限额）</option>
@@ -434,7 +466,7 @@ export default function AuthPage() {
             <select
               style={selectStyle}
               value={cfg.commentsFollowing}
-              onChange={e => setCfg({ ...cfg, commentsFollowing: e.target.value as CommentSyncMode })}
+              onChange={e => updateCfg({ commentsFollowing: e.target.value as CommentSyncMode })}
             >
               <option value="hot">抓取前 20 条高赞/置顶热评 + 回复（推荐）</option>
               <option value="full">全量抓取全部评论</option>
@@ -450,7 +482,7 @@ export default function AuthPage() {
             <select
               style={selectStyle}
               value={cfg.followingSensitivity}
-              onChange={e => setCfg({ ...cfg, followingSensitivity: e.target.value as any })}
+              onChange={e => updateCfg({ followingSensitivity: e.target.value as any })}
             >
               <option value="standard">标准模式（风险≥25分 或 质量≥38分 自动抢救，推荐）</option>
               <option value="relaxed">宽松模式（风险≥18分 或 质量≥24分，多收录优质回答）</option>
@@ -483,7 +515,7 @@ export default function AuthPage() {
             <select
               style={selectStyle}
               value={cfg.preferredAiModel}
-              onChange={e => setCfg({ ...cfg, preferredAiModel: e.target.value })}
+              onChange={e => updateCfg({ preferredAiModel: e.target.value })}
             >
               <option value="@cf/qwen/qwen3-30b-a3b-fp8">通义千问 Qwen3-30B-A3B-FP8（300亿MoE·中文最佳且最省额度）</option>
               <option value="@cf/deepseek-ai/deepseek-v4.1-flash-1017">DeepSeek-V4.1-Flash（深度求索·观点提炼犀利）</option>

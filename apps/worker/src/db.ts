@@ -3,6 +3,14 @@ import { AsyncLocalStorage } from "node:async_hooks";
 // D1Database is provided by @cloudflare/workers-types
 export const dbContext = new AsyncLocalStorage<any>();
 
+/**
+ * 共享收藏聚合 JOIN（配合 0004 的 idx_collection_items_content_removed 覆盖索引）。
+ * - local_fav_count：该内容在所有收藏夹里未移除的条目数（GROUP BY 去重，避免行数膨胀）
+ * - fav_added_at：最早收藏时间（问题详情页「收藏于」展示仍依赖）
+ * 调用方统一写 `LEFT JOIN ${FAV_JOIN_SQL}`，别名固定为 fav。
+ */
+export const FAV_JOIN_SQL = "LEFT JOIN (SELECT content_pk, COUNT(*) AS local_fav_count, MAX(first_seen_at) AS fav_added_at FROM collection_items WHERE is_removed = 0 GROUP BY content_pk) fav ON fav.content_pk = c.pk";
+
 function d1OrThrow() {
   const d1 = dbContext.getStore();
   if (!d1) throw new Error("DB context missing");
@@ -42,6 +50,10 @@ export const db = {
     return await d1OrThrow().batch(stmts);
   },
 
+  /**
+   * @deprecated D1 不支持交互式事务（BEGIN/COMMIT）：此方法只是把回调顺序执行一遍，
+   * 中途抛错不会回滚已执行的语句。需要原子写入请直接使用 db.batch()。
+   */
   transaction: async (fn: Function) => {
     // 保留兼容：D1 上它只是顺序执行，不会回滚。
     // 新代码请直接用 db.batch()。

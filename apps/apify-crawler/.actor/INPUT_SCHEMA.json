@@ -7,8 +7,8 @@
             "title": "Run Type",
             "type": "string",
             "description": "What to synchronize",
-            "enum": ["all", "answers", "collections", "upvotes", "following", "following-list"],
-            "enumTitles": ["Sync All", "Sync Answers", "Sync Collections", "Sync Upvotes", "Sync Following", "Sync Following List Only"],
+            "enum": ["all", "answers", "articles", "collections", "upvotes", "following", "following-list"],
+            "enumTitles": ["Sync All", "Sync Answers", "Sync My Articles", "Sync Collections", "Sync Upvotes", "Sync Following", "Sync Following List Only"],
             "default": "all"
         },
         "isFast": {
@@ -66,6 +66,12 @@
             "type": "object",
             "description": "Per-followed-user resume offsets and history flags injected by Worker",
             "editor": "json"
+        },
+        "syncOwnerId": {
+            "title": "Sync Lease Owner ID",
+            "type": "string",
+            "description": "Internal: distributed sync lock lease owner token injected by Worker or local-sync",
+            "editor": "textfield"
         }
     },
     "required": ["apiUrl", "zhihuUsername", "cookieString"]

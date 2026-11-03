@@ -106,16 +106,16 @@
 | # | 问题 | 状态 | 证据 |
 |---|---|---|---|
 | A1 | **自己的专栏文章从来没被抓过** | **仍存在** | `runType` 枚举无 article；自有路径只抓 `/answers`；文章只在关注答主路径出现 |
-| A2 | 评论父子关系靠外层 id 硬塞（读不存在的 `reply_to_comment_id`） | 仍存在（无害） | `main.ts` 读该字段恒 undefined，parentId 由外层根 id 赋值 |
+| A2 | 评论父子关系靠外层 id 硬塞（读不存在的 `reply_to_comment_id`） | **已修正（2026-11-02）** | 现代码不再读 `reply_to_comment_id`，改用真实字段 `reply_to_author.member.name`（main.ts:226） |
 | A3 | 没有内容删除检测 | 仍存在 | `contents.is_deleted` 生产恒 0；但风险引擎/前端有「已删除」逻辑 |
 
 ### B. 数据错误
 
 | # | 位置 | 错误 | 状态 |
 |---|---|---|---|
-| B1 | 文章段 + **关注答主回答段 + 自动抢救评分器** | 赞数无 `reaction.statistics.like_count` 兜底 → 恒 0 | **本地实测修正**：文章段**带 include 时 `voteup_count` 有值**（B1 对文章不成立）；真正失效的是**关注答主回答段 + 评分器**。文章段的真实错误是 `favorite_count`/`visit_count` 恒 0 |
+| B1 | 文章段 + **关注答主回答段 + 自动抢救评分器** | 赞数无 `reaction.statistics.like_count` 兜底 → 恒 0 | **已修正（2026-11-02）**：文章段带 include 时 `voteup_count` 与 `comment_count` 均正常返回；文章 `reaction.statistics.like_count` 是伪值 0，不能当赞同数。关注答主回答段与评分器均已补 `reaction.statistics.like_count` 兜底。文章段残留真实错误是 `favorite_count`/`visit_count` 恒 0（已改为 `favorites`/0） |
 | B2 | 回答列表 | `visit_count` 不存在 → 回答浏览量恒 0 | 仍存在 |
-| B3 | 收藏夹条目 | `favorite_count \|\| thanks_count \|\| reaction.favorites` → 收藏数取成感谢数 | **部分过时**：回答列表用 reaction 兜底是对的；真正取错只有收藏夹条目；关注答主/文章两处则完全没兜底 |
+| B3 | 收藏夹条目 | `favorite_count \|\| thanks_count \|\| reaction.favorites` → 收藏数取成感谢数 | **已修正（2026-11-02）**：已彻底移除 `thanks_count` 兜底；回答列表/关注答主/文章/收藏夹/赞同动态统一为 `favorite_count ?? reaction.statistics.favorites ?? 0`，动态 target 缺失时写 0 由 Worker 保留既有非零真值 |
 | B4 | 收藏夹列表 | 读 `item.updated_time`，接口不返回 → 落库回退 now | 仍存在（去掉后 `collections.updated_time` 会退化为"最后同步时间"） |
 
 ### C. 写放大
@@ -365,7 +365,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_root_time
 需同步注册 **4 处**：`main.ts` 的 `runType` 联合类型、`INPUT_SCHEMA.json`、`scripts/local-sync.mjs` 的 `VALID_TYPES`、`main.ts` 的入口分发（if/else 分支）。`apify.ts` 无 target 映射（`/api/sync` 的 target 是任意透传），不在改动范围。
 
 **真机实测（limit=2 两次 GET）**：
-- 字段：`id/title/created/updated/excerpt` 必有；`content` 需 include；赞数在 `reaction.statistics.like_count`、收藏在 `reaction.statistics.favorites`；**`comment_count` 即使 include 也不返回**（要显示评论数得走详情接口或留空）。
+- 字段：`id/title/created/updated/excerpt` 必有；`content`/`voteup_count`/`comment_count` 需 include（实测均正常返回）；赞数读顶层 `voteup_count`（`reaction.statistics.like_count` 是伪值 0，不可用），收藏数读 `reaction.statistics.favorites`（顶层 `favorite_count` 永不返回）。
 - 时间戳：`created`/`updated` 是 **10 位秒**，`toIsoOrNull` 已是秒×1000，可直接复用。
 - **停止游标 `articles_cursor` 需同期 4 一起加**（PLAN 初版只说撞 `oldest_article_id`，未定义存储位置）。
 注意：文章时间字段是 `created`/`updated`（秒），需确认后走 `toIsoOrNull`。
@@ -391,7 +391,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_root_time
 默认返回含 `id/created_time/updated_time/reaction/question/author/url/is_collapsed/...`，但**没有 `content`、`voteup_count`、`favorite_count`、`visit_count`**：
 - 赞数 → `reaction.statistics.like_count`
 - 收藏数 → `reaction.statistics.favorites`
-- 浏览量 → 列表不存在（可用 `question.visit_count`）
+- 浏览量 → 列表不存在，保持 0（**不要拿 `question.visit_count` 冒充单篇回答浏览量**，那是问题总浏览数）
 - 正文/摘要/评论数 → 需带 include 才返回
 
 ### 6.2 评论（31 字段）

@@ -1,0 +1,746 @@
+{
+  "endpoint": "articles",
+  "generated": "2026-11-01",
+  "method": "统一请求器 playwright+cookie 直连（apps/collector/.fieldprobe/fetch.mjs），5 个请求逐批发送、间隔>=3000ms；A-D 全部 200，E 403(error.code=10003)；未出现 40353/40362；E 为最后一个计划请求，触发 403 立即停止规则后未再发出任何请求",
+  "requests": [
+    {
+      "id": "A_no_include",
+      "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94/articles?limit=2&offset=0",
+      "status": 200,
+      "ok": true,
+      "ms": 741,
+      "item_count": 2,
+      "root_keys": [
+        "data",
+        "need_force_login",
+        "paging"
+      ],
+      "item_keys": [
+        "article_type",
+        "author",
+        "comment_permission",
+        "content_need_truncated",
+        "copyright_permission",
+        "created",
+        "endorsements",
+        "excerpt",
+        "excerpt_title",
+        "force_login_when_click_read_more",
+        "id",
+        "image_url",
+        "is_navigator",
+        "navigator_vote",
+        "paid_info",
+        "reaction",
+        "title",
+        "type",
+        "updated",
+        "url",
+        "vote_next_step"
+      ],
+      "item_keys_count": 21,
+      "requested_count": 0,
+      "requested_not_returned_count": 0,
+      "content_max_len": 0
+    },
+    {
+      "id": "B_project_include",
+      "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94/articles?include=data%5B*%5D.content,voteup_count,comment_count,created,updated,title,excerpt&limit=2&offset=0",
+      "status": 200,
+      "ok": true,
+      "ms": 889,
+      "item_count": 2,
+      "root_keys": [
+        "data",
+        "need_force_login",
+        "paging"
+      ],
+      "item_keys": [
+        "article_type",
+        "author",
+        "comment_count",
+        "comment_permission",
+        "content",
+        "content_need_truncated",
+        "copyright_permission",
+        "created",
+        "endorsements",
+        "excerpt",
+        "excerpt_title",
+        "force_login_when_click_read_more",
+        "id",
+        "image_url",
+        "is_navigator",
+        "navigator_vote",
+        "paid_info",
+        "reaction",
+        "title",
+        "type",
+        "updated",
+        "url",
+        "vote_next_step",
+        "voteup_count"
+      ],
+      "item_keys_count": 24,
+      "requested_count": 7,
+      "requested_not_returned_count": 0,
+      "content_max_len": 54835
+    },
+    {
+      "id": "C_full_include",
+      "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94/articles?include=data%5B*%5D.voteup_count,comment_count,favorite_count,visit_count,thanks_count,excerpt,excerpt_title,content,image_url,is_labeled,created,updated,comment_permission,copyright_permission,paid_info,reaction.statistics,author.name,author.headline,author.avatar_url,column,topics,title,url&limit=2&offset=0",
+      "status": 200,
+      "ok": true,
+      "ms": 826,
+      "item_count": 2,
+      "root_keys": [
+        "data",
+        "need_force_login",
+        "paging"
+      ],
+      "item_keys": [
+        "article_type",
+        "author",
+        "comment_count",
+        "comment_permission",
+        "content",
+        "content_need_truncated",
+        "copyright_permission",
+        "created",
+        "endorsements",
+        "excerpt",
+        "excerpt_title",
+        "force_login_when_click_read_more",
+        "id",
+        "image_url",
+        "is_labeled",
+        "is_navigator",
+        "navigator_vote",
+        "paid_info",
+        "reaction",
+        "title",
+        "type",
+        "updated",
+        "url",
+        "vote_next_step",
+        "voteup_count"
+      ],
+      "item_keys_count": 25,
+      "requested_count": 23,
+      "requested_not_returned_count": 5,
+      "content_max_len": 54835
+    },
+    {
+      "id": "D_detail_zhuanlan",
+      "url": "https://zhuanlan.zhihu.com/api/articles/2086869210299475286",
+      "status": 200,
+      "ok": true,
+      "ms": 429,
+      "shape": "root 即文章对象",
+      "top_keys": [
+        "ab_param",
+        "activity_topping_info",
+        "admin_closed_comment",
+        "allow_segment_interaction",
+        "annotation_action",
+        "article_type",
+        "attached_info",
+        "author",
+        "bar_plugins_flip_time",
+        "can_comment",
+        "can_reference",
+        "can_tip",
+        "column",
+        "comment_count",
+        "comment_permission",
+        "commercial_info",
+        "content",
+        "content_need_truncated",
+        "contributions",
+        "copyright_permission",
+        "created",
+        "emoji_reaction",
+        "endorsements",
+        "excerpt",
+        "excerpt_title",
+        "favlists_count",
+        "force_login_when_click_read_more",
+        "has_column",
+        "has_publishing_draft",
+        "heavy_up_status",
+        "id",
+        "image_height",
+        "image_url",
+        "image_width",
+        "interaction_bar_plugins",
+        "ip_info",
+        "is_favorited",
+        "is_labeled",
+        "is_liked",
+        "is_navigator",
+        "is_new_link_card",
+        "is_normal",
+        "is_title_image_full_screen",
+        "is_visible",
+        "liked_count",
+        "mcn_fp_show",
+        "navigator_vote",
+        "podcast_audio_enter",
+        "reaction",
+        "reaction_instruction",
+        "reason",
+        "republishers",
+        "settings",
+        "share_guide",
+        "share_text",
+        "state",
+        "status",
+        "suggest_edit",
+        "tipjarors_count",
+        "title",
+        "title_image",
+        "topics",
+        "type",
+        "updated",
+        "upvoted_followees",
+        "url",
+        "vote_next_step",
+        "voteup_count",
+        "voting"
+      ],
+      "top_keys_count": 69,
+      "note": "statistics.favorites=1 与列表侧一致；favlists_count=1；voteup_count=4"
+    },
+    {
+      "id": "E_detail_v4",
+      "url": "https://www.zhihu.com/api/v4/articles/2086869210299475286",
+      "status": 403,
+      "ok": false,
+      "ms": 260,
+      "error": {
+        "code": 10003,
+        "message": "请求参数异常，请升级客户端后重试。"
+      },
+      "note": "非 40353/40362 风控码；v4 文章详情对当前客户端形态不可用（任务预期可能 404，实测为 403/10003），如实记录"
+    }
+  ],
+  "fields": [
+    {
+      "path": "data[].article_type",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "实测 'normal'"
+    },
+    {
+      "path": "data[].author",
+      "type": "object",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "默认即含 name/headline/avatar_url/url_token/avatar_url_template/badge/badge_v2/gender/user_type/is_advertiser/is_org/id/url/type；详情端点 author 另有 uid/description/is_followed/is_following/exposed_medal"
+    },
+    {
+      "path": "data[].comment_count",
+      "type": "number",
+      "seen_in": [
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": true,
+      "note": "实测 0/0"
+    },
+    {
+      "path": "data[].comment_permission",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "实测 'all'"
+    },
+    {
+      "path": "data[].content",
+      "type": "string",
+      "seen_in": [
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": true,
+      "note": "include 后返回；本轮两篇长度 14891/54835 字符"
+    },
+    {
+      "path": "data[].content_need_truncated",
+      "type": "boolean",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].copyright_permission",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "实测 'need_review'"
+    },
+    {
+      "path": "data[].created",
+      "type": "number",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "数字秒级时间戳；文章实体无 created_time（与 answers 相反）"
+    },
+    {
+      "path": "data[].endorsements",
+      "type": "array",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "数组，本轮长度 1"
+    },
+    {
+      "path": "data[].excerpt",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "不受 include 影响（A/B 同为 157/120 字符）；详情端点 excerpt 616 字符"
+    },
+    {
+      "path": "data[].excerpt_title",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].force_login_when_click_read_more",
+      "type": "boolean",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].id",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].image_url",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].is_labeled",
+      "type": "boolean",
+      "seen_in": [
+        "C_full_include"
+      ],
+      "include_required": true,
+      "note": "实测 false；仅全量 include 请求后返回，项目 include 未请求故 B 组无"
+    },
+    {
+      "path": "data[].is_navigator",
+      "type": "boolean",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "实测 false"
+    },
+    {
+      "path": "data[].navigator_vote",
+      "type": "boolean",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "实测 false"
+    },
+    {
+      "path": "data[].paid_info",
+      "type": "object",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "列表恒为空对象 {}；zhuanlan 详情端点无此字段"
+    },
+    {
+      "path": "data[].reaction",
+      "type": "object",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "statistics={like_count,favorites}，relation={faved,liked}；列表 include 请求 reaction.statistics 也只回这 2 键"
+    },
+    {
+      "path": "data[].title",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].type",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "恒 'article'"
+    },
+    {
+      "path": "data[].updated",
+      "type": "number",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "数字秒级时间戳；文章实体无 updated_time"
+    },
+    {
+      "path": "data[].url",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].vote_next_step",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": false,
+      "note": "实测 'vote'"
+    },
+    {
+      "path": "data[].voteup_count",
+      "type": "number",
+      "seen_in": [
+        "B_project_include",
+        "C_full_include"
+      ],
+      "include_required": true,
+      "note": "实测 4/3；与详情 voteup_count=4、statistics.up_vote_count=4 一致"
+    }
+  ],
+  "include_requested": {
+    "B_project_include": [
+      "data[].content",
+      "data[].voteup_count",
+      "data[].comment_count",
+      "data[].created",
+      "data[].updated",
+      "data[].title",
+      "data[].excerpt"
+    ],
+    "C_full_include": [
+      "data[].voteup_count",
+      "data[].comment_count",
+      "data[].favorite_count",
+      "data[].visit_count",
+      "data[].thanks_count",
+      "data[].excerpt",
+      "data[].excerpt_title",
+      "data[].content",
+      "data[].image_url",
+      "data[].is_labeled",
+      "data[].created",
+      "data[].updated",
+      "data[].comment_permission",
+      "data[].copyright_permission",
+      "data[].paid_info",
+      "data[].reaction.statistics",
+      "data[].author.name",
+      "data[].author.headline",
+      "data[].author.avatar_url",
+      "data[].column",
+      "data[].topics",
+      "data[].title",
+      "data[].url"
+    ]
+  },
+  "requested_not_returned": [
+    "data[].column",
+    "data[].favorite_count",
+    "data[].thanks_count",
+    "data[].topics",
+    "data[].visit_count"
+  ],
+  "returned_not_requested": [
+    "data[].article_type",
+    "data[].author",
+    "data[].author.avatar_url_template",
+    "data[].author.badge",
+    "data[].author.badge_v2",
+    "data[].author.gender",
+    "data[].author.id",
+    "data[].author.is_advertiser",
+    "data[].author.is_org",
+    "data[].author.type",
+    "data[].author.url",
+    "data[].author.url_token",
+    "data[].author.user_type",
+    "data[].content_need_truncated",
+    "data[].endorsements",
+    "data[].force_login_when_click_read_more",
+    "data[].id",
+    "data[].is_navigator",
+    "data[].navigator_vote",
+    "data[].reaction",
+    "data[].reaction.relation.faved",
+    "data[].reaction.relation.liked",
+    "data[].type",
+    "data[].vote_next_step"
+  ],
+  "stats_five": [
+    {
+      "path": "data[].voteup_count",
+      "list_default_returned": false,
+      "returned_with_project_include": true,
+      "returned_with_full_include": true,
+      "present_in_detail": true,
+      "type": "number",
+      "observed": [
+        null,
+        4
+      ],
+      "available_via": "include 后列表顶层返回；或详情顶层（默认）。reaction.statistics.like_count 不是赞同（实测 like_count=0 而 voteup_count=4）",
+      "conclusion": "include_required"
+    },
+    {
+      "path": "data[].comment_count",
+      "list_default_returned": false,
+      "returned_with_project_include": true,
+      "returned_with_full_include": true,
+      "present_in_detail": true,
+      "type": "number",
+      "observed": [
+        0
+      ],
+      "available_via": "include 后列表顶层返回；或详情顶层（默认）",
+      "conclusion": "include_required"
+    },
+    {
+      "path": "data[].favorite_count",
+      "list_default_returned": false,
+      "returned_with_project_include": false,
+      "returned_with_full_include": false,
+      "present_in_detail": false,
+      "type": null,
+      "available_via": "reaction.statistics.favorites（列表默认返回，实测 1/12；详情另有 favlists_count=1 与 statistics.favorites=1，一致）",
+      "conclusion": "never_returned_top_level_use_reaction_statistics_favorites"
+    },
+    {
+      "path": "data[].visit_count",
+      "list_default_returned": false,
+      "returned_with_project_include": false,
+      "returned_with_full_include": false,
+      "present_in_detail": false,
+      "type": null,
+      "available_via": "无——列表 reaction.statistics 也无 visit_count 键",
+      "conclusion": "unavailable_via_articles_api"
+    },
+    {
+      "path": "data[].thanks_count",
+      "list_default_returned": false,
+      "returned_with_project_include": false,
+      "returned_with_full_include": false,
+      "present_in_detail": false,
+      "type": null,
+      "available_via": "无——详情也只有 tipjarors_count（打赏）",
+      "conclusion": "unavailable_via_articles_api"
+    }
+  ],
+  "reaction_statistics": [
+    {
+      "context": "list（A 无 include / B 项目 include / C 全量 include，三组一致）",
+      "keys": [
+        "like_count",
+        "favorites"
+      ],
+      "relation_keys": [
+        "faved",
+        "liked"
+      ]
+    },
+    {
+      "context": "detail_zhuanlan GET /api/articles/{id}",
+      "keys": [
+        "up_vote_count",
+        "down_vote_count",
+        "like_count",
+        "comment_count",
+        "share_count",
+        "play_count",
+        "interest_play_count",
+        "favorites",
+        "pv_count",
+        "bullet_count",
+        "applaud_count",
+        "question_follower_count",
+        "question_answer_count",
+        "plaincontent_vote_up_count",
+        "plaincontent_like_count",
+        "img_like_count",
+        "subscribe_count",
+        "republishers"
+      ],
+      "relation_keys": [
+        "is_author",
+        "vote",
+        "liked",
+        "img_liked",
+        "faved",
+        "following",
+        "subcribed",
+        "is_navigator_vote",
+        "current_user_is_navigator",
+        "vote_next_step"
+      ],
+      "extra_reaction_keys": [
+        "image_reactions"
+      ],
+      "note": "up_vote_count=4 与顶层 voteup_count 一致；img_like_count 为按图片哈希的计数对象"
+    }
+  ],
+  "paging_fields": [
+    {
+      "path": "paging.is_end",
+      "type": "boolean",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "observed": false
+    },
+    {
+      "path": "paging.totals",
+      "type": "number",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "observed": 22
+    },
+    {
+      "path": "paging.previous",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ]
+    },
+    {
+      "path": "paging.is_start",
+      "type": "boolean",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ],
+      "observed": true
+    },
+    {
+      "path": "paging.next",
+      "type": "string",
+      "seen_in": [
+        "A_no_include",
+        "B_project_include",
+        "C_full_include"
+      ]
+    }
+  ],
+  "list_vs_detail_diff": [
+    "顶层键数：列表三组并集 25（无 include 仅 21）；zhuanlan 详情 69；两侧共有 24 个键（并集去掉 paid_info 后全部在详情中）。",
+    "列表有而详情无：paid_info（列表恒为空对象 {}）。",
+    "详情独有 45 键：ab_param, activity_topping_info, admin_closed_comment, allow_segment_interaction, annotation_action, attached_info, bar_plugins_flip_time, can_comment, can_reference, can_tip, column, commercial_info, contributions, emoji_reaction, favlists_count, has_column, has_publishing_draft, heavy_up_status, image_height, image_width, interaction_bar_plugins, ip_info, is_favorited, is_new_link_card, is_normal, is_title_image_full_screen, is_visible, is_liked, liked_count, mcn_fp_show, podcast_audio_enter, reaction_instruction, reason, republishers, settings, share_guide, share_text, state, status, suggest_edit, tipjarors_count, title_image, topics, upvoted_followees, voting",
+    "5 个统计字段：voteup_count/comment_count 列表需 include 才有、详情默认返回；favorite_count 两侧顶层都没有（详情以 favlists_count=1 与 statistics.favorites=1 承载，与列表 statistics.favorites=1 一致）；visit_count/thanks_count 列表与详情都没有。",
+    "topics/column：列表即使写进 include 也被忽略；详情默认返回（column 为完整对象：articles_count=18、followers=2；topics 为数组，元素含 id/name/url）。",
+    "reaction：statistics 列表恒 2 键 {like_count,favorites}、详情 18 键（含 up_vote_count=voteup_count、down_vote_count、share_count、pv_count、img_like_count、republishers 等），详情 reaction 另含 image_reactions；relation 列表 2 键 {faved,liked}、详情 10 键。",
+    "author：详情比列表默认多 uid/description/is_followed/is_following/exposed_medal。",
+    "excerpt/content 同一文章两侧形态不同：excerpt 列表 157 字符 vs 详情 616；content 列表（include 后）14891 vs 详情 8271，开头一致但互不包含。",
+    "时间字段两侧一致：created/updated 数字时间戳，均无 created_time/updated_time。",
+    "E（v4 /api/v4/articles/{id}）返回 403 error.code=10003，无数据可比。"
+  ],
+  "consistency_with_old_probe": "changed",
+  "notes": [
+    "请求执行：5 个请求各占一个批次、逐个检查状态后再发下一个；批间间隔 = sleep 3s + j.wait + 浏览器启动，均 >=3000ms。A/B/C/D=200；E=403(error.code=10003)——E 本就是最后一个计划请求，其后未发出任何请求，全程未出现 40353/40362。",
+    "与旧探测（G:/gemini zhihu/data/plan-verify-b/articles-probe.json）逐项核对：无 include 的 21 键完全一致（同一键集合；reaction=[statistics,relation]、statistics=[like_count,favorites]、excerpt 157、is_end=false/totals=22、id/title 为字符串、created/updated 为数字、content 缺席、voteup_count/comment_count 缺席——全部复现）。",
+    "不一致点（故 consistency=changed）：旧结论『带 include 多一个 content』在项目 include（data[*].content,voteup_count,comment_count,created,updated,title,excerpt）下不成立——实测新增 3 键 content/voteup_count/comment_count（24 键）；全量 include 下新增 4 键（再加 is_labeled，25 键）。旧结论仅在 include 只含 content 时可能成立，本轮未单独复测该形态。",
+    "与 answers 列表（10-live-answers.json）的关键差异：answers 的 voteup_count/favorite_count/visit_count/thanks_count 即使 include 也不返回；articles 的 voteup_count/comment_count include 即返回，favorite_count 须改走 reaction.statistics.favorites，visit_count/thanks_count 在列表与详情均拿不到。",
+    "文章列表 reaction.statistics.like_count 不是赞同数：C 实测 like_count=0 而 voteup_count=4，二者数值无关；文章赞同数只有顶层 voteup_count（include）或详情 statistics.up_vote_count。收藏数在 statistics.favorites（列表默认返回：1/12，与详情 favlists_count=1、statistics.favorites=1 三处一致）。",
+    "include 串中 favorite_count/visit_count/thanks_count/column/topics 被服务端静默忽略（不报错、键不出现）；其余请求项均返回或本就是默认键；reaction.statistics 被请求时只回 like_count/favorites 两键。",
+    "author.name/headline/avatar_url 在无 include 的默认 author 对象里已存在，include 请求它们无增量。",
+    "列表 excerpt 不受 include 影响（A/B 同为 157/120）；content 仅在 include 后出现。",
+    "raw 响应与 job 文件存于临时目录 C:/Users/lixueshu/AppData/Local/Temp/zhihu-probe-12/（out-a..e.json）；G:/gemini zhihu 项目内除 .fieldprobe/fetch.mjs 既有文件外未新增/修改任何文件。"
+  ]
+}

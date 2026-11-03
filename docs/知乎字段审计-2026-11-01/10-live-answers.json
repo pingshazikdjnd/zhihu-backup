@@ -1,0 +1,3065 @@
+{
+  "endpoint": "members_answers",
+  "generated": "2026-11-01",
+  "method": "统一请求器 playwright+cookie 直连，共 5 个请求（wait=3200ms，page_fallback 关闭），全部 200，无 403/40353/40362",
+  "requests": [
+    {
+      "id": "basic",
+      "status": 200,
+      "ok": true,
+      "ms": 511,
+      "item_count": 2,
+      "root_keys": [
+        "paging",
+        "data",
+        "need_force_login"
+      ],
+      "item_keys": [
+        "answer_type",
+        "author",
+        "biz_ext",
+        "content_need_truncated",
+        "created_time",
+        "endorsements",
+        "extras",
+        "force_login_when_click_read_more",
+        "id",
+        "is_collapsed",
+        "is_copyable",
+        "is_navigator",
+        "navigator_vote",
+        "question",
+        "reaction",
+        "same_video_answers",
+        "thumbnail",
+        "type",
+        "updated_time",
+        "url",
+        "vote_next_step"
+      ],
+      "item_keys_count": 21,
+      "requested_count": 0,
+      "requested_not_returned_count": 0,
+      "content_max_len": 0
+    },
+    {
+      "id": "proj",
+      "status": 200,
+      "ok": true,
+      "ms": 743,
+      "item_count": 2,
+      "root_keys": [
+        "paging",
+        "data",
+        "need_force_login"
+      ],
+      "item_keys": [
+        "admin_closed_comment",
+        "annotation_action",
+        "answer_type",
+        "author",
+        "biz_ext",
+        "can_comment",
+        "collapse_reason",
+        "collapsed_by",
+        "comment_count",
+        "comment_permission",
+        "content",
+        "content_need_truncated",
+        "created_time",
+        "endorsements",
+        "excerpt",
+        "extras",
+        "force_login_when_click_read_more",
+        "id",
+        "is_collapsed",
+        "is_copyable",
+        "is_labeled",
+        "is_navigator",
+        "is_normal",
+        "mark_infos",
+        "navigator_vote",
+        "question",
+        "reaction",
+        "relationship",
+        "reshipment_settings",
+        "review_info",
+        "reward_info",
+        "same_video_answers",
+        "suggest_edit",
+        "thumbnail",
+        "type",
+        "updated_time",
+        "url",
+        "vote_next_step"
+      ],
+      "item_keys_count": 38,
+      "requested_count": 32,
+      "requested_not_returned_count": 11,
+      "content_max_len": 84
+    },
+    {
+      "id": "max",
+      "status": 200,
+      "ok": true,
+      "ms": 653,
+      "item_count": 2,
+      "root_keys": [
+        "paging",
+        "data",
+        "need_force_login"
+      ],
+      "item_keys": [
+        "admin_closed_comment",
+        "annotation_action",
+        "answer_type",
+        "author",
+        "biz_ext",
+        "can_comment",
+        "collapse_reason",
+        "collapsed_by",
+        "comment_count",
+        "comment_permission",
+        "content",
+        "content_need_truncated",
+        "created_time",
+        "endorsements",
+        "excerpt",
+        "extras",
+        "force_login_when_click_read_more",
+        "id",
+        "is_collapsed",
+        "is_copyable",
+        "is_labeled",
+        "is_navigator",
+        "is_normal",
+        "mark_infos",
+        "navigator_vote",
+        "question",
+        "reaction",
+        "relationship",
+        "reshipment_settings",
+        "review_info",
+        "reward_info",
+        "same_video_answers",
+        "suggest_edit",
+        "thumbnail",
+        "type",
+        "updated_time",
+        "url",
+        "vote_next_step"
+      ],
+      "item_keys_count": 38,
+      "requested_count": 44,
+      "requested_not_returned_count": 14,
+      "content_max_len": 84
+    },
+    {
+      "id": "detail_inc",
+      "status": 200,
+      "ok": true,
+      "ms": 164,
+      "item_count": 1,
+      "root_keys": [
+        "allow_segment_interaction",
+        "answer_type",
+        "author",
+        "biz_ext",
+        "comment_count",
+        "content_need_truncated",
+        "created_time",
+        "extras",
+        "force_login_when_click_read_more",
+        "id",
+        "is_collapsed",
+        "is_copyable",
+        "is_jump_native",
+        "podcast_audio_enter",
+        "question",
+        "reaction",
+        "relationship",
+        "thanks_count",
+        "type",
+        "updated_time",
+        "url",
+        "visit_count",
+        "voteup_count"
+      ],
+      "item_keys": [
+        "allow_segment_interaction",
+        "answer_type",
+        "author",
+        "biz_ext",
+        "comment_count",
+        "content_need_truncated",
+        "created_time",
+        "extras",
+        "force_login_when_click_read_more",
+        "id",
+        "is_collapsed",
+        "is_copyable",
+        "is_jump_native",
+        "podcast_audio_enter",
+        "question",
+        "reaction",
+        "relationship",
+        "thanks_count",
+        "type",
+        "updated_time",
+        "url",
+        "visit_count",
+        "voteup_count"
+      ],
+      "item_keys_count": 23,
+      "requested_count": 6,
+      "requested_not_returned_count": 1,
+      "content_max_len": 0
+    },
+    {
+      "id": "detail_basic",
+      "status": 200,
+      "ok": true,
+      "ms": 136,
+      "item_count": 1,
+      "root_keys": [
+        "allow_segment_interaction",
+        "answer_type",
+        "author",
+        "biz_ext",
+        "content_need_truncated",
+        "created_time",
+        "extras",
+        "force_login_when_click_read_more",
+        "id",
+        "is_collapsed",
+        "is_copyable",
+        "is_jump_native",
+        "podcast_audio_enter",
+        "question",
+        "relationship",
+        "type",
+        "updated_time",
+        "url"
+      ],
+      "item_keys": [
+        "allow_segment_interaction",
+        "answer_type",
+        "author",
+        "biz_ext",
+        "content_need_truncated",
+        "created_time",
+        "extras",
+        "force_login_when_click_read_more",
+        "id",
+        "is_collapsed",
+        "is_copyable",
+        "is_jump_native",
+        "podcast_audio_enter",
+        "question",
+        "relationship",
+        "type",
+        "updated_time",
+        "url"
+      ],
+      "item_keys_count": 18,
+      "requested_count": 0,
+      "requested_not_returned_count": 0,
+      "content_max_len": 0
+    }
+  ],
+  "fields": [
+    {
+      "path": "data[].admin_closed_comment",
+      "type": "boolean",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].annotation_action",
+      "type": "array",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "data[].answer_type",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].author",
+      "type": "object",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].author.avatar_url",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].author.avatar_url_template",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].author.badge",
+      "type": "array",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "data[].author.badge_v2",
+      "type": "object",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].author.badge_v2.detail_badges",
+      "type": "array",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "data[].author.badge_v2.icon",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].author.badge_v2.merged_badges",
+      "type": "array",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "data[].author.badge_v2.night_icon",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].author.badge_v2.title",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].author.gender",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].author.headline",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].author.id",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].author.is_advertiser",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].author.is_org",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].author.name",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].author.type",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].author.url",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].author.url_token",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].author.user_type",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].biz_ext",
+      "type": "object",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].biz_ext.creation_relationship",
+      "type": "object",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "always_empty": true
+    },
+    {
+      "path": "data[].can_comment",
+      "type": "object",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].can_comment.reason",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].can_comment.status",
+      "type": "boolean",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].collapse_reason",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].collapsed_by",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].comment_count",
+      "type": "number",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].comment_permission",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].content",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].content_need_truncated",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].created_time",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].endorsements",
+      "type": "array",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "elem_types": []
+    },
+    {
+      "path": "data[].endorsements[].action_url",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].endorsements[].background_color",
+      "type": "object",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].endorsements[].background_color.alpha",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].endorsements[].background_color.group",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].endorsements[].elements",
+      "type": "array",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "elem_types": []
+    },
+    {
+      "path": "data[].endorsements[].elements[].content",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].endorsements[].elements[].font_color",
+      "type": "object",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].endorsements[].elements[].font_color.alpha",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].endorsements[].elements[].font_color.group",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].endorsements[].elements[].font_size",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].endorsements[].elements[].height",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].endorsements[].elements[].image_color",
+      "type": "object",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].endorsements[].elements[].image_color.alpha",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].endorsements[].elements[].image_color.group",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].endorsements[].elements[].image_key",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].endorsements[].elements[].is_bold",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].endorsements[].elements[].max_line",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].endorsements[].elements[].type",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].endorsements[].elements[].width",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].endorsements[].sub_elements",
+      "type": "array",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "data[].endorsements[].sub_elements_type",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].excerpt",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].extras",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].force_login_when_click_read_more",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].id",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].is_collapsed",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].is_copyable",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].is_labeled",
+      "type": "boolean",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].is_navigator",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].is_normal",
+      "type": "boolean",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].mark_infos",
+      "type": "array",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "data[].navigator_vote",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].question",
+      "type": "object",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].question.author",
+      "type": "object",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].question.author.avatar_url",
+      "type": "string",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].question.author.avatar_url_template",
+      "type": "string",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].question.author.badge",
+      "type": "array",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "data[].question.author.badge_v2",
+      "type": "object",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].question.author.badge_v2.detail_badges",
+      "type": "array",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "data[].question.author.badge_v2.icon",
+      "type": "string",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].question.author.badge_v2.merged_badges",
+      "type": "array",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "data[].question.author.badge_v2.night_icon",
+      "type": "string",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].question.author.badge_v2.title",
+      "type": "string",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].question.author.gender",
+      "type": "number",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].question.author.headline",
+      "type": "string",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].question.author.id",
+      "type": "string",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].question.author.is_advertiser",
+      "type": "boolean",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].question.author.is_org",
+      "type": "boolean",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].question.author.name",
+      "type": "string",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].question.author.type",
+      "type": "string",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].question.author.url",
+      "type": "string",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].question.author.url_token",
+      "type": "string",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].question.author.user_type",
+      "type": "string",
+      "seen_in": [
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].question.created",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].question.id",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].question.question_type",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].question.title",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].question.type",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].question.updated_time",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].question.url",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].question.visit_count",
+      "type": "number",
+      "seen_in": [
+        "proj"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].reaction",
+      "type": "object",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].reaction.relation",
+      "type": "object",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].reaction.relation.faved",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].reaction.relation.liked",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].reaction.statistics",
+      "type": "object",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].reaction.statistics.favorites",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].reaction.statistics.like_count",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].relationship",
+      "type": "object",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].relationship.is_author",
+      "type": "boolean",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].relationship.is_authorized",
+      "type": "boolean",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].relationship.is_nothelp",
+      "type": "boolean",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].relationship.is_thanked",
+      "type": "boolean",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].relationship.voting",
+      "type": "number",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].reshipment_settings",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].review_info",
+      "type": "object",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].review_info.is_reviewing",
+      "type": "boolean",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].review_info.tips",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].review_info.type",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].reward_info",
+      "type": "object",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].reward_info.can_open_reward",
+      "type": "boolean",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].reward_info.is_rewardable",
+      "type": "boolean",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].reward_info.reward_member_count",
+      "type": "number",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].reward_info.reward_total_money",
+      "type": "number",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].reward_info.tagline",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].same_video_answers",
+      "type": "array",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "data[].suggest_edit",
+      "type": "object",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].suggest_edit.reason",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].suggest_edit.status",
+      "type": "boolean",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "data[].suggest_edit.tip",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].suggest_edit.title",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].suggest_edit.unnormal_details",
+      "type": "object",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "always_empty": true
+    },
+    {
+      "path": "data[].suggest_edit.url",
+      "type": "string",
+      "seen_in": [
+        "proj",
+        "max"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].thumbnail",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].type",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "data[].updated_time",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "data[].url",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "data[].vote_next_step",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "allow_segment_interaction",
+      "type": "number",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "answer_type",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "author",
+      "type": "object",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "author.avatar_url",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "author.avatar_url_template",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "author.badge",
+      "type": "array",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "author.badge_v2",
+      "type": "object",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "author.badge_v2.detail_badges",
+      "type": "array",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "author.badge_v2.icon",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "author.badge_v2.merged_badges",
+      "type": "array",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "author.badge_v2.night_icon",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "author.badge_v2.title",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "author.gender",
+      "type": "number",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "author.headline",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "author.id",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "author.is_advertiser",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "author.is_org",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "author.is_privacy",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "author.name",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "author.type",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "author.url",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "author.url_token",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "author.user_type",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "biz_ext",
+      "type": "object",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "biz_ext.share_guide",
+      "type": "object",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "biz_ext.share_guide.has_positive_bubble",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "biz_ext.share_guide.has_time_bubble",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "biz_ext.share_guide.hit_share_guide_cluster",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "comment_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "content_need_truncated",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "created_time",
+      "type": "number",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "extras",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "force_login_when_click_read_more",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "id",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "is_collapsed",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "is_copyable",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "is_jump_native",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "podcast_audio_enter",
+      "type": "object",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "podcast_audio_enter.action_url",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "~1k"
+    },
+    {
+      "path": "podcast_audio_enter.sub_type",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "podcast_audio_enter.text",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "podcast_audio_enter.text_color",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "podcast_audio_enter.text_size",
+      "type": "number",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "question",
+      "type": "object",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "question.created",
+      "type": "number",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "question.id",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "question.question_type",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "question.relationship",
+      "type": "object",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "always_empty": true
+    },
+    {
+      "path": "question.title",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "question.type",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "question.updated_time",
+      "type": "number",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "question.url",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "reaction",
+      "type": "object",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.image_reactions",
+      "type": "object",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true,
+      "always_empty": true
+    },
+    {
+      "path": "reaction.relation",
+      "type": "object",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.relation.current_user_is_navigator",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.relation.faved",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.relation.following",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.relation.is_author",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.relation.is_navigator_vote",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.relation.liked",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.relation.subcribed",
+      "type": "boolean",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.relation.vote",
+      "type": "string",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "reaction.relation.vote_next_step",
+      "type": "string",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true,
+      "str_len": "≤10"
+    },
+    {
+      "path": "reaction.statistics",
+      "type": "object",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.applaud_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.bullet_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.comment_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.down_vote_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.favorites",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.interest_play_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.like_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.plaincontent_like_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.plaincontent_vote_up_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.play_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.pv_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.question_answer_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.question_follower_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.republishers",
+      "type": "array",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "reaction.statistics.share_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.subscribe_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "reaction.statistics.up_vote_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "relationship",
+      "type": "object",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "relationship.upvoted_followees",
+      "type": "array",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "elem_types": [],
+      "always_empty": true
+    },
+    {
+      "path": "thanks_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "type",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "≤10"
+    },
+    {
+      "path": "updated_time",
+      "type": "number",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false
+    },
+    {
+      "path": "url",
+      "type": "string",
+      "seen_in": [
+        "detail_inc",
+        "detail_basic"
+      ],
+      "include_required": false,
+      "str_len": "~100"
+    },
+    {
+      "path": "visit_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    },
+    {
+      "path": "voteup_count",
+      "type": "number",
+      "seen_in": [
+        "detail_inc"
+      ],
+      "include_required": true
+    }
+  ],
+  "include_requested": {
+    "proj": [
+      "data[].is_normal",
+      "data[].admin_closed_comment",
+      "data[].reward_info",
+      "data[].is_collapsed",
+      "data[].annotation_action",
+      "data[].annotation_detail",
+      "data[].collapse_reason",
+      "data[].collapsed_by",
+      "data[].suggest_edit",
+      "data[].comment_count",
+      "data[].can_comment",
+      "data[].content",
+      "data[].voteup_count",
+      "data[].reshipment_settings",
+      "data[].comment_permission",
+      "data[].mark_infos",
+      "data[].created_time",
+      "data[].updated_time",
+      "data[].review_info",
+      "data[].question",
+      "data[].excerpt",
+      "data[].is_labeled",
+      "data[].label_info",
+      "data[].relationship.is_authorized",
+      "data[].voting",
+      "data[].is_author",
+      "data[].is_thanked",
+      "data[].is_nothelp",
+      "data[].is_recognized",
+      "data[].visit_count",
+      "data[].favorite_count",
+      "data[].author.badge[?(type=best_answerer)].topics"
+    ],
+    "max": [
+      "data[].voteup_count",
+      "data[].comment_count",
+      "data[].visit_count",
+      "data[].favorite_count",
+      "data[].thanks_count",
+      "data[].is_normal",
+      "data[].admin_closed_comment",
+      "data[].reward_info",
+      "data[].is_collapsed",
+      "data[].annotation_action",
+      "data[].annotation_detail",
+      "data[].collapse_reason",
+      "data[].collapsed_by",
+      "data[].suggest_edit",
+      "data[].content",
+      "data[].can_comment",
+      "data[].reshipment_settings",
+      "data[].comment_permission",
+      "data[].mark_infos",
+      "data[].created_time",
+      "data[].updated_time",
+      "data[].review_info",
+      "data[].question",
+      "data[].excerpt",
+      "data[].is_labeled",
+      "data[].label_info",
+      "data[].relationship.is_authorized",
+      "data[].voting",
+      "data[].is_author",
+      "data[].is_thanked",
+      "data[].is_nothelp",
+      "data[].is_recognized",
+      "data[].author.badge",
+      "data[].author.headline",
+      "data[].excerpt_title",
+      "data[].thumbnail",
+      "data[].extras",
+      "data[].answer_type",
+      "data[].is_copyable",
+      "data[].content_need_truncated",
+      "data[].reaction.statistics",
+      "data[].paid_info",
+      "data[].endorsements",
+      "data[].author.badge[?(type=best_answerer)].topics"
+    ],
+    "detail_inc": [
+      "voteup_count",
+      "comment_count",
+      "visit_count",
+      "favorite_count",
+      "thanks_count",
+      "reaction"
+    ],
+    "per_request_missing": {
+      "basic": [],
+      "proj": [
+        "data[].annotation_detail",
+        "data[].voteup_count",
+        "data[].label_info",
+        "data[].voting",
+        "data[].is_author",
+        "data[].is_thanked",
+        "data[].is_nothelp",
+        "data[].is_recognized",
+        "data[].visit_count",
+        "data[].favorite_count",
+        "data[].author.badge[?(type=best_answerer)].topics"
+      ],
+      "max": [
+        "data[].voteup_count",
+        "data[].visit_count",
+        "data[].favorite_count",
+        "data[].thanks_count",
+        "data[].annotation_detail",
+        "data[].label_info",
+        "data[].voting",
+        "data[].is_author",
+        "data[].is_thanked",
+        "data[].is_nothelp",
+        "data[].is_recognized",
+        "data[].excerpt_title",
+        "data[].paid_info",
+        "data[].author.badge[?(type=best_answerer)].topics"
+      ],
+      "detail_inc": [
+        "favorite_count"
+      ],
+      "detail_basic": []
+    }
+  },
+  "requested_not_returned": [
+    "data[].annotation_detail",
+    "data[].voteup_count",
+    "data[].label_info",
+    "data[].voting",
+    "data[].is_author",
+    "data[].is_thanked",
+    "data[].is_nothelp",
+    "data[].is_recognized",
+    "data[].visit_count",
+    "data[].favorite_count",
+    "data[].author.badge[?(type=best_answerer)].topics",
+    "data[].thanks_count",
+    "data[].excerpt_title",
+    "data[].paid_info",
+    "favorite_count"
+  ],
+  "returned_not_requested": [
+    "data[].force_login_when_click_read_more",
+    "data[].created_time",
+    "data[].is_navigator",
+    "data[].biz_ext",
+    "data[].biz_ext.creation_relationship",
+    "data[].id",
+    "data[].is_copyable",
+    "data[].reaction",
+    "data[].reaction.statistics",
+    "data[].reaction.statistics.like_count",
+    "data[].reaction.statistics.favorites",
+    "data[].reaction.relation",
+    "data[].reaction.relation.faved",
+    "data[].reaction.relation.liked",
+    "data[].is_collapsed",
+    "data[].author",
+    "data[].author.avatar_url_template",
+    "data[].author.badge_v2",
+    "data[].author.badge_v2.icon",
+    "data[].author.badge_v2.detail_badges",
+    "data[].author.badge_v2.night_icon",
+    "data[].author.badge_v2.merged_badges",
+    "data[].author.badge_v2.title",
+    "data[].author.name",
+    "data[].author.headline",
+    "data[].author.gender",
+    "data[].author.user_type",
+    "data[].author.url_token",
+    "data[].author.is_advertiser",
+    "data[].author.avatar_url",
+    "data[].author.is_org",
+    "data[].author.type",
+    "data[].author.url",
+    "data[].author.badge",
+    "data[].author.id",
+    "data[].url",
+    "data[].type",
+    "data[].question",
+    "data[].question.question_type",
+    "data[].question.created",
+    "data[].question.url",
+    "data[].question.title",
+    "data[].question.type",
+    "data[].question.id",
+    "data[].question.updated_time",
+    "data[].updated_time",
+    "data[].extras",
+    "data[].same_video_answers",
+    "data[].content_need_truncated",
+    "data[].answer_type",
+    "data[].vote_next_step",
+    "data[].navigator_vote",
+    "data[].thumbnail",
+    "data[].endorsements",
+    "data[].endorsements[].action_url",
+    "data[].endorsements[].elements",
+    "data[].endorsements[].elements[].image_key",
+    "data[].endorsements[].elements[].image_color",
+    "data[].endorsements[].elements[].image_color.alpha",
+    "data[].endorsements[].elements[].image_color.group",
+    "data[].endorsements[].elements[].height",
+    "data[].endorsements[].elements[].width",
+    "data[].endorsements[].elements[].type",
+    "data[].endorsements[].elements[].font_size",
+    "data[].endorsements[].elements[].max_line",
+    "data[].endorsements[].elements[].content",
+    "data[].endorsements[].elements[].is_bold",
+    "data[].endorsements[].elements[].font_color",
+    "data[].endorsements[].elements[].font_color.alpha",
+    "data[].endorsements[].elements[].font_color.group",
+    "data[].endorsements[].sub_elements",
+    "data[].endorsements[].sub_elements_type",
+    "data[].endorsements[].background_color",
+    "data[].endorsements[].background_color.alpha",
+    "data[].endorsements[].background_color.group",
+    "data[].question.visit_count",
+    "data[].reward_info.reward_member_count",
+    "data[].reward_info.tagline",
+    "data[].reward_info.reward_total_money",
+    "data[].reward_info.can_open_reward",
+    "data[].reward_info.is_rewardable",
+    "data[].suggest_edit.status",
+    "data[].suggest_edit.reason",
+    "data[].suggest_edit.title",
+    "data[].suggest_edit.url",
+    "data[].suggest_edit.unnormal_details",
+    "data[].suggest_edit.tip",
+    "data[].relationship",
+    "data[].relationship.is_author",
+    "data[].relationship.is_thanked",
+    "data[].relationship.is_nothelp",
+    "data[].relationship.voting",
+    "data[].review_info.is_reviewing",
+    "data[].review_info.tips",
+    "data[].review_info.type",
+    "data[].can_comment.status",
+    "data[].can_comment.reason",
+    "data[].question.author",
+    "data[].question.author.avatar_url_template",
+    "data[].question.author.badge",
+    "data[].question.author.badge_v2",
+    "data[].question.author.badge_v2.icon",
+    "data[].question.author.badge_v2.detail_badges",
+    "data[].question.author.badge_v2.night_icon",
+    "data[].question.author.badge_v2.merged_badges",
+    "data[].question.author.badge_v2.title",
+    "data[].question.author.name",
+    "data[].question.author.is_advertiser",
+    "data[].question.author.url",
+    "data[].question.author.gender",
+    "data[].question.author.user_type",
+    "data[].question.author.headline",
+    "data[].question.author.avatar_url",
+    "data[].question.author.is_org",
+    "data[].question.author.type",
+    "data[].question.author.url_token",
+    "data[].question.author.id",
+    "allow_segment_interaction",
+    "answer_type",
+    "author",
+    "author.avatar_url",
+    "author.avatar_url_template",
+    "author.badge",
+    "author.badge_v2",
+    "author.badge_v2.detail_badges",
+    "author.badge_v2.icon",
+    "author.badge_v2.merged_badges",
+    "author.badge_v2.night_icon",
+    "author.badge_v2.title",
+    "author.gender",
+    "author.headline",
+    "author.id",
+    "author.is_advertiser",
+    "author.is_org",
+    "author.is_privacy",
+    "author.name",
+    "author.type",
+    "author.url",
+    "author.url_token",
+    "author.user_type",
+    "biz_ext",
+    "biz_ext.share_guide",
+    "biz_ext.share_guide.has_positive_bubble",
+    "biz_ext.share_guide.has_time_bubble",
+    "biz_ext.share_guide.hit_share_guide_cluster",
+    "content_need_truncated",
+    "created_time",
+    "extras",
+    "force_login_when_click_read_more",
+    "id",
+    "is_collapsed",
+    "is_copyable",
+    "is_jump_native",
+    "podcast_audio_enter",
+    "podcast_audio_enter.action_url",
+    "podcast_audio_enter.sub_type",
+    "podcast_audio_enter.text",
+    "podcast_audio_enter.text_color",
+    "podcast_audio_enter.text_size",
+    "question",
+    "question.created",
+    "question.id",
+    "question.question_type",
+    "question.relationship",
+    "question.title",
+    "question.type",
+    "question.updated_time",
+    "question.url",
+    "reaction.image_reactions",
+    "reaction.relation",
+    "reaction.relation.current_user_is_navigator",
+    "reaction.relation.faved",
+    "reaction.relation.following",
+    "reaction.relation.is_author",
+    "reaction.relation.is_navigator_vote",
+    "reaction.relation.liked",
+    "reaction.relation.subcribed",
+    "reaction.relation.vote",
+    "reaction.relation.vote_next_step",
+    "reaction.statistics",
+    "reaction.statistics.applaud_count",
+    "reaction.statistics.bullet_count",
+    "reaction.statistics.comment_count",
+    "reaction.statistics.down_vote_count",
+    "reaction.statistics.favorites",
+    "reaction.statistics.interest_play_count",
+    "reaction.statistics.like_count",
+    "reaction.statistics.plaincontent_like_count",
+    "reaction.statistics.plaincontent_vote_up_count",
+    "reaction.statistics.play_count",
+    "reaction.statistics.pv_count",
+    "reaction.statistics.question_answer_count",
+    "reaction.statistics.question_follower_count",
+    "reaction.statistics.republishers",
+    "reaction.statistics.share_count",
+    "reaction.statistics.subscribe_count",
+    "reaction.statistics.up_vote_count",
+    "relationship",
+    "relationship.upvoted_followees",
+    "type",
+    "updated_time",
+    "url"
+  ],
+  "reaction_statistics": [
+    "applaud_count",
+    "bullet_count",
+    "comment_count",
+    "down_vote_count",
+    "favorites",
+    "interest_play_count",
+    "like_count",
+    "plaincontent_like_count",
+    "plaincontent_vote_up_count",
+    "play_count",
+    "pv_count",
+    "question_answer_count",
+    "question_follower_count",
+    "republishers",
+    "share_count",
+    "subscribe_count",
+    "up_vote_count"
+  ],
+  "reaction_statistics_detail": [
+    {
+      "key": "applaud_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "bullet_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "comment_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "down_vote_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "favorites",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max",
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "interest_play_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "like_count",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max",
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "plaincontent_like_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "plaincontent_vote_up_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "play_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "pv_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "question_answer_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "question_follower_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "republishers",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "share_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "subscribe_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    },
+    {
+      "key": "up_vote_count",
+      "seen_in": [
+        "detail_inc"
+      ]
+    }
+  ],
+  "controversial_six": [
+    {
+      "path": "data[].voteup_count",
+      "seen_in_list": [],
+      "list_default_returned": false,
+      "returned_with_include": false,
+      "conclusion": "never_returned",
+      "type": null
+    },
+    {
+      "path": "data[].favorite_count",
+      "seen_in_list": [],
+      "list_default_returned": false,
+      "returned_with_include": false,
+      "conclusion": "never_returned",
+      "type": null
+    },
+    {
+      "path": "data[].visit_count",
+      "seen_in_list": [],
+      "list_default_returned": false,
+      "returned_with_include": false,
+      "conclusion": "never_returned",
+      "type": null
+    },
+    {
+      "path": "data[].thanks_count",
+      "seen_in_list": [],
+      "list_default_returned": false,
+      "returned_with_include": false,
+      "conclusion": "never_returned",
+      "type": null
+    },
+    {
+      "path": "data[].comment_count",
+      "seen_in_list": [
+        "proj",
+        "max"
+      ],
+      "list_default_returned": false,
+      "returned_with_include": true,
+      "conclusion": "include_required",
+      "type": "number"
+    },
+    {
+      "path": "data[].content",
+      "seen_in_list": [
+        "proj",
+        "max"
+      ],
+      "list_default_returned": false,
+      "returned_with_include": true,
+      "conclusion": "include_required",
+      "type": "string"
+    }
+  ],
+  "include_key_diffs": {
+    "proj_over_basic": [
+      "admin_closed_comment",
+      "annotation_action",
+      "can_comment",
+      "collapse_reason",
+      "collapsed_by",
+      "comment_count",
+      "comment_permission",
+      "content",
+      "excerpt",
+      "is_labeled",
+      "is_normal",
+      "mark_infos",
+      "relationship",
+      "reshipment_settings",
+      "review_info",
+      "reward_info",
+      "suggest_edit"
+    ],
+    "basic_not_in_proj": [],
+    "max_over_basic": [
+      "admin_closed_comment",
+      "annotation_action",
+      "can_comment",
+      "collapse_reason",
+      "collapsed_by",
+      "comment_count",
+      "comment_permission",
+      "content",
+      "excerpt",
+      "is_labeled",
+      "is_normal",
+      "mark_infos",
+      "relationship",
+      "reshipment_settings",
+      "review_info",
+      "reward_info",
+      "suggest_edit"
+    ],
+    "max_over_proj": [],
+    "proj_not_in_max": []
+  },
+  "paging_fields": [
+    {
+      "path": "paging.is_end",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ]
+    },
+    {
+      "path": "paging.totals",
+      "type": "number",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ]
+    },
+    {
+      "path": "paging.previous",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ]
+    },
+    {
+      "path": "paging.is_start",
+      "type": "boolean",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ]
+    },
+    {
+      "path": "paging.next",
+      "type": "string",
+      "seen_in": [
+        "basic",
+        "proj",
+        "max"
+      ]
+    }
+  ],
+  "notes": [
+    "本次为真机实测（统一请求器 playwright+cookie，5 请求全部 200，无 403/40353/40362；wait=3200ms；page_fallback 关闭，请求数=job 数=5，未超 6 次上限）。",
+    "D/E（/answers/{id}）响应根层就是回答对象，无 data 包裹；fields 中不带 data[] 前缀的路径即 detail 根层字段。",
+    "列表 A(basic) 默认就带 reaction/thumbnail/extras/biz_ext/answer_type/is_copyable/content_need_truncated 等（无 include 的免费字段），C 里再请求这些属重复请求。",
+    "data[].author.badge 恒为空数组：badge 选择器 author.badge[?(type=best_answerer)].topics 在 proj/max 都请求了，仍无任何 topics 可返回（✗）。",
+    "列表 include 被服务器忽略的计数项：voteup_count/visit_count/favorite_count/thanks_count（proj、max 两次请求均未返回）；真实计数只能走 data[].reaction.statistics。",
+    "detail(D detail_inc) 与列表不同：voteup_count/comment_count/visit_count/thanks_count/reaction 都返回，唯独 favorite_count 请求了也不返回；E(detail_basic) 完全没有 reaction 键（非 null）。",
+    "data[].comment_count、data[].content 在 answers 列表必须 include 才返回；列表 content 为截断正文（两条回答长度均仅 ~100 字符量级），basic 默认无 content。",
+    "data[].excerpt 列表默认不返回，include 后返回（include_required=true）；question/author/created_time/updated_time/is_collapsed 等默认返回。",
+    "data[].reaction 默认返回（basic 即有），其 statistics 仅 like_count、favorites 两键，无需 include；detail 端点 reaction.statistics 多达 17 键（含 up_vote_count/down_vote_count/applaud_count/share_count/comment_count 等），完整清单见 reaction_statistics_detail。",
+    "extras 在列表与详情中都是字符串（非对象）；same_video_answers/annotation_action/mark_infos 为恒空数组；biz_ext 为对象默认返回。",
+    "字符串长度为量级标记（≤10/~100/~1k/~10k/~100k），未记录任何具体值。"
+  ]
+}

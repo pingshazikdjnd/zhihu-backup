@@ -1,4 +1,4 @@
-import { db } from "../db.js";
+import { db, FAV_JOIN_SQL } from "../db.js";
 
 /**
  * 按知乎「问题」维度聚合用户赞同/收藏过的回答。
@@ -8,8 +8,6 @@ import { db } from "../db.js";
  * 一条回答可能同时被赞同和收藏、也可能躺在多个收藏夹——收藏侧先 GROUP BY content_pk
  * 去重再 JOIN，避免行数膨胀把 count 放大。
  */
-
-const FAV_JOIN = `(SELECT content_pk, MAX(first_seen_at) AS fav_added_at FROM collection_items WHERE is_removed = 0 GROUP BY content_pk)`;
 
 export async function listQuestions(params?: { page?: number; q?: string }) {
   const parsedPage = Number(params?.page ?? 1);
@@ -28,10 +26,10 @@ export async function listQuestions(params?: { page?: number; q?: string }) {
       SELECT c.question_id
       FROM contents c
       LEFT JOIN upvotes u ON u.content_pk = c.pk
-      LEFT JOIN ${FAV_JOIN} ci ON ci.content_pk = c.pk
+      ${FAV_JOIN_SQL}
       WHERE c.source_type = 'answer'
         AND c.question_id IS NOT NULL AND c.question_id != ''
-        AND (u.content_pk IS NOT NULL OR ci.content_pk IS NOT NULL)
+        AND (u.content_pk IS NOT NULL OR fav.content_pk IS NOT NULL)
         ${qClause}
       GROUP BY c.question_id
     )
@@ -45,14 +43,14 @@ export async function listQuestions(params?: { page?: number; q?: string }) {
       COALESCE(MAX(NULLIF(c.question_title, '')), MAX(NULLIF(c.title, '')), c.question_id) AS question_title,
       count(*) AS answer_count,
       sum(CASE WHEN u.content_pk IS NOT NULL THEN 1 ELSE 0 END) AS upvoted_count,
-      sum(CASE WHEN ci.content_pk IS NOT NULL THEN 1 ELSE 0 END) AS faved_count,
-      max(COALESCE(u.upvote_time, ci.fav_added_at, c.last_seen_at)) AS latest_time
+      sum(CASE WHEN fav.content_pk IS NOT NULL THEN 1 ELSE 0 END) AS faved_count,
+      max(COALESCE(u.upvote_time, fav.fav_added_at, c.last_seen_at)) AS latest_time
     FROM contents c
     LEFT JOIN upvotes u ON u.content_pk = c.pk
-    LEFT JOIN ${FAV_JOIN} ci ON ci.content_pk = c.pk
+    ${FAV_JOIN_SQL}
     WHERE c.source_type = 'answer'
       AND c.question_id IS NOT NULL AND c.question_id != ''
-      AND (u.content_pk IS NOT NULL OR ci.content_pk IS NOT NULL)
+      AND (u.content_pk IS NOT NULL OR fav.content_pk IS NOT NULL)
       ${qClause}
     GROUP BY c.question_id
     ORDER BY answer_count DESC, latest_time DESC
@@ -70,15 +68,15 @@ export async function getQuestionAnswers(questionId: string) {
            c.is_deleted, c.is_collapsed,
            c.updated_time, c.last_seen_at,
            u.upvote_time,
-           ci.fav_added_at,
-           CASE WHEN ci.content_pk IS NOT NULL THEN 1 ELSE 0 END AS in_favorites
+           fav.fav_added_at,
+           CASE WHEN fav.content_pk IS NOT NULL THEN 1 ELSE 0 END AS in_favorites
     FROM contents c
     LEFT JOIN upvotes u ON u.content_pk = c.pk
-    LEFT JOIN ${FAV_JOIN} ci ON ci.content_pk = c.pk
+    ${FAV_JOIN_SQL}
     WHERE c.question_id = ?
       AND c.source_type = 'answer'
-      AND (u.content_pk IS NOT NULL OR ci.content_pk IS NOT NULL)
-    ORDER BY COALESCE(u.upvote_time, ci.fav_added_at, c.last_seen_at) DESC
+      AND (u.content_pk IS NOT NULL OR fav.content_pk IS NOT NULL)
+    ORDER BY COALESCE(u.upvote_time, fav.fav_added_at, c.last_seen_at) DESC
   `).all(questionId);
 
   if (answers.length === 0) {

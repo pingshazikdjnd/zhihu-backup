@@ -12,7 +12,8 @@ import { questionRoutes } from "./routes/questions.js";
 import { followingRoutes } from "./routes/following.js";
 import { recommendRoutes } from "./routes/recommend.js";
 import { dbContext } from "./db.js";
-import { triggerApifyRun } from "./services/apify.js";
+import { getActiveWriteToken } from "./routes/auth.js";
+import { runAndRecord } from "./routes/sync.js";
 import type { Bindings } from "./types.js";
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -53,6 +54,23 @@ app.use("*", async (c, next) => {
   return dbContext.run(c.env.DB, next);
 });
 
+// 可选读接口门禁：READ_AUTH_REQUIRED="true" 时 /api/* 也要求 Bearer。
+// 默认不开启，避免阻断现有前端；健康检查与登录状态页始终允许匿名访问。
+app.use("/api/*", async (c, next) => {
+  if (c.env.READ_AUTH_REQUIRED !== "true") return next();
+
+  const path = new URL(c.req.url).pathname;
+  if (path === "/api/health" || path === "/api/auth/zhihu-status") return next();
+
+  const auth = c.req.header("authorization") || "";
+  if (auth.startsWith("Bearer ")) {
+    if (c.env.API_SECRET && auth === `Bearer ${c.env.API_SECRET}`) return next();
+    const writeToken = await getActiveWriteToken(c);
+    if (writeToken && auth === `Bearer ${writeToken}`) return next();
+  }
+  return c.json({ error: "Read authentication required", needToken: true }, 401);
+});
+
 app.get("/api/health", c => c.json({ ok: true }));
 
 app.route("/ingest", ingestRoutes);
@@ -73,8 +91,13 @@ app.route("/api/recommend", recommendRoutes);
 // 日常定时用快速模式（isFast=true：连续 20 条无更新即停，几分钟内完成）；
 // 全量模式（从头翻完所有历史）数据量大的账号会跑几小时，只在手动触发时用。
 async function scheduledHandler(_event: any, env: Bindings, _ctx: any) {
-  const res = await triggerApifyRun(env, "all", true);
-  console.log("cron sync:", res.ok ? `apify run ${res.runId}` : `failed: ${res.error}`);
+  // 走与手动触发同一个 runAndRecord：同样抢分布式锁、同样记录 sync_runs，
+  // 不再绕过锁直接起 Actor run（cron 与手动重叠会并发双跑）。
+  const res = await dbContext.run(env.DB, () => runAndRecord(env, "cron", "all", true));
+  console.log(
+    "cron sync:",
+    res.ok ? `apify run ${res.runId}` : `failed: ${res.error}`
+  );
 }
 
 export default {

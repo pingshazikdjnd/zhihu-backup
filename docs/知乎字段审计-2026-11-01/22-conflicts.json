@@ -1,0 +1,155 @@
+{
+  "meta": {
+    "generated": "2026-11-01",
+    "purpose": "FIELD_AUDIT.md（2026-10-28 旧审计）与 2026-11-01 真机实测产物逐条对账",
+    "inputs": [
+      "G:/gemini zhihu/FIELD_AUDIT.md（只读）",
+      "01-endpoints-include.json",
+      "10-live-answers.json/.md",
+      "11-live-comments.json/.md",
+      "12-live-articles.json/.md",
+      "13-live-collections.json/.md",
+      "14-live-members.json/.md",
+      "15-live-pins-questions.json/.md",
+      "20-missing-audit.json/.md",
+      "原始响应 out-11-*.json / out-12-answers-*.json / out-13-*.json / out-15-a.json / tmp/out-14-*.json / Temp/zhihu-probe-12/out-a..e.json"
+    ],
+    "method": "旧文档行号经 grep -n 定位核实；include 键数用脚本对 01-endpoints-include.json 逐键重算；体积用原始响应逐条 json.dumps(utf-8 紧凑序列化) 实测字节。G:/gemini zhihu 未做任何修改。"
+  },
+  "conflicts": [
+    {
+      "id": "C1",
+      "topic": "include 键数量：旧审计『40 个键、26 生效、6 白请求』 vs 01 盘点 32 项",
+      "old": {
+        "claim": "我们现在的 include 有 40 个键，其中 26 个生效、6 个纯浪费；同文白请求表列出 7 个字段",
+        "source": "FIELD_AUDIT.md:19（白请求表 FIELD_AUDIT.md:9-17）"
+      },
+      "new": {
+        "claim": "01 按端点盘点：answers_list_mine=32（31 标量+1 badge 选择器）、collections_items=32、answer_detail=4、members_followees=5、member_answers=13、member_articles=7，合计 93 项（含端点间重复）；全部端点字段名去重并集=40",
+        "source": "01-endpoints-include.json（include_fields 逐键重算；notes 第 13 条自认『40 为另一种计数口径』）"
+      },
+      "verdict": "both_partly",
+      "evidence": "两个数字各自口径都对：『40』=全仓 include 字段名去重并集（answers 32 项 + followees 独有 5 项 + member_articles 独有 3 项），脚本重算精确等于 40；『32』=单个 answers/collections include 串的项数。只在一方出现的键（相对 answers 32 项）：并集多出 8 项 = answer_count、articles_count、follower_count、headline、avatar_url（followees）+ created、updated、title（member_articles）；反向 answers 32 项无一不在并集中。真正错的是旧审计的生效拆分：proj include 32 项实测（10-live-answers.json）21 项按请求路径返回、11 项未返回（annotation_detail、voteup_count、label_info、voting、is_author、is_thanked、is_nothelp、is_recognized、visit_count、favorite_count、badge[].topics），其中 4 项（voting/is_author/is_thanked/is_nothelp）位移到 relationship.* 返回，严格『响应任何位置都没有』=7 项。旧审计『26 生效、6 白请求』与实测（21/11 或 25/7）不符，且 26+6=32 与其自身『40』矛盾、其白请求表 7 行与『6』矛盾——该表 7 行内容反而与实测严格白请求 7 项完全吻合。"
+    },
+    {
+      "id": "C2",
+      "topic": "answers 列表 voteup_count/favorite_count/visit_count：『请求了但不返回』是否唯一真相（01 标【双】：include 了且代码读了）",
+      "old": {
+        "claim": "答案列表不返回 voteup_count/favorite_count/visit_count；visit_count 疑似只在 question.visit_count；靠 reaction.statistics 兜底结果正确，但 item.visit_count 不存在导致回答浏览量恒 0",
+        "source": "FIELD_AUDIT.md:14,16,17,25,26,27"
+      },
+      "new": {
+        "claim": "proj（项目 include）与 max（全量 44 项探测）两次请求下 data[].voteup_count / favorite_count / visit_count / thanks_count 全部 ✗（conclusion=never_returned）；answer 详情端点（detail_inc，include 6 项）返回 voteup_count/comment_count/visit_count/thanks_count/reaction，唯独 favorite_count include 也不返回；question.visit_count 在 proj 列表内嵌 question 中返回",
+        "source": "10-live-answers.json#controversial_six + #requests.detail_inc + #requested_not_returned"
+      },
+      "verdict": "agree",
+      "evidence": "对列表端点，『请求了但不返回』就是唯一真相：basic（无 include）/proj/max 三组 21 个顶层键位均无这三个字段，include 显式请求也不给——01 把它们标【双】只说明『include 了且代码读了』，不说明接口会给；代码读取路径 sync.ts:98-100/main.ts:318-320 因此恒走兜底。旧审计两点补充被实测坐实并细化：①『疑似只在 question.visit_count』确认为真，但仅限 answers 列表 include question 生效时（basic 无、proj/max 有）；answer 详情内嵌 question、activities 内嵌 question、collections 内嵌 question 都没有 visit_count。②『回答浏览量恒 0』需限定为列表路径：answer 详情 include 实测返回 visit_count（10 号 detail_inc），collector 的 sync.ts:104 逐条详情路径能拿真值，恒 0 只发生在已删详情请求的 main.ts 路径（01 notes 第 4 条）。新增：thanks_count 列表同样 include 也不返回（旧审计未列），favorite_count 连详情 include 都不返回，reaction.statistics.favorites 兜底是唯一收藏数来源且实测三组都有值。"
+    },
+    {
+      "id": "C3",
+      "topic": "articles 列表 voteup_count/favorite_count/visit_count：『默认不返回，include 也未被验证生效，赞数恒 0』哪半句对",
+      "old": {
+        "claim": "articles 列表 item.voteup_count/favorite_count/visit_count 默认不返回，include 也未被验证生效 → 文章赞数/收藏/浏览恒 0，『赞≥100 才进 AI 候选』门槛永远不成立，文章自动抢救实际失效",
+        "source": "FIELD_AUDIT.md:28（修复建议同 premise：FIELD_AUDIT.md:98）"
+      },
+      "new": {
+        "claim": "项目 include（content,voteup_count,comment_count,created,updated,title,excerpt）实测生效：B 组 24 键 = 默认 21 键 + content/voteup_count/comment_count，voteup_count=4（同条 reaction.statistics.like_count=0）；全量 include 再加 is_labeled。favorite_count/visit_count/thanks_count/column/topics 被 include 静默忽略；zhuanlan 详情顶层也无 favorite_count/visit_count/thanks_count，实际键为 favlists_count=1/tipjarors_count=0/statistics.up_vote_count=4/statistics.favorites=1",
+        "source": "12-live-articles.json#stats_five + #requests（raw：Temp/zhihu-probe-12/out-b.json、out-d.json）"
+      },
+      "verdict": "both_partly",
+      "evidence": "对的一半：『默认不返回』三个字段全部成立（A 组 21 键无 voteup_count/comment_count/content），favorite_count/visit_count 对 include 免疫也成立（C 组全量 include 被忽略），且比旧审计更糟——文章 visit_count/thanks_count 任何端点都拿不到。错的一半：『include 也未被验证生效』对 voteup_count/comment_count 不成立——项目 include 实测生效并返回真值（voteup_count=4，而 like_count=0 证明该统计键对文章是伪值），因此『文章赞数恒 0、AI 候选门槛永远不成立、文章自动抢救实际失效』的后果判定被推翻：member_articles 的 include 本来就含 voteup_count（01-endpoints-include.json#member_articles.include_raw），赞数门槛当前可正常工作。连带 FIELD_AUDIT.md:98 修复建议 1 的前提失效；若仍要兜底，正确键是详情的 statistics.up_vote_count 而非 like_count（列表）——旧建议若照抄反而写入 0。"
+    },
+    {
+      "id": "C4",
+      "topic": "collections 条目：『无 favorite_count，有 thanks_count，收藏数实为感谢数』兜底逻辑是否还成立",
+      "old": {
+        "claim": "collections 条目无 favorite_count、有 thanks_count，favorite_count→thanks_count 兜底导致收藏夹的收藏数实际是感谢数",
+        "source": "FIELD_AUDIT.md:29（修复建议：FIELD_AUDIT.md:100）"
+      },
+      "new": {
+        "claim": "collections/items 的 content(answer 27 键) 实测：voteup_count/comment_count/thanks_count 默认下发（样本 1012/75/46），favorite_count ❌（include 显式请求也不下发）、visit_count ❌、reaction ❌——该接口根本没有 reaction 对象；且端点整体忽略 include（B 无 include / C 项目 32 项 include / D 探测 include 三组字节级一致）",
+        "source": "13-live-collections.json（.md §2/§4；raw：out-13-b/c/d.json 三组逐键 diff 为空）"
+      },
+      "verdict": "agree",
+      "evidence": "争议事实逐字复现：无 favorite_count（连 include 都被端点忽略）、有 thanks_count（默认 46）→ collector sync.ts:363 的 favorite_count→thanks_count 兜底今天仍会把感谢数当收藏数写入，兜底逻辑成立且比旧审计描述的更顽固（include 都救不了）。但旧审计的修复建议（FIELD_AUDIT.md:100『改为 reaction.statistics.favorites』）被新数据推翻：collections/items 无 reaction 对象，statistics.favorites 在此端点不存在，照改结果恒 0；main.ts:785 的 favorite_count ?? reaction.statistics.favorites ?? 0 链在此端点实测两头全空。结论：该端点根本拿不到条目级收藏数，收藏夹级统计（item_count=921/view_count=16/updated_time）只能走 /collections/{id} 详情（实测 200 可用）；另发现外层 item 仅 {content, created} 2 键、内嵌 question 无 visit_count。"
+    },
+    {
+      "id": "C5",
+      "topic": "followees 计数字段是否必须带 include",
+      "old": {
+        "claim": "followees 的 answer_count/articles_count/follower_count 必须带 include 才有；当前 include 正确，若被删则专栏文章全部不抓",
+        "source": "FIELD_AUDIT.md:30"
+      },
+      "new": {
+        "claim": "followees 带 include 列表项 30 键：follower_count(number)+follower_count_text/_num/_unit、answer_count(210)、articles_count 实测返回；member 详情无 include 默认 26 键中零个计数字段；followers 无 include 列表项 20 键同样无任何计数字段；paging.totals=102 与 following_count 同口径",
+        "source": "14-live-members.json（.md §1.1/§2.2/§2.3；raw：tmp/out-14-C.json follower_count_num='4316'）"
+      },
+      "verdict": "agree",
+      "evidence": "双向对照坐实『必须带 include』：带 include 的 followees 三计数全返回真值（answer_count=210、follower_count_num='4316'），不带 include 的 followers 列表和 member 详情默认面 0 个计数字段——若 include 被删，计数字段确实全部消失，旧审计的后果预警成立。新增两点：①include 请求的 description 在 followees 列表被忽略（include 盲区）；②follower_count_text/_num/_unit 未请求也赠送返回（旧审计把它归入白拿清单是对的）。"
+    },
+    {
+      "id": "C6",
+      "topic": "『给了但我们没要（可白拿）』10 项清单逐项核对",
+      "old": {
+        "claim": "reaction.statistics.favorites、question.visit_count、author.badge_v2、can_comment、review_info、extras、thumbnail、文章 excerpt_title/image_url、评论 can_recommend/censor_status、关注 follower_count_num/text 全是接口给了但项目没要的可白拿字段",
+        "source": "FIELD_AUDIT.md:34"
+      },
+      "new": {
+        "claim": "10 项全部在真机数据中实测存在，但生效端点需精确化：见 evidence 逐项",
+        "source": "10/11/12/13/14 各 live json + out-*原始响应"
+      },
+      "verdict": "agree",
+      "evidence": "逐项判定：①reaction.statistics.favorites：answers 列表默认有（basic 即有，10 号 §5）、articles 列表默认有（favorites=1）、answer 详情有；但 collections/items 没有（13 号）——『唯一真实收藏数』仅对 answers/articles 上下文成立。②question.visit_count：仅 answers 列表 include question 生效时有（proj ✓ basic ✗）；answer 详情/activities/collections 内嵌 question 均无。③author.badge_v2：answers 列表默认返回（author 内 5 键，badge 恒空数组）；member/activities actor 也有；评论 author.member 只有 badge 无 badge_v2。④can_comment：answers 列表需 include 才有（proj/max 返回 can_comment 对象）；root_comments 包装层 comment_status.can_comment 默认返回。⑤review_info：answers 列表 include 生效返回（is_reviewing/tips/type）。⑥extras：answers 列表与详情默认返回。⑦thumbnail：answers 列表默认返回（空串）；collections answer content 也有（thumbnail+thumbnail_info）。⑧文章 excerpt_title/image_url：articles 列表默认键、collections article content 也有；注意 answers 列表 include excerpt_title 不返回（max 探测 ✗），该字段不适用于答案。⑨评论 can_recommend（根/子评论都有，boolean）、censor_status（number，仅根评论）实测存在。⑩follower_count_num/text：followees 列表未请求即赠送（'4316' string），member+include 也有。结论：清单本身全对，无一项落空；修正仅在于各字段的端点适用范围（②①④⑧各有限定）。"
+    },
+    {
+      "id": "C7",
+      "topic": "单条 JSON 体积结论（collections 4,649 / activities 8,348 / comments 1,587 / answers 2,242）能否复现",
+      "old": {
+        "claim": "collections/items 单条 4,649 字节（content 4,599，98.9%）；activities(v3) 8,348（target 7,371，88.3%）；comments 1,587（author 774，48.8%）；answers（带 include）2,242（author 566，25.2%）",
+        "source": "FIELD_AUDIT.md:40,41,42,43"
+      },
+      "new": {
+        "claim": "对 2026-11-01 原始响应逐条实测（紧凑 utf-8 序列化）：answers proj 首条=2,242 字节、author=566（25.2%）；collections 首条=4,650、content=4,600（98.9%，20 条样本 3,523–23,031）；activities 7 条 4,760–11,416，首条 target 占比 89.0%（7,914/8,891）；根评论 5 条 1,305–1,880，author 占比 32–36%",
+        "source": "out-12-answers-p1/p2.json、out-13-b/d.json、out-15-a.json、out-11-batch4.json（脚本实测）"
+      },
+      "verdict": "agree",
+      "evidence": "四组全部可复现：answers 2,242/566 与旧审计逐字节相同（同一条样本）；collections 4,650 vs 4,649 仅差 1 字节（同条样本，content 占比 98.9% 一致），且旧值落在 20 条新样本区间内；activities 旧值 8,348 落在新样本 4,760–11,416 区间，target 占比 88.3% vs 89.0% 吻合；comments 旧值 1,587 落在新样本 1,305–1,880 区间。唯一不可复现为常数的是 comments 的 author 占比（旧 48.8% vs 新 32–36%，作者卡片大小随样本浮动）。体积结论整体成立：content/target/author 确为各端点体积大户。"
+    }
+  ],
+  "still_valid_in_old": [
+    "FIELD_AUDIT.md:14,16,17,25-27 — answers 列表不返回 voteup_count/favorite_count/visit_count（include 也拿不到），列表路径『请求了但不返回』仍是唯一真相（10 号 proj/max 实测 never_returned）",
+    "FIELD_AUDIT.md:14 — answers/articles 上下文中 reaction.statistics.favorites 是唯一真实收藏数（basic 默认即有；detail 也有；favorite_count 连详情 include 都不返回）",
+    "FIELD_AUDIT.md:16 — answers 列表靠 reaction.statistics.like_count 兜底赞同数结果正确（列表 like_count 有值）",
+    "FIELD_AUDIT.md:17 — visit_count『疑似只在 question.visit_count』确认为真，但仅限 answers 列表 include question 生效时",
+    "FIELD_AUDIT.md:19 — 『40 个键』在『全仓 include 字段名去重并集』口径下精确复现（脚本重算=40）",
+    "FIELD_AUDIT.md:29 — collections 条目无 favorite_count、有 thanks_count，收藏数实为感谢数的兜底行为今天仍成立（且该端点连 include 都被忽略、无 reaction 对象，更无从救）",
+    "FIELD_AUDIT.md:30 — followees 计数字段必须带 include（无 include 的 followers/member 默认面 0 个计数字段），include 被删则抓取链路断",
+    "FIELD_AUDIT.md:34 — 『可白拿』清单 10 项全部实测存在（仅端点范围需按 C6 修正）",
+    "FIELD_AUDIT.md:40-43 — 四组单条体积数字全部可复现（answers 逐字节相同、collections 差 1 字节、activities/comments 落在新样本区间）",
+    "FIELD_AUDIT.md:99 — 『从 answers include 删掉 visit_count』建议仍正确（该键是白请求）；question.visit_count 确为可行的列表级替代（更优解是 answer 详情 include 的 visit_count）"
+  ],
+  "obsolete_in_old": [
+    "FIELD_AUDIT.md:19 — 『26 个生效、6 个纯浪费』拆分被实测推翻：实际 21 项按请求路径返回 + 11 项未返回（位移 relationship.* 后严格白请求 7 项）；且 26+6=32 与自身『40』矛盾、白请求表 7 行与『6』矛盾",
+    "FIELD_AUDIT.md:28 — 『include 也未被验证生效』对 voteup_count/comment_count 不成立：项目 include 实测生效并返回真值（voteup_count=4）",
+    "FIELD_AUDIT.md:28 — 后果判定『文章赞数恒 0 → AI 候选门槛永远不成立 → 文章自动抢救实际失效』被推翻：member_articles include 含 voteup_count 且生效，赞数门槛当前可工作",
+    "FIELD_AUDIT.md:98 — 修复建议 1 的前提失效；其建议的兜底键 reaction.statistics.like_count 对文章实测为 0（伪值），正确兜底是详情 statistics.up_vote_count",
+    "FIELD_AUDIT.md:100 — 修复建议 3『改为 reaction.statistics.favorites』在 collections/items 端点被推翻：该端点无 reaction 对象，照改恒 0；条目级收藏数在此端点任何字段都拿不到，需改走 /collections/{id} 详情",
+    "FIELD_AUDIT.md:14 — 『真实值在 reaction.statistics.favorites』须限定 answers/articles 上下文：collections/items 无 reaction，statistics.favorites 在此不存在",
+    "FIELD_AUDIT.md:25 — 『回答浏览量恒 0』作为系统级结论过时：answer 详情 include 实测返回 visit_count（sync.ts:104 路径可拿真值），恒 0 仅限已删详情请求的 main.ts 列表路径",
+    "FIELD_AUDIT.md:104 — 『6 个字段是白请求』过时：按请求路径实测 11 项、严格口径 7 项；『3 个统计字段恒 0』中的文章赞数部分不再成立（include 可拿）"
+  ],
+  "new_findings_not_in_old": [
+    "answer 详情 include（voteup_count,comment_count,visit_count,favorite_count）实测：前 3 项+thanks_count+reaction 全返回，唯 favorite_count include 也不返回——收藏数全系统只有 reaction.statistics.favorites 一条真路（10-live-answers.json detail_inc）",
+    "collections/items 端点整体忽略 include 参数：无 include / 项目 32 项 include / 探测 include 三组响应字节级一致，项目现有 32 项 include 在此端点全部无效（13-live-collections.json §4）",
+    "collections/items 外层 item 仅 {content, created} 2 键，created 是 ISO8601 字符串；内嵌 question（8 键）无 visit_count；answer/article 混排（19:1）字段面差异大，须按 content.type 分支解析（13 号 §2/§3）",
+    "reaction.statistics 三个伪键（upvote_count/favorite_count/visit_count）在任何真机响应中都不存在——真实键为 up_vote_count（详情）/favorites；浏览量根本不在 statistics 里——代码三处兜底是死代码（20-missing-audit.md §4 第 8-10 条）",
+    "评论接口实测：无 reply_to_comment_id（楼中楼定位只能靠 reply_to_author.member.name）、无 img/image_url/imgUrl（评论图片备份恒空）、赞数字段是 vote_count（无 like_count）、is_top/is_featured 实际叫 top/featured、include 参数被忽略（11-live-comments.md §4/§7）",
+    "文章评论端点 /api/v4/articles/{id}/root_comments 对存在的文章返回 404（HTML）；/api/v4/articles/{id} 与 /api/v4/questions/{id} 均 403/10003 需签名（x-zse-96 类）——文章评论真实端点与 question 直连字段集未知（11 号 §6、15 号 §3）",
+    "v3 activities 的 limit 参数无效（limit=2 实返 7 条）；target.answer 34 键比答案详情端点更全（详情 19 键无 content/voteup_count）；内嵌 question 16 键无 visit_count/updated_time；翻页游标是毫秒时间戳+page_num（15-live-pins-questions.md §1/§2）",
+    "members/{token} 默认 26 键零计数字段；36 项 include 返回 55 键（data[*]. 前缀与裸字段名两种语法等价）；include 盲区：relationship、is_bind_phone 拿不到、description 在 followees 被忽略；follower_count_num/_text/_unit 未请求赠送（14-live-members.md §1/§2）",
+    "me 与 member 是两套字段面：me 独有 uid/columns_count/zvideo_count/editor_info/4 个通知计数；口径陷阱 favorite_count（me，=13 收藏夹数）≠ favorited_count（member include，=18908 被收藏数）（14 号 §3）",
+    "articles favorite_count 顶层任何端点都没有：列表走 statistics.favorites、详情走 favlists_count（两处一致=1）；文章浏览量 visit_count 与感谢数 thanks_count 任何端点都拿不到（详情只有 tipjarors_count）（12 号 §5、20 号 §4 第 12-13 条）",
+    "answers max 探测 include 44 项中 excerpt_title/paid_info 也不返回；answer_type/is_copyable/content_need_truncated/endorsements/navigator_vote/vote_next_step/biz_ext 等默认赠送字段共 17 项可白拿（10-live-answers.json returned_not_requested）",
+    "新产物内部矛盾一处：20-missing-audit.md:158 把 /members/{u}/favlists 与 /collections/{id}/items 列为『零实测端点』，但 13-live-collections 已实测（6 请求全 200）——20 号成文时未纳入 13 号输入（其输入清单仅 10/11/12/14/15/01/03）"
+  ]
+}

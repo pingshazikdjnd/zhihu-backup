@@ -240,13 +240,14 @@ async function upsertCollectionSnapshotInner(input: IngestCollectionSnapshotInpu
     INSERT INTO collection_snapshots (
       collection_id, snapshot_at, item_count, added_count, removed_count
     ) VALUES (?, ?, ?, ?, ?)
-  `).raw(collectionId, now, input.items.length, added, removed));
+  `).raw(collectionId, now, uniqueItems.size, added, removed));
 
   for (let i = 0; i < stmts.length; i += BATCH_SIZE) {
     await db.batch(stmts.slice(i, i + BATCH_SIZE));
   }
 
-  return { added, removed, count: input.items.length };
+  // 计数口径与快路径一致：payload 里重复出现的条目只算一条（uniqueItems）
+  return { added, removed, count: uniqueItems.size };
 }
 
 export async function listCollections() {
@@ -271,7 +272,8 @@ export async function listAllCollectionItems(params?: { page?: number }) {
              WHEN c.content_md IS NOT NULL AND c.content_md != '' THEN SUBSTR(c.content_md, 1, 300) 
              ELSE SUBSTR(c.content_html, 1, 300) 
            END as excerpt, 
-           c.voteup_count, c.comment_count, c.favorite_count, c.visit_count, c.author_url_token, c.pk as content_pk
+           c.voteup_count, c.comment_count, c.favorite_count, c.visit_count, c.author_url_token, c.author_avatar,
+           COALESCE(c.pk, ci.content_pk) as content_pk
     FROM collection_items ci
     LEFT JOIN contents c ON ci.content_pk = c.pk
     WHERE ci.is_removed = 0

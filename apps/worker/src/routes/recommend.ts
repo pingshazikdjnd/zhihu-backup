@@ -5,11 +5,25 @@ import {
   getRecommendFeed,
   getSimilarContents
 } from "../services/recommend.js";
-import type { FollowingEvalItem } from "../services/recommend.js";
-import { isOriginAllowed } from "./auth.js";
+import type { FollowingEvalItem, FollowingSensitivity } from "../services/recommend.js";
+import { getActiveWriteToken, isOriginAllowed } from "./auth.js";
 import type { Bindings } from "../types.js";
 
 export const recommendRoutes = new Hono<{ Bindings: Bindings }>();
+
+// /ai-assess 的凭据判断沿用项目现有口径：API_SECRET 或凭据页写入口令（不引入新密钥）。
+// 正常前端是同源 Pages 代理 POST，浏览器会带 Origin；无 Origin 的脚本必须自带 Bearer 才能用。
+async function hasApiCredential(c: any): Promise<boolean> {
+  const auth = c.req.header("authorization") || "";
+  if (!auth.startsWith("Bearer ")) return false;
+  if (c.env.API_SECRET && auth === `Bearer ${c.env.API_SECRET}`) return true;
+  try {
+    const writeToken = await getActiveWriteToken(c);
+    return Boolean(writeToken) && auth === `Bearer ${writeToken}`;
+  } catch {
+    return false;
+  }
+}
 
 // 进程内轻量速率限制（防止恶意脚本批量遍历 pk 耗尽每日 10,000 Neurons 免费额度）
 let rateWindowStart = 0;
@@ -37,8 +51,19 @@ recommendRoutes.get("/similar/:pk", async c => {
 
 // 调用 Cloudflare Workers AI 对单篇回答进行「和谐风险 + 核心价值」深度鉴定
 recommendRoutes.post("/ai-assess", async c => {
-  if (!isOriginAllowed(c)) {
-    return c.json({ error: "Forbidden origin" }, 403);
+  // 已配置写入口令（含 API_SECRET 兜底）时不再接受「仅 Origin」放行：
+  // 必须携带有效 Bearer（API_SECRET / 写入口令），且带 Origin 时还须命中白名单，
+  // 防止伪造 Origin 的脚本无凭据刷 AI 额度。极端空环境才保留原有 Origin 门禁。
+  const origin = c.req.header("origin");
+  const activeToken = await getActiveWriteToken(c).catch(() => "");
+  let authorized: boolean;
+  if (activeToken) {
+    authorized = (await hasApiCredential(c)) && (!origin || isOriginAllowed(c, true));
+  } else {
+    authorized = Boolean(origin) && isOriginAllowed(c);
+  }
+  if (!authorized) {
+    return c.json({ error: origin ? "Forbidden origin" : "Unauthorized" }, origin ? 403 : 401);
   }
   const now = Date.now();
   if (now - rateWindowStart > 60_000) {
@@ -59,7 +84,10 @@ recommendRoutes.post("/ai-assess", async c => {
 });
 
 const MAX_EVAL_ITEMS = 10;
+// 10 条 ×（sourceId 120 + title/questionTitle/excerpt 各 300）= 10200，12000 只作防御上限；
+// 超出时逐条截断而不是整批 400
 const MAX_EVAL_CHARS = 12000;
+const MAX_EVAL_EXCERPT_CHARS = 300;
 
 function toBoundedString(value: unknown, max: number): string {
   return typeof value === "string" ? value.slice(0, max) : "";
@@ -68,6 +96,32 @@ function toBoundedString(value: unknown, max: number): string {
 function toBoundedNumber(value: unknown): number | undefined {
   const n = Number(value);
   return Number.isFinite(n) ? n : undefined;
+}
+
+function evalItemChars(item: FollowingEvalItem): number {
+  return (
+    item.sourceId.length +
+    (item.title || "").length +
+    (item.questionTitle || "").length +
+    (item.excerpt || "").length
+  );
+}
+
+// 超出总字符上限时从后往前裁剪摘要/问题标题/标题，保证整批仍能处理
+function enforceEvalCharBudget(items: FollowingEvalItem[], max: number): void {
+  let total = items.reduce((sum, item) => sum + evalItemChars(item), 0);
+  if (total <= max) return;
+  for (let i = items.length - 1; i >= 0 && total > max; i--) {
+    const item = items[i];
+    for (const field of ["excerpt", "questionTitle", "title"] as const) {
+      if (total <= max) break;
+      const value = item[field] || "";
+      if (!value) continue;
+      const cut = Math.min(value.length, total - max);
+      item[field] = value.slice(0, value.length - cut);
+      total -= cut;
+    }
+  }
 }
 
 // 关注答主批量「是否值得备份」AI 复核（供 Apify 爬虫回调，必须带 API_SECRET）
@@ -91,13 +145,19 @@ recommendRoutes.post("/evaluate-following", async c => {
   evalWindowCount++;
 
   const body: unknown = await c.req.json().catch(() => null);
-  const rawItems = body && typeof body === "object" ? (body as Record<string, unknown>).items : undefined;
+  const bodyRec = body && typeof body === "object" ? (body as Record<string, unknown>) : null;
+  const rawItems = bodyRec?.items;
   if (!Array.isArray(rawItems)) {
     return c.json({ error: "items must be an array" }, 400);
   }
+  // 旧爬虫不传 sensitivity 时按 standard（阈值 25），保持向后兼容
+  const rawSensitivity = bodyRec?.sensitivity;
+  const sensitivity: FollowingSensitivity =
+    rawSensitivity === "strict" || rawSensitivity === "relaxed" || rawSensitivity === "standard"
+      ? rawSensitivity
+      : "standard";
 
   const items: FollowingEvalItem[] = [];
-  let totalChars = 0;
   for (const raw of rawItems.slice(0, MAX_EVAL_ITEMS)) {
     if (!raw || typeof raw !== "object") continue;
     const rec = raw as Record<string, unknown>;
@@ -107,8 +167,7 @@ recommendRoutes.post("/evaluate-following", async c => {
       rec.sourceType === "article" || rec.sourceType === "pin" ? rec.sourceType : "answer";
     const title = toBoundedString(rec.title, 300);
     const questionTitle = toBoundedString(rec.questionTitle, 300);
-    const excerpt = toBoundedString(rec.excerpt, 1200);
-    totalChars += sourceId.length + title.length + questionTitle.length + excerpt.length;
+    const excerpt = toBoundedString(rec.excerpt, MAX_EVAL_EXCERPT_CHARS);
     const riskScore = toBoundedNumber(rec.riskScore);
     const voteupCount = toBoundedNumber(rec.voteupCount);
     const commentCount = toBoundedNumber(rec.commentCount);
@@ -134,10 +193,8 @@ recommendRoutes.post("/evaluate-following", async c => {
   if (items.length === 0) {
     return c.json({ error: "items is empty or invalid" }, 400);
   }
-  if (totalChars > MAX_EVAL_CHARS) {
-    return c.json({ error: `items too large (max ${MAX_EVAL_CHARS} chars)` }, 400);
-  }
+  enforceEvalCharBudget(items, MAX_EVAL_CHARS);
 
-  const res = await evaluateFollowingWithAI(c.env, items);
+  const res = await evaluateFollowingWithAI(c.env, items, sensitivity);
   return c.json({ ok: true, ...res });
 });

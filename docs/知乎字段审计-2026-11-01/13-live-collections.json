@@ -1,0 +1,194 @@
+{
+  "endpoint": "collections",
+  "meta": {
+    "generated": "2026-11-01",
+    "method": "真机测试：Playwright 无头浏览器携带 ZHIHU_COOKIE_STRING 直连 zhihu.com/api/v4，请求器 G:/gemini zhihu/apps/collector/.fieldprobe/fetch.mjs。共 6 个请求全部 200，无 403。",
+    "request_source": "13A-13E 于 2026-11-01 19:05-19:06 由同一请求器发出（out-13-a/b/c.json，数据完整且 favlist id 自洽，本轮复用）；13F 为本轮补发的第 6 个请求（out-13-d.json）。本文件只读分析，未改动 G:/gemini zhihu 下任何文件。",
+    "subject": "members/{user}/favlists + collections/{id}/items + collections/{id}（收藏夹实体）"
+  },
+  "requests": [
+    {
+      "id": "13A_favlists",
+      "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94/favlists?limit=5&offset=0",
+      "status": 200,
+      "ms": 430,
+      "source_file": "out-13-a.json",
+      "summary": "返回 5 个 favlist（totals=13），第一个 id=822239827『我的收藏』is_public=false"
+    },
+    {
+      "id": "13B_items_plain",
+      "url": "https://www.zhihu.com/api/v4/collections/822239827/items?limit=2&offset=0",
+      "status": 200,
+      "ms": 287,
+      "source_file": "out-13-b.json",
+      "summary": "无 include 基线：2 条 item，content.type 均为 answer，totals=921"
+    },
+    {
+      "id": "13C_items_project_include",
+      "url": "https://www.zhihu.com/api/v4/collections/822239827/items?include=<01-endpoints-include.json#collections_items.include_raw 的 URL 编码>&limit=2&offset=0",
+      "status": 200,
+      "ms": 243,
+      "source_file": "out-13-c.json",
+      "summary": "项目 32 项 include（data[*].content.* 选择器）：与 B 键集完全相同，无任何新增字段"
+    },
+    {
+      "id": "13D_items_probe_include",
+      "url": "https://www.zhihu.com/api/v4/collections/822239827/items?include=data%5B*%5D.content.voteup_count,comment_count,visit_count,favorite_count,thanks_count,excerpt,content,question,author.name,author.headline,reaction.statistics,is_labeled,created_time,updated_time,type&limit=2&offset=0",
+      "status": 200,
+      "ms": 134,
+      "source_file": "out-13-c.json",
+      "summary": "全量探测 include：与 B 键集完全相同；请求的 favorite_count/visit_count/reaction.statistics/is_labeled 仍未下发"
+    },
+    {
+      "id": "13E_collection_detail",
+      "url": "https://www.zhihu.com/api/v4/collections/822239827",
+      "status": 200,
+      "ms": 181,
+      "source_file": "out-13-c.json",
+      "summary": "收藏夹详情 200（非 404）：{collection:{18 键}, status:100, message:\"\"}；answer_count=921=item_count，is_public=false"
+    },
+    {
+      "id": "13F_items_wide20",
+      "url": "https://www.zhihu.com/api/v4/collections/822239827/items?limit=20&offset=0",
+      "status": 200,
+      "ms": 472,
+      "source_file": "out-13-d.json",
+      "summary": "扩样 20 条：19 answer + 1 article；无一条含 favorite_count/visit_count/reaction"
+    }
+  ],
+  "favlist_keys": ["id", "title", "type", "is_public", "url"],
+  "favlists_paging_keys": ["is_end", "is_start", "totals", "next", "previous"],
+  "item_keys": ["content", "created"],
+  "items_paging_keys": ["is_end", "is_start", "next", "previous", "totals"],
+  "content_keys_by_type": {
+    "answer": [
+      "type", "answer_type", "url", "created_time", "updated_time", "author", "thumbnail",
+      "is_collapsed", "is_copyable", "is_visible", "is_normal", "voteup_count", "comment_count",
+      "thanks_count", "is_mine", "comment_permission", "reshipment_settings", "content", "excerpt",
+      "suggest_edit", "thumbnail_info", "attached_info", "relationship", "attachment", "is_deleted",
+      "question", "id"
+    ],
+    "article": [
+      "title", "type", "excerpt_title", "url", "image_url", "created", "updated", "author",
+      "comment_permission", "content", "voteup_count", "column", "comment_count", "id"
+    ]
+  },
+  "include_effect": "无效。B(无 include)/C(项目 32 项 include)/D(探测 include) 三者的 content 顶层、question、author、relationship 键集逐一比对完全相同：include 请求的字段一个都没新增（favorite_count/visit_count/reaction.statistics/is_labeled/label_info/mark_infos 等仍缺席），默认字段也没有减少。collections/items 端点忽略 include 参数，所有响应返回同一默认字段面。",
+  "fields": {
+    "favlist_item": {
+      "id": "number (822239827)",
+      "title": "string (我的收藏)",
+      "type": "string (恒 'collection')",
+      "is_public": "boolean (第 1 个收藏夹 false，其余 4 个 true)",
+      "url": "string (http://www.zhihu.com/api/v4/collections/{id})"
+    },
+    "favlists_paging": {
+      "is_end": "boolean",
+      "is_start": "boolean",
+      "totals": "number (13，收藏夹总数)",
+      "next": "string (http://www.zhihu.com/api/v4/members/{user}/favlists?limit=5&offset=5)",
+      "previous": "string"
+    },
+    "outer_item": {
+      "content": "object（实体本体，见 content.answer / content.article）",
+      "created": "string ISO8601（收藏时间，如 2026-10-22T19:36:40+08:00；非 epoch 数字）"
+    },
+    "items_paging": {
+      "is_end": "boolean",
+      "is_start": "boolean",
+      "next": "string",
+      "previous": "string",
+      "totals": "number (921，条目总数)"
+    },
+    "content.answer": {
+      "type": "string ('answer')",
+      "answer_type": "string ('NORMAL')",
+      "id": "string（回答 id，数字字符串如 2096686432219828275）",
+      "url": "string",
+      "created_time": "number (epoch 秒)",
+      "updated_time": "number (epoch 秒)",
+      "author": "object (16 键: id,url_token,name,use_default_avatar,avatar_url,avatar_url_template,is_org,type,url,user_type,headline,gender,is_advertiser,vip_info,badge_v2,actived_at)",
+      "author.vip_info": "object (is_vip,rename_days,widget{url,night_mode_url},vip_icon{url,night_mode_url})",
+      "thumbnail": "string (样本为空串)",
+      "thumbnail_info": "object (count,type,thumbnails[])",
+      "is_collapsed": "boolean",
+      "is_copyable": "boolean",
+      "is_visible": "boolean",
+      "is_normal": "boolean",
+      "voteup_count": "number (有，默认下发，样本 1012)",
+      "comment_count": "number (默认下发，样本 75)",
+      "thanks_count": "number (默认下发，样本 46)",
+      "is_mine": "boolean",
+      "comment_permission": "string ('all')",
+      "reshipment_settings": "string ('disallowed')",
+      "content": "string (HTML 正文)",
+      "excerpt": "string",
+      "suggest_edit": "object (reason,status,tip,title,unnormal_details{status,description,reason,reason_id,note},url)",
+      "attached_info": "string (base64)",
+      "relationship": "object (5 键: is_author,is_authorized,is_nothelp,is_thanked,voting；19 条 answer 全部一致)",
+      "attachment": "object (type:'ANSWER', attachment_id:'')",
+      "is_deleted": "boolean",
+      "question": "object (8 键: type,title,question_type,created,updated_time,url,is_deleted,id)",
+      "favorite_count": "ABSENT（include 请求也不下发）",
+      "visit_count": "ABSENT（include 请求也不下发）",
+      "reaction": "ABSENT（reaction.statistics 在该接口不存在）"
+    },
+    "content.article": {
+      "type": "string ('article')",
+      "title": "string",
+      "excerpt_title": "string（article 无 excerpt，只有 excerpt_title）",
+      "id": "string（文章 id）",
+      "url": "string (zhuanlan.zhihu.com/p/{id})",
+      "image_url": "string",
+      "created": "number (epoch 秒，article 用 created/updated 而非 created_time/updated_time)",
+      "updated": "number (epoch 秒)",
+      "author": "object (17 键 = answer 的 16 键 + badge)",
+      "comment_permission": "string ('all')",
+      "content": "string (HTML 正文)",
+      "voteup_count": "number (有，样本 994)",
+      "column": "object (9 键: id,type:'column',url_token,title,url,created,updated,description,image_url)",
+      "comment_count": "number (样本 31)",
+      "favorite_count": "ABSENT",
+      "visit_count": "ABSENT",
+      "thanks_count": "ABSENT",
+      "reaction": "ABSENT",
+      "relationship": "ABSENT",
+      "question": "ABSENT"
+    },
+    "collection_detail_E": {
+      "wrapper": "{ collection: {...}, status: 100, message: \"\" }",
+      "collection": {
+        "id": "number (822239827)",
+        "type": "string ('collection')",
+        "title": "string",
+        "is_public": "boolean (false，本人 cookie 可读私有收藏夹)",
+        "url": "string (https://api.zhihu.com/collections/{id}，注意是 api.zhihu.com 域)",
+        "description": "string",
+        "follower_count": "number (0)",
+        "answer_count": "number (921)",
+        "item_count": "number (921，与 answer_count 相等)",
+        "like_count": "number (0)",
+        "view_count": "number (16)",
+        "comment_count": "number (0)",
+        "is_following": "boolean",
+        "is_liking": "boolean",
+        "created_time": "number (epoch 秒 1659442476)",
+        "updated_time": "number (epoch 秒 1793037431)",
+        "creator": "object (11 键: id,type:'people',is_following,avatar_url,headline,user_type,gender,url,name,is_followed,badge)",
+        "is_default": "boolean"
+      }
+    }
+  },
+  "notes": [
+    "核对1（favlists 字段全集）：favlist 列表项确认仍为 5 个键 id/is_public/title/type/url，与历史证据一致；updated_time 与 item_count 均不在列表项中。收藏夹的条目数与更新时间只能从 E（collections/{id} 详情）拿：item_count=921、updated_time=1793037431。favlists 的 paging 含 is_end/is_start/totals/next/previous 5 键，totals=13 为收藏夹总数。",
+    "核对2（answer 计数字段）：收藏夹里的 answer 默认（无 include）即返回 voteup_count、comment_count、thanks_count 三个真实数字（样本 1012/75/46）；favorite_count、visit_count、reaction 完全不存在——即使 C/D 的 include 显式请求也不下发。reaction.statistics 在 collections/items 中没有任何样本，该子对象在此接口不存在，因此 collector sync.ts:363 的 favorite_count ?? reaction.statistics.favorites 兜底链在此接口恒得 0，thanks_count 反而是唯一可用的真实『感谢数』（但语义不是收藏数）。",
+    "核对3（外层 item 与 content 关系）：外层 item 只有 {content, created} 两个键，没有 id/type/url/title；实体类型与 id 都在 content 内（content.type / content.id）。content.type 实测取值 answer、article（20 条样本 19:1）；item.created 是 ISO8601 字符串（收藏时间），不是 epoch。",
+    "核对4（include 是否生效）：不生效。B/C/D 三响应逐键比对（content 顶层、question、author、relationship）完全相同，include 请求的 32 项（C）与 15 项（D，含 reaction.statistics、type）均零新增。结论：collections/items 忽略 include，抓取时无需携带（带 include 不报错但无用）。",
+    "article 是贫化对象：仅 14 键，无 question/relationship/is_collapsed/is_deleted/excerpt（只有 excerpt_title），时间字段用 created/updated（数字）而非 created_time/updated_time；author 比 answer 多一个 badge 键；有 column 子对象（专栏 9 键）。article 同样只有 voteup_count/comment_count，无 favorite_count/visit_count/thanks_count/reaction。",
+    "question 子对象（answer 内）8 键：type/title/question_type/created/updated_time/url/is_deleted/id，注意其中没有 visit_count——FIELD_AUDIT 提到的『浏览量疑似只在 question.visit_count』在 collections/items 接口不成立，此接口任何位置都拿不到 visit_count。",
+    "E 收藏夹详情返回 200（非 404）：外层 {collection, status:100, message:''}，collection 18 键（含 is_default）。is_public=false 的私有收藏夹本人 cookie 可正常读。url 字段是 api.zhihu.com 域名，与 favlist 列表项里的 www.zhihu.com 域不同。",
+    "items 的 paging 5 键 is_end/is_start/next/previous/totals，totals=921 与 E 的 item_count/answer_count 一致，说明该接口 answer_count 与 item_count 同口径（本收藏夹 20 条里仍有 1 条 article，故 answer_count 命名并不排除 article/pin 混排）。",
+    "请求纪律：共 6 个请求（上限 6），间隔均 >=3200ms，全部 200，未出现 403/40353/40362。13A-13E 复用 2026-11-01 19:05-19:06 同一请求器的完整结果（out-13-a/b/c.json，favlist id=822239827 自洽），13F 为本轮补发（out-13-d.json）。G:/gemini zhihu 仅读取与运行 .fieldprobe/fetch.mjs，未修改项目文件。",
+    "对抓取器的直接结论：collections/items 不需要也不依赖 include；answer 的收藏数、浏览量在该接口拿不到（favorite_count/visit_count 缺席），只能用 voteup_count/comment_count/thanks_count + E 详情的 item_count/view_count 兜底。"
+  ]
+}

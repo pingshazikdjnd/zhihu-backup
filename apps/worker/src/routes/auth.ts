@@ -124,40 +124,76 @@ export function isOriginAllowed(c: any, requireHeader = false): boolean {
 }
 
 /**
- * 读取当前生效的凭据页写入口令：优先读 D1 app_settings 中的在线设置值，回退到环境变量 COOKIE_WRITE_TOKEN。
+ * 读取当前生效的凭据页写入口令：
+ * 优先读 D1 app_settings 中的在线设置值，回退到环境变量 COOKIE_WRITE_TOKEN，
+ * 最后回退到 API_SECRET —— 只要部署配了 API_SECRET，写接口就天然是 fail-closed，
+ * 不存在「口令为空、裸奔放行」的窗口。用户在网页输入 API_SECRET 也能直接操作。
  */
-export async function getActiveWriteToken(c: any): Promise<string> {
+export type WriteTokenSource = "db" | "env" | "api_secret" | "none";
+
+/**
+ * 逐层探测当前生效的写口令及其来源：
+ * db（网页设置的 D1 密码）> env（COOKIE_WRITE_TOKEN）> api_secret（API_SECRET 兜底）> none。
+ * 前端需要 tokenSource 区分「用户设过独立密码」和「只是拿 API_SECRET 兜底」。
+ */
+export async function getActiveWriteTokenInfo(
+  c: any
+): Promise<{ token: string; source: WriteTokenSource }> {
   try {
     const row = await db.prepare(
       `SELECT value FROM app_settings WHERE key = ?`
     ).get<{ value: string }>(WRITE_TOKEN_KEY);
     if (row?.value && row.value.trim()) {
-      return row.value.trim();
+      return { token: row.value.trim(), source: "db" };
     }
   } catch {
     // 忽略表未就绪
   }
-  return String(c.env.COOKIE_WRITE_TOKEN || "").trim();
+  const envToken = String(c.env.COOKIE_WRITE_TOKEN || "").trim();
+  if (envToken) return { token: envToken, source: "env" };
+  const apiSecret = String(c.env.API_SECRET || "").trim();
+  if (apiSecret) return { token: apiSecret, source: "api_secret" };
+  return { token: "", source: "none" };
+}
+
+export async function getActiveWriteToken(c: any): Promise<string> {
+  return (await getActiveWriteTokenInfo(c)).token;
 }
 
 /**
- * 写入凭据的鉴权策略：
- * - 配了口令（D1 `cookie_write_token` 或环境变量 `COOKIE_WRITE_TOKEN`）：必须带该口令，或带 `API_SECRET`
- * - 没配口令：校验 Origin 白名单后允许网页直接提交
+ * 写入鉴权（fail-closed）：
+ * - 必须携带 `Authorization: Bearer <token>`，不存在「仅 Origin 免密」分支；
+ * - 带了 Origin 就必须命中白名单（CLI 无 Origin 时凭口令即可）；
+ * - 依次接受 API_SECRET / 写入口令（D1 在线设置 > COOKIE_WRITE_TOKEN > API_SECRET）；
+ * - 连 API_SECRET 都没配的空环境直接拒绝，绝不默认放行。
  */
 export async function authorizeWrite(c: any): Promise<{ ok: boolean }> {
   const apiSecret = c.env.API_SECRET;
   const auth = c.req.header("authorization") || "";
 
+  if (!auth.startsWith("Bearer ")) return { ok: false };
+
+  // 带了 Origin 才校验白名单；无 Origin 的脚本/CLI 仍可用 Bearer 调用
+  if (c.req.header("origin") && !isOriginAllowed(c, true)) return { ok: false };
+
   if (apiSecret && auth === `Bearer ${apiSecret}`) return { ok: true };
-  if (!isOriginAllowed(c)) return { ok: false };
 
   const writeToken = await getActiveWriteToken(c);
-  if (writeToken) {
-    return { ok: auth === `Bearer ${writeToken}` };
-  }
+  if (!writeToken) return { ok: false };
 
-  return { ok: true };
+  return { ok: auth === `Bearer ${writeToken}` };
+}
+
+export const NO_WRITE_TOKEN_HINT =
+  "尚未配置操作密码或 API_SECRET，请先在设置页初始化操作密码";
+
+/**
+ * 写鉴权失败的统一响应：纯本地空环境（D1 / COOKIE_WRITE_TOKEN / API_SECRET 都没配）时
+ * 给出「先去设置页初始化操作密码」的可操作提示，而不是含糊的「密码错误」。
+ */
+async function denyWrite(c: any, fallback: string) {
+  const token = await getActiveWriteToken(c);
+  return c.json({ error: token ? fallback : NO_WRITE_TOKEN_HINT, needToken: true }, 401);
 }
 
 /**
@@ -165,7 +201,7 @@ export async function authorizeWrite(c: any): Promise<{ ok: boolean }> {
  */
 authRoutes.post("/zhihu-cookie", async c => {
   if (!(await authorizeWrite(c)).ok) {
-    return c.json({ error: "密码错误或未填写操作密码", needToken: true }, 401);
+    return denyWrite(c, "密码错误或未填写操作密码");
   }
 
   const body = await c.req.json().catch(() => null) as { cookieString?: unknown } | null;
@@ -197,8 +233,9 @@ authRoutes.post("/zhihu-cookie", async c => {
 
 /**
  * 在线设置或修改凭据页操作密码（口令）。
- * - 若当前已有密码（D1 或环境变量 COOKIE_WRITE_TOKEN），必须先校验 currentToken 正确才允许修改
- * - 若当前未设密码，可直接设置初始密码
+ * - 当前已有口令（D1 / COOKIE_WRITE_TOKEN / API_SECRET 任一）时，必须先校验 currentToken 正确才允许修改；
+ * - 环境变量 COOKIE_WRITE_TOKEN 与 API_SECRET 均可作为应急恢复主钥，永远不锁死；
+ * - 极端空环境（三者都没配）首次设置时仍需来自白名单网页，防止外部脚本抢设管理员密码。
  */
 authRoutes.post("/write-token", async c => {
   if (!isOriginAllowed(c)) {
@@ -220,8 +257,23 @@ authRoutes.post("/write-token", async c => {
   const activeToken = await getActiveWriteToken(c);
   const auth = c.req.header("authorization") || "";
   const hasApiSecret = Boolean(c.env.API_SECRET && auth === `Bearer ${c.env.API_SECRET}`);
+  // 环境变量口令作为应急恢复主钥：D1 里的口令被写坏/忘记时可从 env 恢复
+  const envToken = String(c.env.COOKIE_WRITE_TOKEN || "").trim();
+  const apiSecretEnv = String(c.env.API_SECRET || "").trim();
 
-  if (activeToken && !hasApiSecret && currentInput !== activeToken) {
+  if (!activeToken) {
+    // 纯本地 / 空环境首次初始化：三者都没配，此时不存在任何可校验的旧口令，
+    // 只信任白名单网页（浏览器必带 Origin）直接设置初始操作密码，
+    // 防止外部无头脚本抢设管理员密码。
+    if (!isOriginAllowed(c, true)) {
+      return c.json({ error: "Forbidden origin" }, 403);
+    }
+  } else if (
+    !hasApiSecret &&
+    currentInput !== activeToken &&
+    !(envToken && currentInput === envToken) &&
+    !(apiSecretEnv && currentInput === apiSecretEnv)
+  ) {
     return c.json({ error: "当前密码不正确，无法修改" }, 401);
   }
 
@@ -262,7 +314,10 @@ async function getLastApifyRun(c: any) {
 
   let data: any = null;
   try {
-    const res = await fetch(`https://api.apify.com/v2/acts/${actorId}/runs/last?token=${token}`);
+    // token 放 Authorization 头：URL query 会出现在 Apify 的错误回显里，进而被写进 sync_runs.message
+    const res = await fetch(`https://api.apify.com/v2/acts/${actorId}/runs/last`, {
+      headers: { authorization: `Bearer ${token}` }
+    });
     if (res.ok) {
       const j = await res.json() as any;
       data = {
@@ -314,7 +369,7 @@ authRoutes.get("/zhihu-status", async c => {
     if (!Number.isNaN(t)) ageHours = Math.round((Date.now() - t) / 3600_000);
   }
 
-  const activeToken = await getActiveWriteToken(c);
+  const activeTokenInfo = await getActiveWriteTokenInfo(c);
   const syncConfig = await getSyncConfig(c.env.BUCKET);
   let upvotesCursor: string | null = null;
   try {
@@ -329,7 +384,12 @@ authRoutes.get("/zhihu-status", async c => {
     ageHours,
     cookieCount: value ? value.split(";").filter(s => s.trim()).length : 0,
     hasZC0: isValidCookieString(value),
-    writeTokenRequired: Boolean(activeToken),
+    writeTokenRequired: Boolean(activeTokenInfo.token),
+    // 当前生效的写口令来源：db=网页设的独立密码，env=COOKIE_WRITE_TOKEN，
+    // api_secret=还没单独设密码、暂用 API_SECRET 兜底，none=纯本地空环境
+    tokenSource: activeTokenInfo.source,
+    // 读接口是否也要求 Bearer（默认关闭，保持前端直接可用）
+    readAuthRequired: c.env.READ_AUTH_REQUIRED === "true",
     lastRun: await getLastApifyRun(c),
     syncConfig,
     upvotesCursor
@@ -346,7 +406,7 @@ authRoutes.get("/settings", async c => {
 
 authRoutes.post("/settings", async c => {
   if (!(await authorizeWrite(c)).ok) {
-    return c.json({ error: "操作密码错误或未填写，请先在设置页输入操作密码", needToken: true }, 401);
+    return denyWrite(c, "操作密码错误或未填写，请先在设置页输入操作密码");
   }
   const body = await c.req.json().catch(() => null) as Partial<SyncConfig> | null;
   if (!body || typeof body !== "object") {
@@ -361,7 +421,7 @@ authRoutes.post("/settings", async c => {
  */
 authRoutes.post("/zhihu-cookie/clear", async c => {
   if (!(await authorizeWrite(c)).ok) {
-    return c.json({ error: "密码错误或未填写操作密码", needToken: true }, 401);
+    return denyWrite(c, "密码错误或未填写操作密码");
   }
   await db.prepare(`DELETE FROM app_settings WHERE key = ?`).run(COOKIE_KEY);
   return c.json({ ok: true });

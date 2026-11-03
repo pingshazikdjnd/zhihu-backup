@@ -1,9 +1,26 @@
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if ((url.pathname.startsWith("/api/") || url.pathname.startsWith("/ingest/")) && env.API) {
+    const isBackendRoute = url.pathname.startsWith("/api/") || url.pathname.startsWith("/ingest/");
+
+    if (isBackendRoute) {
+      if (!env.API) {
+        return new Response(
+          JSON.stringify({
+            error: "service_binding_missing",
+            hint: "Pages 项目需绑定 Service Binding 名称 API → worker"
+          }),
+          {
+            status: 503,
+            headers: {
+              "content-type": "application/json; charset=utf-8"
+            }
+          }
+        );
+      }
       return env.API.fetch(request);
     }
+
     const res = await env.ASSETS.fetch(request);
     if (
       res.status === 404 &&

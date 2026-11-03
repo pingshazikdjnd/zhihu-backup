@@ -28,7 +28,8 @@ export type TriggerResult = { ok: boolean; runId?: string; error?: string };
 export async function triggerApifyRun(
   env: Bindings,
   runType: string,
-  isFast: boolean
+  isFast: boolean,
+  opts: { syncOwnerId?: string } = {}
 ): Promise<TriggerResult> {
   // API_SECRET 缺失时必须提前拒绝：否则 Actor 拿不到 apiSecret，
   // 回传全部 503，而 sync_runs 还会记成功。
@@ -105,7 +106,9 @@ export async function triggerApifyRun(
     ...(upvotesCursor ? { upvotesCursor } : {}),
     ...(fullModeUsers.length > 0 ? { fullModeUsers } : {}),
     ...(Object.keys(followedProgress).length > 0 ? { followedProgress } : {}),
-    ...(syncConfig ? { syncConfig } : {})
+    ...(syncConfig ? { syncConfig } : {}),
+    // 同步租约持有者：爬虫每批 /ingest 请求带 x-sync-owner，Worker 据此持续续租
+    ...(opts.syncOwnerId ? { syncOwnerId: opts.syncOwnerId } : {})
   };
 
   let res: Response;
@@ -113,11 +116,15 @@ export async function triggerApifyRun(
     // timeout=12h：默认 1 小时在首次全量（数千回答/赞同的老账号）不够用。
     // 实测赞同段 ~1.65s/条且每次 run 从头翻页（重复段必须先过一遍），
     // 4h 只能推进 ~8700 条、进度会被重复成本卡死；12h 一次翻到底
+    // token 放 Authorization 头：URL query 会随 Apify 的错误回显被写进 sync_runs.message
     res = await fetch(
-      `https://api.apify.com/v2/acts/${env.APIFY_ACTOR_ID}/runs?token=${env.APIFY_TOKEN}&timeout=43200`,
+      `https://api.apify.com/v2/acts/${env.APIFY_ACTOR_ID}/runs?timeout=43200`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          authorization: `Bearer ${env.APIFY_TOKEN}`
+        },
         body: JSON.stringify(payload)
       }
     );

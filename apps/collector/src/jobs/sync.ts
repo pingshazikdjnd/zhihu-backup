@@ -99,17 +99,24 @@ export async function runScraper() {
       let finalFavorite = item.favorite_count || item.thanks_count || item.reaction?.statistics?.favorites || item.reaction?.statistics?.favorite_count || 0;
       let finalVisit = item.visit_count || item.reaction?.statistics?.visit_count || 0;
       
-      // Fetch detailed stats because list API omits them
-      try {
-         const detailRes = await context.request.get(`https://www.zhihu.com/api/v4/answers/${item.id}?include=voteup_count,comment_count,visit_count,favorite_count`);
-         if (detailRes.ok()) {
+      // 只在列表 API 明显缺少关键计数时才补查详情，减少 N+1 请求。
+      // 列表 API 的 include 已经请求了 voteup_count/comment_count/visit_count/favorite_count，
+      // 原实现却对每条回答都额外请求一次 /answers/{id}：既浪费请求，也显著增加触发知乎风控的风险。
+      const needsDetail = (item.visit_count === undefined || item.visit_count === 0) && (item.voteup_count > 50);
+      if (needsDetail) {
+        try {
+          const detailRes = await context.request.get(`https://www.zhihu.com/api/v4/answers/${item.id}?include=voteup_count,comment_count,visit_count,favorite_count`);
+          if (detailRes.ok()) {
             const detail = await detailRes.json();
             if (detail.voteup_count !== undefined) finalVoteup = detail.voteup_count;
             if (detail.favorite_count !== undefined) finalFavorite = detail.favorite_count;
             if (detail.visit_count !== undefined) finalVisit = detail.visit_count;
-         }
-      } catch (e) {
-         console.error(`Failed to fetch detail for ${item.id}`);
+          }
+          // 补查后增加延迟避免触发风控
+          await new Promise(r => setTimeout(r, 500));
+        } catch (e) {
+          console.error(`⚠️ 详情补查失败 (${item.id}), 使用列表数据`);
+        }
       }
 
       const contentInput = {
@@ -126,6 +133,8 @@ export async function runScraper() {
         commentCount: item.comment_count || 0,
         favoriteCount: finalFavorite,
         visitCount: finalVisit,
+        // is_collapsed / is_labeled 可能为 undefined，下游 contents 服务统一用 `值 ? 1 : 0` 归一化，
+        // 因此这里保持原样透传、不做类型转换（与下方收藏夹同步处的写法一致），无需修改。
         isCollapsed: item.is_collapsed,
         isLabeled: item.is_labeled,
         labelInfo: item.label_info ? JSON.stringify(item.label_info) : "",
@@ -380,7 +389,11 @@ export async function runCollectionScraper() {
                 } else {
                   existingCount = 0;
                 }
-              } catch(e) {}
+              } catch (e: any) {
+                // 原为空 catch，sendContent 的失败被完全静默吞掉：收藏条目看起来"同步成功"，
+                // 实际内容丢失且无任何日志。这里必须落日志，否则数据丢失无从发现。
+                console.error(`❌ 收藏夹内容保存失败: ${contentInput.title}`, e?.message || e);
+              }
             }
 
             items.push({

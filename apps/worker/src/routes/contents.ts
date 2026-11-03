@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { getContentDetail, listContents } from "../services/contents.js";
-import { listComments } from "../services/comments.js";
+import { getChildComments, listComments, listRootComments } from "../services/comments.js";
 import type { Bindings } from "../types.js";
 
 export const contentRoutes = new Hono<{ Bindings: Bindings }>();
@@ -26,9 +26,13 @@ contentRoutes.get("/:pk", async c => {
       if (!htmlObj) htmlObj = await c.env.BUCKET.get(`html/${pk}`);
       if (htmlObj) detail.content.content_html = await htmlObj.text();
 
-      let mdObj = hash ? await c.env.BUCKET.get(`md/${pk}/${hash}`) : null;
-      if (!mdObj) mdObj = await c.env.BUCKET.get(`md/${pk}`);
-      if (mdObj) detail.content.content_md = await mdObj.text();
+      // 详情页渲染只用 HTML：HTML 命中时 md/ 读取必然 miss（旧通道从不写 md/），
+      // 跳过可以省掉 2 次 R2 Class B 读取
+      if (!htmlObj) {
+        let mdObj = hash ? await c.env.BUCKET.get(`md/${pk}/${hash}`) : null;
+        if (!mdObj) mdObj = await c.env.BUCKET.get(`md/${pk}`);
+        if (mdObj) detail.content.content_md = await mdObj.text();
+      }
     }
   }
   return c.json(detail);
@@ -37,6 +41,26 @@ contentRoutes.get("/:pk", async c => {
 contentRoutes.get("/:pk/comments", async c => {
   const pk = c.req.param("pk");
   return c.json({ data: await listComments(pk) });
+});
+
+// 根评论分页（热度序）。子评论按需从 R2 读取，不再随根列表一次性返回。
+contentRoutes.get("/:pk/root-comments", async c => {
+  const pk = c.req.param("pk");
+  const limit = parseInt(c.req.query("limit") || "20", 10);
+  const offset = parseInt(c.req.query("offset") || "0", 10);
+  const data = await listRootComments(c.env.DB, pk, { limit, offset });
+  return c.json({
+    data,
+    limit: Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 20,
+    offset: Number.isFinite(offset) ? Math.max(offset, 0) : 0
+  });
+});
+
+// 点「展开 N 条回复」时读取某个根评论下的子评论。
+// R2 未命中时回退读 D1（历史子评论还没搬进 R2），所以 BUCKET 缺失也照样能展开。
+contentRoutes.get("/:pk/comments/:rootId/children", async c => {
+  const rootId = c.req.param("rootId");
+  return c.json({ data: await getChildComments(c.env.BUCKET, rootId, c.env.DB) });
 });
 
 // 注意：原来的 /:pk/sync-live 与 /:pk/sync-comments-live 已删除。

@@ -1,11 +1,12 @@
 import { Hono } from "hono";
 import {
   IngestCollectionSnapshotSchema,
+  IngestCommentsByRootSchema,
   IngestCommentsSchema,
   IngestContentSchema
 } from "shared";
 import { upsertContent } from "../services/contents.js";
-import { replaceComments } from "../services/comments.js";
+import { replaceComments, replaceCommentsByRoot } from "../services/comments.js";
 import { upsertCollectionSnapshot } from "../services/collections.js";
 import { upsertUpvote } from "../services/upvotes.js";
 import {
@@ -14,6 +15,7 @@ import {
   upsertFollowedUsersSnapshot
 } from "../services/following.js";
 import { getSyncConfig } from "./auth.js";
+import { acquireSyncLock, releaseSyncLock, renewSyncLock } from "./sync.js";
 import { requireSecret } from "../middleware/require-secret.js";
 import { db } from "../db.js";
 import type { Bindings } from "../types.js";
@@ -22,6 +24,23 @@ export const ingestRoutes = new Hono<{ Bindings: Bindings }>();
 
 // 写接口统一鉴权（fail-closed），详见 middleware/require-secret.ts
 ingestRoutes.use("*", requireSecret);
+
+// 爬虫每批 /ingest/* 请求都带 x-sync-owner：自动为它续租同步锁。
+// 长抓取（几小时）期间只要还在回传数据，15 分钟租约就持续顺延；
+// 爬虫蓝屏/崩溃后停止发请求，锁自然过期，无需人工清理。
+ingestRoutes.use("*", async (c, next) => {
+  const owner = (c.req.header("x-sync-owner") || "").trim();
+  if (owner) {
+    const renewal = renewSyncLock(owner).catch(() => false);
+    try {
+      c.executionCtx.waitUntil(renewal);
+    } catch {
+      // 本地/测试环境没有 executionCtx 时退回同步等待
+      await renewal;
+    }
+  }
+  await next();
+});
 
 ingestRoutes.post("/content", async c => {
   const body = await c.req.json().catch(() => null);
@@ -37,24 +56,25 @@ ingestRoutes.post("/content", async c => {
   const mdToStore = parsed.data.contentMd || "";
 
   // R2 未绑定时不能静默跳过：D1 里 content_html 是空串，正文会永久丢失。
-  if ((htmlToStore || mdToStore) && !c.env.BUCKET) {
+  const bucket = c.env.BUCKET;
+  if ((htmlToStore || mdToStore) && !bucket) {
     return c.json({ error: "R2 bucket not bound; refusing to drop content" }, 503);
   }
 
   // 先写库（幂等），成功后再写 R2，避免「R2 已是新正文、D1 还是旧 hash」
   const result = await upsertContent(parsed.data);
 
-  if (c.env.BUCKET) {
+  if (bucket) {
     // R2 的 put 是 Class A 且不比对内容：同一 key 同字节也会计费。
     // key 已带 content_hash（正文一变 key 就变），所以只要对象已存在就无需重写。
     // 不能只用 created/changed 判断：D1 写成功但 R2 put 失败时，下一轮 changed=false
     // 会让正文永久缺失；这里用 HEAD 兜底，miss 即补写。
     const putIfAbsent = async (key: string, body: string, contentType: string, kind: string) => {
       if (!result.created) {
-        const existing = await c.env.BUCKET.head(key).catch(() => null);
+        const existing = await bucket.head(key).catch(() => null);
         if (existing) return false;
       }
-      await c.env.BUCKET.put(key, body, {
+      await bucket.put(key, body, {
         httpMetadata: { contentType },
         customMetadata: { pk, kind }
       });
@@ -86,6 +106,28 @@ ingestRoutes.post("/comments", async c => {
     return c.json({ error: `content not found: ${parsed.data.contentPk}` }, 404);
   }
   const result = await replaceComments(parsed.data);
+  return c.json(result);
+});
+
+ingestRoutes.post("/comments-by-root", async c => {
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json({ error: "invalid json" }, 400);
+
+  const parsed = IngestCommentsByRootSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+
+  // comments 有外键约束，悬空 contentPk 会在 batch 阶段变 500，提前给 404
+  const contentExists = await db.prepare(`SELECT 1 FROM contents WHERE pk = ?`).get(parsed.data.contentPk);
+  if (!contentExists) {
+    return c.json({ error: `content not found: ${parsed.data.contentPk}` }, 404);
+  }
+  // 子评论必须落 R2；未绑定时拒绝，避免静默丢楼中楼
+  const bucket = c.env.BUCKET;
+  if (!bucket) {
+    return c.json({ error: "R2 bucket not bound; refusing to drop child comments" }, 503);
+  }
+
+  const result = await replaceCommentsByRoot(parsed.data, { DB: c.env.DB, BUCKET: bucket });
   return c.json(result);
 });
 
@@ -206,4 +248,34 @@ ingestRoutes.post("/sync-state", async c => {
 ingestRoutes.post("/sync-all", async c => {
   // 云端不再本地拉起任务，统一走 /api/sync/full
   return c.json({ success: false, message: "Use /api/sync/full instead" }, 410 as any);
+});
+
+// 本地同步脚本（scripts/local-sync.mjs）与云端共用同一把互斥锁：
+// 本地开跑前 acquire，结束后 release；抢不到返回 409 由脚本自行跳过。
+ingestRoutes.post("/sync-lock/acquire", async c => {
+  const body = await c.req.json().catch(() => null) as { ownerId?: unknown; source?: unknown } | null;
+  const ownerId = typeof body?.ownerId === "string" && body.ownerId.trim()
+    ? body.ownerId.trim()
+    : undefined;
+  const source = typeof body?.source === "string" && body.source.trim()
+    ? body.source.trim()
+    : "manual";
+  const lock = await acquireSyncLock(ownerId, source);
+  if (!lock.ok) {
+    return c.json({
+      ok: false,
+      error: "同步任务正在进行中，请稍后再试",
+      ownerId: lock.ownerId,
+      holder: lock.holder
+    }, 409);
+  }
+  return c.json(lock);
+});
+
+ingestRoutes.post("/sync-lock/release", async c => {
+  const body = await c.req.json().catch(() => null) as { ownerId?: unknown } | null;
+  const ownerId = typeof body?.ownerId === "string" ? body.ownerId.trim() : "";
+  if (!ownerId) return c.json({ error: "ownerId is required" }, 400);
+  const released = await releaseSyncLock(ownerId);
+  return c.json({ ok: true, released });
 });

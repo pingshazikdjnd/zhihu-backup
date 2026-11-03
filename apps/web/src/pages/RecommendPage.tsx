@@ -135,7 +135,7 @@ export default function RecommendPage() {
           <div>
             <h1 style={{ fontSize: 18, margin: 0 }}>个性化推荐与防和谐预警</h1>
             <p style={{ margin: "6px 0 0", color: "var(--zhihu-meta)", fontSize: 13 }}>
-              基于你的赞同/收藏偏好、关注答主与 Cloudflare Workers AI 风险评估
+              基于你的赞同/收藏偏好与关注答主做规则打分，可手动点击「AI 鉴定」调用 Cloudflare Workers AI 做风险鉴定
               {stats ? ` · 候选池中发现 ${stats.high_risk_count} 篇高危易和谐、${stats.medium_risk_count} 篇中度敏感回答` : ""}
             </p>
           </div>

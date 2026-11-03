@@ -1,0 +1,731 @@
+{
+  "endpoint": "comments",
+  "requests": [
+    {
+      "id": "A",
+      "url": "https://www.zhihu.com/api/v4/answers/2095990096667341029/root_comments?limit=5&offset=0",
+      "status": 200
+    },
+    {
+      "id": "C1",
+      "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94/articles?limit=1&offset=0",
+      "status": 200
+    },
+    {
+      "id": "D",
+      "url": "https://www.zhihu.com/api/v4/answers/2095990096667341029/root_comments?limit=5&offset=0&include=data%5B*%5D.content,author.name,author.headline,created_time,like_count,reply_comment_id,child_comment_count,is_author,is_top,is_featured,can_like,can_recommend,censor_status,location,time_text,img_url,image_url,be_replied",
+      "status": 200
+    },
+    {
+      "id": "C2",
+      "url": "https://www.zhihu.com/api/v4/articles/2086869210299475286/root_comments?limit=5&offset=0",
+      "status": 404
+    },
+    {
+      "id": "A2",
+      "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94/answers?limit=5&offset=0",
+      "status": 200
+    },
+    {
+      "id": "R",
+      "url": "https://www.zhihu.com/api/v4/answers/2082485163410331245/root_comments?limit=5&offset=0",
+      "status": 200
+    },
+    {
+      "id": "B",
+      "url": "https://www.zhihu.com/api/v4/comments/11576157620/child_comments?limit=5&offset=0",
+      "status": 200
+    }
+  ],
+  "fields": [
+    {
+      "path": "collapsed_counts",
+      "type": "number",
+      "seen_in": [
+        "A",
+        "D",
+        "R"
+      ]
+    },
+    {
+      "path": "comment_status",
+      "type": "object",
+      "seen_in": [
+        "A",
+        "D",
+        "R"
+      ]
+    },
+    {
+      "path": "comment_status.can_comment",
+      "type": "boolean",
+      "seen_in": [
+        "A",
+        "D",
+        "R"
+      ]
+    },
+    {
+      "path": "comment_status.can_reply",
+      "type": "boolean",
+      "seen_in": [
+        "A",
+        "D",
+        "R"
+      ]
+    },
+    {
+      "path": "comment_status.toast",
+      "type": "string",
+      "seen_in": [
+        "A",
+        "D",
+        "R"
+      ]
+    },
+    {
+      "path": "common_counts",
+      "type": "number",
+      "seen_in": [
+        "A",
+        "D",
+        "R"
+      ]
+    },
+    {
+      "path": "data",
+      "type": "array",
+      "seen_in": [
+        "A",
+        "D",
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[]",
+      "type": "object",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].address_text",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].allow_delete",
+      "type": "boolean",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].allow_like",
+      "type": "boolean",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].allow_reply",
+      "type": "boolean",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].allow_vote",
+      "type": "boolean",
+      "seen_in": [
+        "R"
+      ]
+    },
+    {
+      "path": "data[].attached_info",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author",
+      "type": "object",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member",
+      "type": "object",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.avatar_url",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.avatar_url_template",
+      "type": "string",
+      "seen_in": [
+        "R"
+      ]
+    },
+    {
+      "path": "data[].author.member.badge",
+      "type": "array",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.gender",
+      "type": "number",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.headline",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.id",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.is_advertiser",
+      "type": "boolean",
+      "seen_in": [
+        "R"
+      ]
+    },
+    {
+      "path": "data[].author.member.is_followed",
+      "type": "boolean",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.is_following",
+      "type": "boolean",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.is_org",
+      "type": "boolean",
+      "seen_in": [
+        "R"
+      ]
+    },
+    {
+      "path": "data[].author.member.name",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.type",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.url",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.url_token",
+      "type": "string",
+      "seen_in": [
+        "R"
+      ]
+    },
+    {
+      "path": "data[].author.member.user_type",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.vip_info",
+      "type": "object",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.member.vip_info.is_vip",
+      "type": "boolean",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].author.role",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].can_collapse",
+      "type": "boolean",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].can_recommend",
+      "type": "boolean",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].censor_status",
+      "type": "number",
+      "seen_in": [
+        "R"
+      ]
+    },
+    {
+      "path": "data[].child_comment_count",
+      "type": "number",
+      "seen_in": [
+        "R"
+      ]
+    },
+    {
+      "path": "data[].child_comments",
+      "type": "array",
+      "seen_in": [
+        "R"
+      ]
+    },
+    {
+      "path": "data[].collapsed",
+      "type": "boolean",
+      "seen_in": [
+        "R"
+      ]
+    },
+    {
+      "path": "data[].content",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].created_time",
+      "type": "number",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].disliked",
+      "type": "boolean",
+      "seen_in": [
+        "R"
+      ]
+    },
+    {
+      "path": "data[].extra_info",
+      "type": "object",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].featured",
+      "type": "boolean",
+      "seen_in": [
+        "R"
+      ]
+    },
+    {
+      "path": "data[].id",
+      "type": "number",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].is_author",
+      "type": "boolean",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].is_delete",
+      "type": "boolean",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].liked",
+      "type": "boolean",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].replies_count",
+      "type": "number",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author",
+      "type": "object|null",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member",
+      "type": "object",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.avatar_url",
+      "type": "string",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.badge",
+      "type": "array",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.gender",
+      "type": "number",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.headline",
+      "type": "string",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.id",
+      "type": "string",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.is_followed",
+      "type": "boolean",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.is_following",
+      "type": "boolean",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.name",
+      "type": "string",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.type",
+      "type": "string",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.url",
+      "type": "string",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.user_type",
+      "type": "string",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.vip_info",
+      "type": "object",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.member.vip_info.is_vip",
+      "type": "boolean",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reply_to_author.role",
+      "type": "string",
+      "seen_in": [
+        "B"
+      ]
+    },
+    {
+      "path": "data[].resource_type",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].reviewing",
+      "type": "boolean",
+      "seen_in": [
+        "R"
+      ]
+    },
+    {
+      "path": "data[].top",
+      "type": "boolean",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].type",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].url",
+      "type": "string",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].vote_count",
+      "type": "number",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "data[].voting",
+      "type": "boolean",
+      "seen_in": [
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "featured_counts",
+      "type": "number",
+      "seen_in": [
+        "A",
+        "D",
+        "R"
+      ]
+    },
+    {
+      "path": "paging",
+      "type": "object",
+      "seen_in": [
+        "A",
+        "D",
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "paging.is_end",
+      "type": "boolean",
+      "seen_in": [
+        "A",
+        "D",
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "paging.is_start",
+      "type": "boolean",
+      "seen_in": [
+        "A",
+        "D",
+        "R"
+      ]
+    },
+    {
+      "path": "paging.next",
+      "type": "string",
+      "seen_in": [
+        "A",
+        "D",
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "paging.previous",
+      "type": "string",
+      "seen_in": [
+        "A",
+        "D",
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "paging.totals",
+      "type": "number",
+      "seen_in": [
+        "A",
+        "D",
+        "R",
+        "B"
+      ]
+    },
+    {
+      "path": "reviewing_counts",
+      "type": "number",
+      "seen_in": [
+        "A",
+        "D",
+        "R"
+      ]
+    }
+  ],
+  "paging_keys": [
+    "is_end",
+    "is_start",
+    "next",
+    "previous",
+    "totals"
+  ],
+  "author_keys": [
+    "role",
+    "member",
+    "member.id",
+    "member.url_token",
+    "member.name",
+    "member.avatar_url",
+    "member.avatar_url_template",
+    "member.headline",
+    "member.gender",
+    "member.type",
+    "member.user_type",
+    "member.url",
+    "member.badge",
+    "member.vip_info",
+    "member.vip_info.is_vip",
+    "member.is_org",
+    "member.is_advertiser",
+    "member.is_followed",
+    "member.is_following"
+  ],
+  "include_effect": "ignored",
+  "diffs_root_vs_child": [
+    "root-only fields: child_comment_count, child_comments (empty-array placeholder), allow_vote, censor_status, reviewing, featured, collapsed, disliked (all 5/5 root items had them; 0/5 child items)",
+    "child-only fields: replies_count, extra_info (object, observed empty {})",
+    "reply_to_author: not always null in root_comments — 4/5 root items null, 1/5 non-null (conversational root-comment reply); always object {role, member{...}} in child_comments",
+    "wrapper: root_comments returns featured_counts/common_counts/collapsed_counts/reviewing_counts/comment_status; child_comments wrapper is only {data, paging}",
+    "paging: child_comments omits is_start",
+    "allow_like/allow_delete/allow_reply/can_recommend/can_collapse/is_author/is_delete/top/liked/voting/vote_count present in both",
+    "author.member.is_followed/is_following appeared only in B (likely viewer-relationship dependent, not a root/child schema difference); author.member.is_org/is_advertiser/url_token/avatar_url_template appeared only in R (likely per-author variation, 5-sample limitation)"
+  ],
+  "notes": [
+    "Pinned answer 2095990096667341029 has totals=0 root comments (comment_status.can_comment=true, toast present), so A and D data[] were empty; comment-object fields were documented from answer 2082485163410331245 (R: totals=6, limit=5 returned 5) and child_comments of comment 11576157620 (B: totals=54).",
+    "img_url / image_url / imageUrl: NONE exist anywhere in comment payloads (grep over raw R/B JSON: all absent). No image fields in comments at all; attached_info is an opaque base64-style string (e.g. ggIGCAsQABgA), not image info.",
+    "like count field is vote_count (number). Neither likes nor like_count exists. Vote state: liked/disliked/voting booleans (no like_count-style fields).",
+    "is_top/is_featured do NOT exist; actual keys are top (boolean, false in all samples) and featured (boolean, true on 5/5 root comments in sample R). censor_status exists (number, 0 in samples). can_recommend exists (boolean) in both root and child.",
+    "include_effect=ignored: A vs D (same URL +/- include on pinned answer) returned byte-identical wrappers {featured_counts,common_counts,collapsed_counts,reviewing_counts,comment_status,paging,data} with totals=0 both; data-level include test impossible on pinned answer (0 comments). The un-include-d R response already returns the full schema (content, vote_count, censor_status, can_recommend, author.member card, etc.), i.e. comment endpoints return a fixed default schema and the include parameter is not honored.",
+    "Article comments: GET /api/v4/articles/2086869210299475286/root_comments returned 404 (plain HTML 404: Not Found, also via page-context fallback) although the article exists (comment_permission=all, type=article). Not retried with variants due to the 7-request hard budget.",
+    "answers list (A2) returned 9 items despite limit=5 and has no comment_count field in default items (checked reaction/extras/biz_ext, none carry comment counts); answer choice for R was made by engagement (like_count=403).",
+    "Root comment objects embed child_comments: [] (empty array placeholder, never populated in root_comments responses).",
+    "Child comment ids are not returned in created_time order (B sample ids non-monotonic); ordering rule not determined within budget.",
+    "id is a JSON number for comments (e.g. 11576157620); created_time is unix seconds (number); resource_type=answer, type=comment; author.role and reply_to_author.role observed as \"normal\".",
+    "Request budget: exactly 7 requests, all >=3000ms apart, no 403/40353/40362 errors encountered; statuses: 6x200, 1x404."
+  ]
+}

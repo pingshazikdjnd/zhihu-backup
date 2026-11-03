@@ -33,8 +33,10 @@ export const IngestContentSchema = z.object({
   commentCount: z.number().int().optional().default(0),
   favoriteCount: z.number().int().optional().default(0),
   visitCount: z.number().int().optional().default(0),
-  isCollapsed: z.boolean().optional().default(false),
-  isLabeled: z.boolean().optional().default(false),
+  // 不给默认值：弱数据源（赞同/收藏动态）常不带这两个字段，
+  // 默认 false 会在更新路径把库里已有的折叠/黄标状态冲成 0
+  isCollapsed: z.boolean().optional(),
+  isLabeled: z.boolean().optional(),
   labelInfo: z.string().optional().default(""),
   createdTime: z.string().optional().default(""),
   updatedTime: z.string().optional().default("")
@@ -69,6 +71,48 @@ export const IngestCommentsSchema = z.object({
   // true = 本次抓取不完整（中途失败），跳过删除检测，避免误标删除
   partial: z.boolean().optional().default(false)
 });
+
+// 按「根」分组的评论同步：根评论留 D1 comments，子评论写 R2 childcomments/{rootId}.json。
+// 每请求 ≤20 个根：partial 合并最坏 20 GET + 20 PUT + D1 batch，压在 50 子请求限制内。
+export const IngestCommentsByRootSchema = z.object({
+  contentPk: z.string(),
+  roots: z.array(z.object({
+    id: z.string(),
+    author: z.string(),
+    authorAvatar: z.string().optional(),
+    content: z.string(),
+    img: z.string().optional(),
+    imageUrl: z.string().optional(),
+    time: z.string().optional(),
+    location: z.string().optional(),
+    likes: z.number(),
+    isAuthor: z.boolean().optional(),
+    isTop: z.boolean().optional(),
+    isFeatured: z.boolean().optional(),
+    childCount: z.number().default(0),
+    children: z.array(z.object({
+      id: z.string(),
+      parentId: z.string(),
+      author: z.string(),
+      authorAvatar: z.string().optional(),
+      beReplied: z.string().nullable().optional(),
+      content: z.string(),
+      img: z.string().optional(),
+      imageUrl: z.string().optional(),
+      time: z.string().optional(),
+      location: z.string().optional(),
+      likes: z.number(),
+      isAuthor: z.boolean().optional()
+    })).default([]),
+    isChildrenComplete: z.boolean().default(false)
+  })).max(20),  // ≤20 根/请求，避免超 50 子请求限制
+  // 全量 root id 列表（分批时用于删除对账）
+  allRootIds: z.array(z.string()).optional(),
+  partial: z.boolean().optional()
+});
+export type IngestCommentsByRootInput = z.infer<typeof IngestCommentsByRootSchema>;
+export type IngestRootCommentInput = IngestCommentsByRootInput["roots"][number];
+export type IngestChildCommentInput = IngestRootCommentInput["children"][number];
 
 export const IngestCollectionItemSchema = z.object({
   sourceType: ContentTypeSchema,

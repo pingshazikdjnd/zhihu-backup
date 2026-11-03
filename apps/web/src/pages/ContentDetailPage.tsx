@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { api } from "../lib/api.js";
+import { api, fetchRootComments } from "../lib/api.js";
 import { sanitizeHtml } from "../lib/sanitize.js";
 import CommentTree from "../components/CommentTree.js";
 
@@ -18,6 +18,11 @@ export default function ContentDetailPage() {
   const [syncMsg, setSyncMsg] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  // 评论单独维护错误/加载态：评论接口挂了不能把整篇正文一起判死
+  const [commentError, setCommentError] = useState("");
+  const [commentLoading, setCommentLoading] = useState(false);
+  // 每次切换 pk 自增，旧请求回来时据此丢弃，避免串台
+  const requestIdRef = useRef(0);
 
   // 云端 /sync-comments-live 已加 Bearer 鉴权（浏览器不该持有 API_SECRET），
   // 而且 Cloudflare 的出站 IP 抓知乎会被风控。抓取统一交给 Apify。
@@ -29,32 +34,45 @@ export default function ContentDetailPage() {
   // 实时刷新统计数字已移除：云端 /sync-live 需要 Bearer 鉴权，
   // 且 CF 出站抓知乎不可用。统计由 Apify 同步时一并更新。
 
+  const loadRootComments = useCallback(async (reqId: number) => {
+    setCommentError("");
+    setCommentLoading(true);
+    try {
+      const res = await fetchRootComments(pk, { limit: 20, offset: 0 });
+      if (requestIdRef.current !== reqId) return;
+      setComments(res.data || []);
+    } catch (e: any) {
+      if (requestIdRef.current !== reqId) return;
+      setCommentError(e?.message || "评论加载失败");
+    } finally {
+      if (requestIdRef.current === reqId) setCommentLoading(false);
+    }
+  }, [pk]);
+
   useEffect(() => {
     if (!pk) return;
-    let alive = true;
+    const reqId = ++requestIdRef.current;
     setDetail(null);
     setComments([]);
     setSyncMsg("");
     setLoading(true);
     setError("");
+    setCommentError("");
 
-    Promise.all([
-      api(`/api/contents/${encodeURIComponent(pk)}`).then(res => {
-        if (alive) setDetail(res);
-      }),
-      api<{ data: any[] }>(`/api/contents/${encodeURIComponent(pk)}/comments`).then(res => {
-        if (alive && res.data) setComments(res.data);
+    // 正文与评论解耦：任一失败只影响自己那一块
+    api(`/api/contents/${encodeURIComponent(pk)}`)
+      .then(res => {
+        if (requestIdRef.current === reqId) setDetail(res);
       })
-    ])
       .catch(e => {
-        if (alive) setError(e?.message || "加载失败");
+        if (requestIdRef.current === reqId) setError(e?.message || "加载失败");
       })
       .finally(() => {
-        if (alive) setLoading(false);
+        if (requestIdRef.current === reqId) setLoading(false);
       });
 
-    return () => { alive = false; };
-  }, [pk]);
+    loadRootComments(reqId);
+  }, [pk, loadRootComments]);
 
   // 不再自动触发实时同步：
   // 1) 云端 /sync-live 现在要求 Bearer 鉴权，浏览器不该持有 API_SECRET；
@@ -172,7 +190,22 @@ export default function ContentDetailPage() {
           </button>
           {syncMsg && <span style={{ fontSize: 13, color: "var(--zhihu-meta)", fontWeight: 400 }}>{syncMsg}</span>}
         </div>
-        <CommentTree comments={comments} />
+        {commentError && (
+          <div style={{ fontSize: 13, color: "#dc2626", marginBottom: 10, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <span>评论加载失败：{commentError}</span>
+            <button
+              type="button"
+              className="btn-ghost"
+              onClick={() => loadRootComments(requestIdRef.current)}
+            >
+              重试加载评论
+            </button>
+          </div>
+        )}
+        {commentLoading && comments.length === 0 && (
+          <p className="loading-state">评论加载中…</p>
+        )}
+        <CommentTree key={pk} comments={comments} contentPk={pk} />
       </div>
     </>
   );

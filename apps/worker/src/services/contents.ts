@@ -171,9 +171,17 @@ async function upsertContentInner(input: IngestContentInput) {
     const safeCreatedTime = isRealTime(input.createdTime) ? input.createdTime : existing.created_time;
     const safeUpdatedTime = isRealTime(input.updatedTime) ? input.updatedTime : existing.updated_time;
 
-    // Preserve existing stats if incoming are 0 to prevent data loss from faulty API responses
+    // Preserve existing stats if incoming are 0 to prevent data loss from faulty API responses.
     const safeVoteupCount = (input.voteupCount === 0 && existing.voteup_count > 0) ? existing.voteup_count : input.voteupCount;
-    const safeCommentCount = (input.commentCount === 0 && existing.comment_count > 0) ? existing.comment_count : input.commentCount;
+    // 评论数是例外：弱数据源（本次载荷不带正文，如收藏夹条目/赞同动态）里的 0 常常是
+    // 「未提供」而非「真的被删光」，必须沿用旧值；但带正文的完整载荷里 0 是真实观测，
+    // 若也锁死旧值，原站评论被删光后计数会永远停在旧数字。此时如实落 0，
+    // 并由 replaceCommentsByRoot 的全量清零对账兜底（见 services/comments.ts）。
+    const isWeakCommentPayload = !rawHtml && !rawMd;
+    const safeCommentCount =
+      (input.commentCount === 0 && existing.comment_count > 0 && isWeakCommentPayload)
+        ? existing.comment_count
+        : input.commentCount;
     const safeFavoriteCount = (!input.favoriteCount && existing.favorite_count > 0) ? existing.favorite_count : (input.favoriteCount || 0);
     const safeVisitCount = (!input.visitCount && existing.visit_count > 0) ? existing.visit_count : (input.visitCount || 0);
 
@@ -223,12 +231,13 @@ async function upsertContentInner(input: IngestContentInput) {
     if (existing.author_headline !== safeAuthorHeadline) {
       profileChanges.push("作者简介更新");
     }
-    const inputCollapsed = input.isCollapsed ? 1 : 0;
-    if (existing.is_collapsed !== inputCollapsed) {
+    // 未传（弱数据源）时保留库里的既有值；显式 false 才置 0
+    const nextCollapsed = input.isCollapsed !== undefined ? (input.isCollapsed ? 1 : 0) : existing.is_collapsed;
+    if (existing.is_collapsed !== nextCollapsed) {
       bodyChanges.push("折叠状态更新");
     }
-    const inputLabeled = input.isLabeled ? 1 : 0;
-    if (existing.is_labeled !== inputLabeled) {
+    const nextLabeled = input.isLabeled !== undefined ? (input.isLabeled ? 1 : 0) : existing.is_labeled;
+    if (existing.is_labeled !== nextLabeled) {
       bodyChanges.push("标签更新");
     }
 
@@ -237,13 +246,14 @@ async function upsertContentInner(input: IngestContentInput) {
     const resolvePrevCommentCount = async () => {
       let prevCommentCount = existing.comment_count;
       if (prevCommentCount > 0) {
+        // 只需判断「有没有评论」：COUNT(*) 会扫全量评论行，热门内容每轮同步都是读放大
         const cStat = await db.prepare(
-          `SELECT COUNT(*) AS cnt FROM comments WHERE content_pk = ?`
-        ).get<{ cnt: number }>(pk);
+          `SELECT 1 AS has_any FROM comments WHERE content_pk = ? LIMIT 1`
+        ).get<{ has_any: number }>(pk);
         // 只有「一条评论都没入库」才强制补抓。此前用 author_avatar IS NULL 判定
         // 「旧格式未迁移」，但知乎匿名/注销用户的头像本来就是空，导致这些内容
         // 永远被判为未抓全、每轮全量重抓评论，早停被反复清零。
-        if (!cStat || Number(cStat.cnt) === 0) {
+        if (!cStat) {
           prevCommentCount = 0;
         }
       }
@@ -280,8 +290,8 @@ async function upsertContentInner(input: IngestContentInput) {
         safeCommentCount,
         safeFavoriteCount,
         safeVisitCount,
-        input.isCollapsed ? 1 : 0,
-        input.isLabeled ? 1 : 0,
+        nextCollapsed,
+        nextLabeled,
         safeLabelInfo ?? null,
         safeCreatedTime ?? null,
         safeUpdatedTime ?? null,
@@ -327,9 +337,9 @@ async function upsertContentInner(input: IngestContentInput) {
         // 早前这里还检查 author_avatar IS NULL（旧格式未迁移），但匿名/注销用户的
         // 头像本来就是 NULL，会让每次正文变更都强制整篇重抓评论、早停反复清零。
         const cStat = await db.prepare(
-          `SELECT COUNT(*) AS cnt FROM comments WHERE content_pk = ?`
-        ).get<{ cnt: number }>(pk);
-        if (!cStat || Number(cStat.cnt) === 0) {
+          `SELECT 1 AS has_any FROM comments WHERE content_pk = ? LIMIT 1`
+        ).get<{ has_any: number }>(pk);
+        if (!cStat) {
           prevCommentCount = 0; // comments 表中尚无评论，强制返回 0 触发爬虫补抓
         }
       }

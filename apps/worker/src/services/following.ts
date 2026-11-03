@@ -1,4 +1,4 @@
-import { db } from "../db.js";
+import { db, FAV_JOIN_SQL } from "../db.js";
 import { evaluateContentRisk } from "./risk.js";
 
 export type FollowedUserRecord = {
@@ -25,30 +25,46 @@ export type FollowedUserRecord = {
 };
 
 const R2_FOLLOWED_KEY = "meta/followed_users.json";
-const FAV_JOIN = `(SELECT content_pk, MAX(first_seen_at) AS fav_added_at FROM collection_items WHERE is_removed = 0 GROUP BY content_pk)`;
 
-async function ensureTable() {
-  try {
-    await db.prepare(`
-      CREATE TABLE IF NOT EXISTS followed_users (
-        url_token TEXT PRIMARY KEY,
-        user_id TEXT,
-        name TEXT NOT NULL,
-        avatar_url TEXT,
-        headline TEXT,
-        answer_count INTEGER NOT NULL DEFAULT 0,
-        articles_count INTEGER NOT NULL DEFAULT 0,
-        follower_count INTEGER NOT NULL DEFAULT 0,
-        sync_mode TEXT NOT NULL DEFAULT 'default' CHECK (sync_mode IN ('default', 'full')),
-        is_unfollowed INTEGER NOT NULL DEFAULT 0,
-        first_seen_at TEXT NOT NULL,
-        last_seen_at TEXT NOT NULL,
-        last_synced_at TEXT
-      )
-    `).run();
-  } catch {
-    // D1 当日写入限额满时忽略，自动降级走 R2
-  }
+/** 「有变化」只看这些业务字段：时间戳/断点类字段每次都会被重写，不能拿来判断是否要写库 */
+const SIGNIFICANT_FIELDS = [
+  "user_id",
+  "name",
+  "avatar_url",
+  "headline",
+  "answer_count",
+  "articles_count",
+  "follower_count",
+  "sync_mode",
+  "is_unfollowed"
+] as const;
+type SignificantField = (typeof SIGNIFICANT_FIELDS)[number];
+
+/** 数字字段统一用 Number() 归一：D1 可能把 INTEGER 读成字符串，直接比较会误判为变化 */
+const NUMERIC_SIGNIFICANT_FIELDS: ReadonlySet<SignificantField> = new Set([
+  "answer_count",
+  "articles_count",
+  "follower_count",
+  "is_unfollowed"
+]);
+
+/**
+ * 把字段归一成可比较的字符串：null / undefined / "" 视为相同（都归一为空串）。
+ * 因为 R2 反序列化与 D1 返回值在类型上可能不一致，归一后再比较才不会触发假变化。
+ */
+function normalizeSignificantField(record: FollowedUserRecord | undefined, key: SignificantField): string {
+  if (!record) return "";
+  const raw: string | number | null | undefined = record[key];
+  if (NUMERIC_SIGNIFICANT_FIELDS.has(key)) return String(Number(raw ?? 0) || 0);
+  return String(raw ?? "");
+}
+
+/** 判断业务字段是否发生变化（新用户直接视为变化）；不含 last_seen_at 等每次刷新都会变的时间戳 */
+function hasSignificantChange(prev: FollowedUserRecord | undefined, next: FollowedUserRecord): boolean {
+  if (!prev) return true;
+  return SIGNIFICANT_FIELDS.some(
+    key => normalizeSignificantField(prev, key) !== normalizeSignificantField(next, key)
+  );
 }
 
 async function readR2Map(bucket: any): Promise<Record<string, FollowedUserRecord>> {
@@ -120,13 +136,15 @@ export async function upsertFollowedUsersSnapshot(
   const now = new Date().toISOString();
   const map = await getFollowedUsersMap(bucket);
   const incomingTokens = new Set<string>();
+  // 只记录真正需要落库的 token：空集合时 D1/R2 都不写，避免数据没变也产生写入放大
+  const changedTokens = new Set<string>();
 
   for (const u of users) {
     const token = String(u.urlToken || "").trim();
     if (!token) continue;
     incomingTokens.add(token);
     const prev = map[token];
-    map[token] = {
+    const next: FollowedUserRecord = {
       url_token: token,
       user_id: u.userId || prev?.user_id || "",
       name: u.name || prev?.name || token,
@@ -138,31 +156,53 @@ export async function upsertFollowedUsersSnapshot(
       sync_mode: prev?.sync_mode === "full" ? "full" : "default",
       is_unfollowed: 0,
       first_seen_at: prev?.first_seen_at || now,
-      last_seen_at: now,
+      // 先沿用旧的 last_seen_at；只有确认有变化时才在下面刷新为 now
+      last_seen_at: prev?.last_seen_at || now,
       last_synced_at: prev?.last_synced_at ?? null,
       mode_updated_at: prev?.mode_updated_at,
       resume_offset: prev?.resume_offset ?? 0,
       history_done: Boolean(prev?.history_done),
       last_checked_answer_id: prev?.last_checked_answer_id || ""
     };
+    if (hasSignificantChange(prev, next)) {
+      // 新用户或业务字段有变：才算一次真实写入，last_seen_at 随之刷新
+      next.last_seen_at = now;
+      changedTokens.add(token);
+    }
+    map[token] = next;
   }
 
   if (!incremental && incomingTokens.size > 0) {
     for (const token of Object.keys(map)) {
       if (!incomingTokens.has(token)) {
-        map[token].is_unfollowed = 1;
+        const rec = map[token];
+        // 已是取关状态的不重复标记、不重复写；「未取关 -> 取关」算一次真实变化
+        if (rec.is_unfollowed) continue;
+        rec.is_unfollowed = 1;
+        rec.last_seen_at = now;
+        changedTokens.add(token);
       }
     }
+  }
+
+  // 没有任何变化时直接返回：不写 R2（省 Class A）、不发 D1 batch（省每日行写入额度）
+  if (changedTokens.size === 0) {
+    const allList = Object.values(map).filter(u => !u.is_unfollowed);
+    return {
+      ok: true,
+      totalFollowed: allList.length,
+      fullModeCount: allList.filter(u => u.sync_mode === "full").length
+    };
   }
 
   // 1. 先写 R2（不受 D1 每日 100K 行写入限制影响，100% 实时成功）
   await writeR2Map(bucket, map);
 
-  // 2. 尝试同步写 D1
+  // 2. 尝试同步写 D1（只写有变化的用户，迁移 0003 已建表，无需再执行 DDL）
   try {
-    await ensureTable();
     const stmts: any[] = [];
-    for (const r of Object.values(map)) {
+    for (const token of changedTokens) {
+      const r = map[token];
       stmts.push(
         db.prepare(`
           INSERT INTO followed_users (
@@ -240,7 +280,7 @@ export async function setFollowedUserSyncMode(
   await writeR2Map(bucket, map);
 
   try {
-    await ensureTable();
+    // 迁移 0003 已建表，这里直接 UPDATE；D1 配额满时由 R2 持久化
     await db.prepare(
       `UPDATE followed_users SET sync_mode = ?, last_seen_at = ? WHERE url_token = ?`
     ).run(syncMode, now, urlToken);
@@ -301,11 +341,11 @@ export async function listFollowedUsers(
         c.author_name,
         count(*) AS backed_cnt,
         sum(CASE WHEN u.content_pk IS NOT NULL THEN 1 ELSE 0 END) AS upvoted_cnt,
-        sum(CASE WHEN ci.content_pk IS NOT NULL THEN 1 ELSE 0 END) AS faved_cnt,
+        sum(CASE WHEN fav.content_pk IS NOT NULL THEN 1 ELSE 0 END) AS faved_cnt,
         max(COALESCE(c.updated_time, c.created_time, c.last_seen_at)) AS latest_time
       FROM contents c
       LEFT JOIN upvotes u ON u.content_pk = c.pk
-      LEFT JOIN ${FAV_JOIN} ci ON ci.content_pk = c.pk
+      ${FAV_JOIN_SQL}
       WHERE c.author_name IS NOT NULL AND c.author_name != ''
       GROUP BY c.author_url_token, c.author_name
     `).all<any>();
@@ -432,10 +472,10 @@ export async function getFollowedUserContents(
            c.is_deleted, c.is_collapsed, c.is_labeled, c.label_info,
            c.created_time, c.updated_time, c.last_seen_at,
            u.upvote_time,
-           CASE WHEN ci.content_pk IS NOT NULL THEN 1 ELSE 0 END AS in_favorites
+           CASE WHEN fav.content_pk IS NOT NULL THEN 1 ELSE 0 END AS in_favorites
     FROM contents c
     LEFT JOIN upvotes u ON u.content_pk = c.pk
-    LEFT JOIN ${FAV_JOIN} ci ON ci.content_pk = c.pk
+    ${FAV_JOIN_SQL}
     WHERE ${whereSql}
     ORDER BY COALESCE(c.updated_time, c.created_time, c.last_seen_at) DESC
     LIMIT 1000
@@ -510,10 +550,10 @@ export async function listFollowingFeed(
            c.is_deleted, c.is_collapsed, c.is_labeled, c.label_info,
            c.created_time, c.updated_time, c.last_seen_at,
            u.upvote_time,
-           CASE WHEN ci.content_pk IS NOT NULL THEN 1 ELSE 0 END AS in_favorites
+           CASE WHEN fav.content_pk IS NOT NULL THEN 1 ELSE 0 END AS in_favorites
     FROM contents c
     LEFT JOIN upvotes u ON u.content_pk = c.pk
-    LEFT JOIN ${FAV_JOIN} ci ON ci.content_pk = c.pk
+    ${FAV_JOIN_SQL}
     WHERE (
       ${tokensIn ? `c.author_url_token IN (${tokensIn})` : "0"}
       OR ${namesIn ? `((c.author_url_token IS NULL OR c.author_url_token = '') AND c.author_name IN (${namesIn}))` : "0"}

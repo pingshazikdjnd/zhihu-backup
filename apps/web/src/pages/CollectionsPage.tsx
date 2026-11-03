@@ -32,14 +32,18 @@ export default function CollectionsPage() {
     allCollectionsStore.activeTab = activeTab;
   }, [activeTab]);
 
+  const loadCollections = () => {
+    api<{ data: any[] }>("/api/collections")
+      .then(res => {
+        setCollections(res.data);
+        allCollectionsStore.collections = res.data;
+      })
+      .catch(e => setError(e?.message || "收藏夹列表加载失败"));
+  };
+
   useEffect(() => {
     if (collections.length === 0) {
-      api<{ data: any[] }>("/api/collections")
-        .then(res => {
-          setCollections(res.data);
-          allCollectionsStore.collections = res.data;
-        })
-        .catch(e => setError(e?.message || "收藏夹列表加载失败"));
+      loadCollections();
     }
   }, []);
 
@@ -74,16 +78,18 @@ export default function CollectionsPage() {
     }
   }, [activeTab]);
 
-  const lastElementRef = useCallback((node: HTMLAnchorElement) => {
-    if (isLoading) return;
+  const lastElementRef = useCallback((node: HTMLElement | null) => {
+    // 上一次请求失败时不能再挂 observer：哨兵元素持续可见会形成
+    // 失败 -> 重挂 -> 再失败的无限请求风暴
+    if (isLoading || error) return;
     if (observer.current) observer.current.disconnect();
     observer.current = new IntersectionObserver(entries => {
-      if (entries[0].isIntersecting && hasMoreItems) {
+      if (entries[0].isIntersecting && !isLoading && !error && hasMoreItems) {
         fetchItems(itemsPage + 1);
       }
     });
     if (node) observer.current.observe(node);
-  }, [isLoading, hasMoreItems, itemsPage]);
+  }, [isLoading, error, hasMoreItems, itemsPage]);
 
   const fmtNum = (n: any) => {
     const num = Number(n) || 0;
@@ -94,8 +100,22 @@ export default function CollectionsPage() {
   return (
     <div>
       {error && (
-        <div className="card" style={{ color: "#dc2626", fontSize: 14 }}>
-          {error}
+        <div className="card" style={{ color: "#dc2626", fontSize: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <span>{error}</span>
+          <button
+            type="button"
+            className="btn-ghost"
+            onClick={() => {
+              setError("");
+              if (activeTab === "collections") {
+                loadCollections();
+              } else {
+                fetchItems(items.length === 0 ? 1 : itemsPage + 1);
+              }
+            }}
+          >
+            点击重试
+          </button>
         </div>
       )}
       <div className="tab-bar">
@@ -125,20 +145,15 @@ export default function CollectionsPage() {
 
         {activeTab === "items" && items.map((item, index) => {
           const isLast = index === items.length - 1;
-          return (
-            <Link 
-              className="card" 
-              key={`${item.id}-${index}`} 
-              to={`/contents/${encodeURIComponent(item.content_pk)}`}
-              ref={isLast ? lastElementRef : null}
-            >
+          const cardBody = (
+            <>
               {item.author_name && (
                 <div className="card-author">
                   {item.author_avatar && <img src={item.author_avatar} alt="" referrerPolicy="no-referrer" />}
                   <span className="author-name">{item.author_name}</span>
                 </div>
               )}
-              <h3>{item.title || item.content_pk}</h3>
+              <h3>{item.title || item.content_pk || "（内容编号缺失）"}</h3>
               {item.excerpt && <p className="card-excerpt">{stripHtml(item.excerpt)}</p>}
               
               <div className="card-footer">
@@ -151,7 +166,22 @@ export default function CollectionsPage() {
                 <span className="stat">{item.source_type === "answer" ? "回答" : item.source_type === "article" ? "文章" : item.source_type}</span>
                 <span className="footer-right">收藏于 {new Date(item.created_time).toLocaleDateString()}</span>
               </div>
+            </>
+          );
+          // content_pk 为空时不能拼出 /contents/null，降级成不可点击的普通卡片
+          return item.content_pk ? (
+            <Link 
+              className="card" 
+              key={`${item.id}-${index}`} 
+              to={`/contents/${encodeURIComponent(item.content_pk)}`}
+              ref={isLast ? lastElementRef : null}
+            >
+              {cardBody}
             </Link>
+          ) : (
+            <div className="card" key={`${item.id}-${index}`} ref={isLast ? lastElementRef : null}>
+              {cardBody}
+            </div>
           );
         })}
 

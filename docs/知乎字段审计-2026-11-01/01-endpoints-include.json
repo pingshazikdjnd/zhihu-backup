@@ -1,0 +1,916 @@
+{
+  "meta": {
+    "generated": "2026-11-01",
+    "method": "全仓库静态 grep + 逐行人工核对，未发任何网络请求。字段路径均来自代码原文，file:line 为证据。",
+    "source_files": [
+      "apps/collector/src/jobs/sync.ts",
+      "apps/apify-crawler/src/main.ts",
+      "apps/api/src/routes/contents.ts"
+    ],
+    "evidence_note": "code_reads 的 file 字段中多个引用用 ' | ' 分隔，表示同一路径在多个文件/位置被读取（同一逻辑链路）。"
+  },
+  "endpoints": [
+    {
+      "id": "answers_list_mine",
+      "url_template": "https://www.zhihu.com/api/v4/members/{username}/answers?include={include}&limit=20&offset={offset}",
+      "kind": "list",
+      "call_sites": [
+        "apps/collector/src/jobs/sync.ts:83",
+        "apps/apify-crawler/src/main.ts:270",
+        "apps/apify-crawler/src/main.ts:393"
+      ],
+      "params": [
+        "include=<URL 编码的 include 串，见 include_raw>",
+        "limit=20",
+        "offset=0|20|40|...（main.ts 优先跟随 json.paging.next，next 缺失时 offset+=20）"
+      ],
+      "include_raw": "data[*].is_normal,admin_closed_comment,reward_info,is_collapsed,annotation_action,annotation_detail,collapse_reason,collapsed_by,suggest_edit,comment_count,can_comment,content,voteup_count,reshipment_settings,comment_permission,mark_infos,created_time,updated_time,review_info,question,excerpt,is_labeled,label_info,relationship.is_authorized,voting,is_author,is_thanked,is_nothelp,is_recognized,visit_count,favorite_count;data[*].author.badge[?(type=best_answerer)].topics",
+      "include_fields": [
+        "data[*].is_normal",
+        "data[*].admin_closed_comment",
+        "data[*].reward_info",
+        "data[*].is_collapsed",
+        "data[*].annotation_action",
+        "data[*].annotation_detail",
+        "data[*].collapse_reason",
+        "data[*].collapsed_by",
+        "data[*].suggest_edit",
+        "data[*].comment_count",
+        "data[*].can_comment",
+        "data[*].content",
+        "data[*].voteup_count",
+        "data[*].reshipment_settings",
+        "data[*].comment_permission",
+        "data[*].mark_infos",
+        "data[*].created_time",
+        "data[*].updated_time",
+        "data[*].review_info",
+        "data[*].question",
+        "data[*].excerpt",
+        "data[*].is_labeled",
+        "data[*].label_info",
+        "data[*].relationship.is_authorized",
+        "data[*].voting",
+        "data[*].is_author",
+        "data[*].is_thanked",
+        "data[*].is_nothelp",
+        "data[*].is_recognized",
+        "data[*].visit_count",
+        "data[*].favorite_count",
+        "data[*].author.badge[?(type=best_answerer)].topics"
+      ],
+      "code_reads": [
+        { "path": "json.data", "file": "apps/collector/src/jobs/sync.ts:91 | apps/apify-crawler/src/main.ts:288" },
+        { "path": "json.paging.is_end", "file": "apps/collector/src/jobs/sync.ts:160 | apps/apify-crawler/src/main.ts:379" },
+        { "path": "json.paging.next", "file": "apps/apify-crawler/src/main.ts:380" },
+        { "path": "item.type", "file": "apps/collector/src/jobs/sync.ts:96 | apps/apify-crawler/src/main.ts:306" },
+        { "path": "item.id", "file": "apps/collector/src/jobs/sync.ts:117 | apps/apify-crawler/src/main.ts:306" },
+        { "path": "item.voteup_count", "file": "apps/collector/src/jobs/sync.ts:98 | apps/apify-crawler/src/main.ts:318" },
+        { "path": "item.reaction.statistics.like_count", "file": "apps/collector/src/jobs/sync.ts:98 | apps/apify-crawler/src/main.ts:318" },
+        { "path": "item.reaction.statistics.upvote_count", "file": "apps/collector/src/jobs/sync.ts:98 | apps/apify-crawler/src/main.ts:318" },
+        { "path": "item.favorite_count", "file": "apps/collector/src/jobs/sync.ts:99 | apps/apify-crawler/src/main.ts:319" },
+        { "path": "item.thanks_count", "file": "apps/collector/src/jobs/sync.ts:99 | apps/apify-crawler/src/main.ts:319" },
+        { "path": "item.reaction.statistics.favorites", "file": "apps/collector/src/jobs/sync.ts:99 | apps/apify-crawler/src/main.ts:319" },
+        { "path": "item.reaction.statistics.favorite_count", "file": "apps/collector/src/jobs/sync.ts:99 | apps/apify-crawler/src/main.ts:319" },
+        { "path": "item.visit_count", "file": "apps/collector/src/jobs/sync.ts:100 | apps/apify-crawler/src/main.ts:320" },
+        { "path": "item.reaction.statistics.visit_count", "file": "apps/collector/src/jobs/sync.ts:100 | apps/apify-crawler/src/main.ts:320" },
+        { "path": "item.question.title", "file": "apps/collector/src/jobs/sync.ts:118 | apps/apify-crawler/src/main.ts:325" },
+        { "path": "item.question.id", "file": "apps/collector/src/jobs/sync.ts:119 | apps/apify-crawler/src/main.ts:326" },
+        { "path": "item.author.name", "file": "apps/collector/src/jobs/sync.ts:120 | apps/apify-crawler/src/main.ts:327" },
+        { "path": "item.author.url_token", "file": "apps/collector/src/jobs/sync.ts:120 | apps/apify-crawler/src/main.ts:327" },
+        { "path": "item.author.avatar_url", "file": "apps/collector/src/jobs/sync.ts:120 | apps/apify-crawler/src/main.ts:327" },
+        { "path": "item.author.headline", "file": "apps/collector/src/jobs/sync.ts:120 | apps/apify-crawler/src/main.ts:327" },
+        { "path": "item.content", "file": "apps/collector/src/jobs/sync.ts:122 | apps/apify-crawler/src/main.ts:329" },
+        { "path": "item.excerpt", "file": "apps/collector/src/jobs/sync.ts:124 | apps/apify-crawler/src/main.ts:331" },
+        { "path": "item.comment_count", "file": "apps/collector/src/jobs/sync.ts:126 | apps/apify-crawler/src/main.ts:333" },
+        { "path": "item.is_collapsed", "file": "apps/collector/src/jobs/sync.ts:129 | apps/apify-crawler/src/main.ts:336" },
+        { "path": "item.is_labeled", "file": "apps/collector/src/jobs/sync.ts:130 | apps/apify-crawler/src/main.ts:337" },
+        { "path": "item.label_info", "file": "apps/collector/src/jobs/sync.ts:131 | apps/apify-crawler/src/main.ts:338" },
+        { "path": "item.created_time", "file": "apps/collector/src/jobs/sync.ts:132 | apps/apify-crawler/src/main.ts:339" },
+        { "path": "item.updated_time", "file": "apps/collector/src/jobs/sync.ts:133 | apps/apify-crawler/src/main.ts:340" }
+      ],
+      "coverage": {
+        "requested_not_read": [
+          "data[*].is_normal",
+          "data[*].admin_closed_comment",
+          "data[*].reward_info",
+          "data[*].annotation_action",
+          "data[*].annotation_detail",
+          "data[*].collapse_reason",
+          "data[*].collapsed_by",
+          "data[*].suggest_edit",
+          "data[*].can_comment",
+          "data[*].reshipment_settings",
+          "data[*].comment_permission",
+          "data[*].mark_infos",
+          "data[*].review_info",
+          "data[*].relationship.is_authorized",
+          "data[*].voting",
+          "data[*].is_author",
+          "data[*].is_thanked",
+          "data[*].is_nothelp",
+          "data[*].is_recognized",
+          "data[*].author.badge[?(type=best_answerer)].topics"
+        ],
+        "both": [
+          "comment_count",
+          "content",
+          "voteup_count",
+          "created_time",
+          "updated_time",
+          "question（读 .title/.id）",
+          "excerpt",
+          "is_collapsed",
+          "is_labeled",
+          "label_info",
+          "visit_count",
+          "favorite_count"
+        ],
+        "read_not_requested": [
+          "item.type",
+          "item.id",
+          "item.thanks_count",
+          "item.reaction.statistics.like_count",
+          "item.reaction.statistics.upvote_count",
+          "item.reaction.statistics.favorites",
+          "item.reaction.statistics.favorite_count",
+          "item.reaction.statistics.visit_count",
+          "item.author.name",
+          "item.author.url_token",
+          "item.author.avatar_url",
+          "item.author.headline",
+          "json.paging.is_end",
+          "json.paging.next"
+        ]
+      }
+    },
+    {
+      "id": "answer_detail",
+      "url_template": "https://www.zhihu.com/api/v4/answers/{answerId}?include=voteup_count,comment_count,visit_count,favorite_count",
+      "kind": "detail",
+      "call_sites": [
+        "apps/collector/src/jobs/sync.ts:104",
+        "apps/api/src/routes/contents.ts:39"
+      ],
+      "params": [
+        "include=voteup_count,comment_count,visit_count,favorite_count（写死在 URL 里，无 data[*]. 前缀）"
+      ],
+      "include_raw": "voteup_count,comment_count,visit_count,favorite_count",
+      "include_fields": [
+        "voteup_count",
+        "comment_count",
+        "visit_count",
+        "favorite_count"
+      ],
+      "code_reads": [
+        { "path": "detail.voteup_count", "file": "apps/collector/src/jobs/sync.ts:107" },
+        { "path": "detail.favorite_count", "file": "apps/collector/src/jobs/sync.ts:108" },
+        { "path": "detail.visit_count", "file": "apps/collector/src/jobs/sync.ts:109" },
+        { "path": "data.error.message", "file": "apps/api/src/routes/contents.ts:58" },
+        { "path": "data.error.code", "file": "apps/api/src/routes/contents.ts:59" },
+        { "path": "data.voteup_count", "file": "apps/api/src/routes/contents.ts:65" },
+        { "path": "data.comment_count", "file": "apps/api/src/routes/contents.ts:66" },
+        { "path": "data.visit_count", "file": "apps/api/src/routes/contents.ts:67" },
+        { "path": "data.favorite_count", "file": "apps/api/src/routes/contents.ts:68" },
+        { "path": "data.thanks_count", "file": "apps/api/src/routes/contents.ts:68" },
+        { "path": "data.reaction.statistics.favorites", "file": "apps/api/src/routes/contents.ts:68" },
+        { "path": "data.reaction.statistics.favorite_count", "file": "apps/api/src/routes/contents.ts:68" }
+      ],
+      "coverage": {
+        "requested_not_read": [],
+        "both": [
+          "voteup_count",
+          "comment_count（contents.ts 读；sync.ts 不读）",
+          "visit_count",
+          "favorite_count"
+        ],
+        "read_not_requested": [
+          "data.thanks_count",
+          "data.reaction.statistics.favorites",
+          "data.reaction.statistics.favorite_count",
+          "data.error.code",
+          "data.error.message"
+        ]
+      }
+    },
+    {
+      "id": "answers_root_comments",
+      "url_template": "https://www.zhihu.com/api/v4/answers/{answerId}/root_comments?limit=20&offset={offset}",
+      "kind": "list",
+      "call_sites": [
+        "apps/collector/src/jobs/sync.ts:174",
+        "apps/apify-crawler/src/main.ts:411",
+        "apps/api/src/routes/contents.ts:135"
+      ],
+      "params": [
+        "limit=20",
+        "offset=0|20|40|...（按 offset 翻页；main.ts:421 hot 模式 offset>=20 即停）"
+      ],
+      "include_raw": "",
+      "include_fields": [],
+      "code_reads": [
+        { "path": "json.data", "file": "apps/collector/src/jobs/sync.ts:180 | apps/apify-crawler/src/main.ts:417 | apps/api/src/routes/contents.ts:140" },
+        { "path": "json.paging.is_end", "file": "apps/collector/src/jobs/sync.ts:181 | apps/apify-crawler/src/main.ts:418 | apps/api/src/routes/contents.ts:141" },
+        { "path": "c.id", "file": "apps/apify-crawler/src/main.ts:429 | apps/collector/src/jobs/sync.ts:187 | apps/api/src/routes/contents.ts:147" },
+        { "path": "c.reply_to_comment_id", "file": "apps/apify-crawler/src/main.ts:430 | apps/collector/src/jobs/sync.ts:188 | apps/api/src/routes/contents.ts:148" },
+        { "path": "c.author.member.name", "file": "apps/apify-crawler/src/main.ts:431 | apps/collector/src/jobs/sync.ts:189 | apps/api/src/routes/contents.ts:149" },
+        { "path": "c.author.member.avatar_url", "file": "apps/apify-crawler/src/main.ts:432 | apps/collector/src/jobs/sync.ts:190 | apps/api/src/routes/contents.ts:150" },
+        { "path": "c.reply_to_author.member.name", "file": "apps/apify-crawler/src/main.ts:433 | apps/collector/src/jobs/sync.ts:191 | apps/api/src/routes/contents.ts:151" },
+        { "path": "c.content", "file": "apps/apify-crawler/src/main.ts:427 | apps/collector/src/jobs/sync.ts:192 | apps/api/src/routes/contents.ts:152" },
+        { "path": "c.img", "file": "apps/apify-crawler/src/main.ts:224（pickCommentImageUrl，经 normalizeCommentImage 于 main.ts:427 传入）" },
+        { "path": "c.imageUrl", "file": "apps/apify-crawler/src/main.ts:224" },
+        { "path": "c.image_url", "file": "apps/apify-crawler/src/main.ts:224" },
+        { "path": "c.created_time", "file": "apps/apify-crawler/src/main.ts:437 | apps/collector/src/jobs/sync.ts:194 | apps/api/src/routes/contents.ts:154" },
+        { "path": "c.address_text", "file": "apps/apify-crawler/src/main.ts:438 | apps/collector/src/jobs/sync.ts:195 | apps/api/src/routes/contents.ts:155" },
+        { "path": "c.vote_count", "file": "apps/apify-crawler/src/main.ts:439 | apps/collector/src/jobs/sync.ts:196 | apps/api/src/routes/contents.ts:156" },
+        { "path": "c.reaction.statistics.like_count", "file": "apps/apify-crawler/src/main.ts:439 | apps/collector/src/jobs/sync.ts:196 | apps/api/src/routes/contents.ts:156" },
+        { "path": "c.is_author", "file": "apps/apify-crawler/src/main.ts:440 | apps/collector/src/jobs/sync.ts:197 | apps/api/src/routes/contents.ts:157" },
+        { "path": "c.author.role", "file": "apps/apify-crawler/src/main.ts:440 | apps/collector/src/jobs/sync.ts:197 | apps/api/src/routes/contents.ts:157" },
+        { "path": "c.top", "file": "apps/apify-crawler/src/main.ts:441 | apps/collector/src/jobs/sync.ts:198 | apps/api/src/routes/contents.ts:158" },
+        { "path": "c.featured", "file": "apps/apify-crawler/src/main.ts:442 | apps/collector/src/jobs/sync.ts:199 | apps/api/src/routes/contents.ts:159" },
+        { "path": "c.child_comment_count", "file": "apps/apify-crawler/src/main.ts:445 | apps/collector/src/jobs/sync.ts:202 | apps/api/src/routes/contents.ts:163" },
+        { "path": "c.child_comments[]", "file": "apps/apify-crawler/src/main.ts:445 | apps/collector/src/jobs/sync.ts:202 | apps/api/src/routes/contents.ts:162" }
+      ],
+      "coverage": {
+        "requested_not_read": [],
+        "both": [],
+        "read_not_requested": [
+          "json.data",
+          "json.paging.is_end",
+          "c.id",
+          "c.reply_to_comment_id",
+          "c.author.member.name",
+          "c.author.member.avatar_url",
+          "c.reply_to_author.member.name",
+          "c.content",
+          "c.img",
+          "c.imageUrl",
+          "c.image_url",
+          "c.created_time",
+          "c.address_text",
+          "c.vote_count",
+          "c.reaction.statistics.like_count",
+          "c.is_author",
+          "c.author.role",
+          "c.top",
+          "c.featured",
+          "c.child_comment_count",
+          "c.child_comments[]"
+        ]
+      },
+      "notes": [
+        "本接口未携带 include，所有字段依赖知乎默认返回（FIELD_AUDIT.md 实测记录了实际返回面）。"
+      ]
+    },
+    {
+      "id": "comments_child_comments",
+      "url_template": "https://www.zhihu.com/api/v4/comments/{commentId}/child_comments?limit=20&offset={offset}",
+      "kind": "list",
+      "call_sites": [
+        "apps/collector/src/jobs/sync.ts:206",
+        "apps/apify-crawler/src/main.ts:451",
+        "apps/api/src/routes/contents.ts:164"
+      ],
+      "params": [
+        "limit=20",
+        "offset=0|20|40|...（sync.ts/main.ts 用 offset 翻页；contents.ts:164 仅传 limit=20，随后跟随 json.paging.next）"
+      ],
+      "include_raw": "",
+      "include_fields": [],
+      "code_reads": [
+        { "path": "json.data", "file": "apps/collector/src/jobs/sync.ts:209 | apps/apify-crawler/src/main.ts:454 | apps/api/src/routes/contents.ts:170" },
+        { "path": "json.paging.is_end", "file": "apps/collector/src/jobs/sync.ts:231 | apps/apify-crawler/src/main.ts:478 | apps/api/src/routes/contents.ts:171" },
+        { "path": "json.paging.next", "file": "apps/api/src/routes/contents.ts:195" },
+        { "path": "child.id", "file": "apps/apify-crawler/src/main.ts:462 | apps/collector/src/jobs/sync.ts:216 | apps/api/src/routes/contents.ts:179" },
+        { "path": "child.author.member.name", "file": "apps/apify-crawler/src/main.ts:464 | apps/collector/src/jobs/sync.ts:218 | apps/api/src/routes/contents.ts:181" },
+        { "path": "child.author.member.avatar_url", "file": "apps/apify-crawler/src/main.ts:465 | apps/collector/src/jobs/sync.ts:219 | apps/api/src/routes/contents.ts:182" },
+        { "path": "child.reply_to_author.member.name", "file": "apps/apify-crawler/src/main.ts:466 | apps/collector/src/jobs/sync.ts:220 | apps/api/src/routes/contents.ts:183" },
+        { "path": "child.content", "file": "apps/apify-crawler/src/main.ts:460 | apps/collector/src/jobs/sync.ts:221 | apps/api/src/routes/contents.ts:184" },
+        { "path": "child.img", "file": "apps/apify-crawler/src/main.ts:224（经 normalizeCommentImage 于 main.ts:460 传入）" },
+        { "path": "child.imageUrl", "file": "apps/apify-crawler/src/main.ts:224" },
+        { "path": "child.image_url", "file": "apps/apify-crawler/src/main.ts:224" },
+        { "path": "child.created_time", "file": "apps/apify-crawler/src/main.ts:470 | apps/collector/src/jobs/sync.ts:223 | apps/api/src/routes/contents.ts:186" },
+        { "path": "child.address_text", "file": "apps/apify-crawler/src/main.ts:471 | apps/collector/src/jobs/sync.ts:224 | apps/api/src/routes/contents.ts:187" },
+        { "path": "child.vote_count", "file": "apps/apify-crawler/src/main.ts:472 | apps/collector/src/jobs/sync.ts:225 | apps/api/src/routes/contents.ts:188" },
+        { "path": "child.reaction.statistics.like_count", "file": "apps/apify-crawler/src/main.ts:472 | apps/collector/src/jobs/sync.ts:225 | apps/api/src/routes/contents.ts:188" },
+        { "path": "child.is_author", "file": "apps/apify-crawler/src/main.ts:473 | apps/collector/src/jobs/sync.ts:226 | apps/api/src/routes/contents.ts:189" },
+        { "path": "child.author.role", "file": "apps/apify-crawler/src/main.ts:473 | apps/collector/src/jobs/sync.ts:226 | apps/api/src/routes/contents.ts:189" },
+        { "path": "child.top", "file": "apps/apify-crawler/src/main.ts:474 | apps/collector/src/jobs/sync.ts:227 | apps/api/src/routes/contents.ts:190" },
+        { "path": "child.featured", "file": "apps/apify-crawler/src/main.ts:475 | apps/collector/src/jobs/sync.ts:228 | apps/api/src/routes/contents.ts:191" }
+      ],
+      "coverage": {
+        "requested_not_read": [],
+        "both": [],
+        "read_not_requested": [
+          "json.data",
+          "json.paging.is_end",
+          "json.paging.next",
+          "child.id",
+          "child.author.member.name",
+          "child.author.member.avatar_url",
+          "child.reply_to_author.member.name",
+          "child.content",
+          "child.img",
+          "child.imageUrl",
+          "child.image_url",
+          "child.created_time",
+          "child.address_text",
+          "child.vote_count",
+          "child.reaction.statistics.like_count",
+          "child.is_author",
+          "child.author.role",
+          "child.top",
+          "child.featured"
+        ]
+      }
+    },
+    {
+      "id": "articles_root_comments",
+      "url_template": "https://www.zhihu.com/api/v4/articles/{articleId}/root_comments?limit=20&offset={offset}",
+      "kind": "list",
+      "call_sites": [
+        "apps/apify-crawler/src/main.ts:582（endpointType='articles'，见 main.ts:572）"
+      ],
+      "params": [
+        "limit=20",
+        "offset=0|20|40|...（full 模式最多 200 页，hot 模式仅 1 页，见 main.ts:577）"
+      ],
+      "include_raw": "",
+      "include_fields": [],
+      "code_reads": [
+        { "path": "json.data", "file": "apps/apify-crawler/src/main.ts:588" },
+        { "path": "json.paging.is_end", "file": "apps/apify-crawler/src/main.ts:634" },
+        { "path": "c.id", "file": "apps/apify-crawler/src/main.ts:595" },
+        { "path": "c.reply_to_comment_id", "file": "apps/apify-crawler/src/main.ts:596" },
+        { "path": "c.author.member.name", "file": "apps/apify-crawler/src/main.ts:597" },
+        { "path": "c.author.member.avatar_url", "file": "apps/apify-crawler/src/main.ts:598" },
+        { "path": "c.content", "file": "apps/apify-crawler/src/main.ts:593" },
+        { "path": "c.img", "file": "apps/apify-crawler/src/main.ts:224（经 normalizeCommentImage 于 main.ts:593 传入）" },
+        { "path": "c.imageUrl", "file": "apps/apify-crawler/src/main.ts:224" },
+        { "path": "c.image_url", "file": "apps/apify-crawler/src/main.ts:224" },
+        { "path": "c.created_time", "file": "apps/apify-crawler/src/main.ts:603" },
+        { "path": "c.address_text", "file": "apps/apify-crawler/src/main.ts:604" },
+        { "path": "c.vote_count", "file": "apps/apify-crawler/src/main.ts:605" },
+        { "path": "c.reaction.statistics.like_count", "file": "apps/apify-crawler/src/main.ts:605" },
+        { "path": "c.is_author", "file": "apps/apify-crawler/src/main.ts:606" },
+        { "path": "c.author.role", "file": "apps/apify-crawler/src/main.ts:606" },
+        { "path": "c.top", "file": "apps/apify-crawler/src/main.ts:607" },
+        { "path": "c.featured", "file": "apps/apify-crawler/src/main.ts:608" },
+        { "path": "c.child_comments[]", "file": "apps/apify-crawler/src/main.ts:611" },
+        { "path": "child.id", "file": "apps/apify-crawler/src/main.ts:615" },
+        { "path": "child.author.member.name", "file": "apps/apify-crawler/src/main.ts:617" },
+        { "path": "child.author.member.avatar_url", "file": "apps/apify-crawler/src/main.ts:618" },
+        { "path": "child.reply_to_author.member.name", "file": "apps/apify-crawler/src/main.ts:619" },
+        { "path": "child.content", "file": "apps/apify-crawler/src/main.ts:613" },
+        { "path": "child.created_time", "file": "apps/apify-crawler/src/main.ts:623" },
+        { "path": "child.address_text", "file": "apps/apify-crawler/src/main.ts:624" },
+        { "path": "child.vote_count", "file": "apps/apify-crawler/src/main.ts:625" },
+        { "path": "child.reaction.statistics.like_count", "file": "apps/apify-crawler/src/main.ts:625" },
+        { "path": "child.is_author", "file": "apps/apify-crawler/src/main.ts:626" },
+        { "path": "child.top", "file": "apps/apify-crawler/src/main.ts:627" },
+        { "path": "child.featured", "file": "apps/apify-crawler/src/main.ts:628" }
+      ],
+      "coverage": {
+        "requested_not_read": [],
+        "both": [],
+        "read_not_requested": [
+          "json.data",
+          "json.paging.is_end",
+          "c.*（同 answers_root_comments 全集）",
+          "child.*（同 answers_root_comments 全集）"
+        ]
+      }
+    },
+    {
+      "id": "members_favlists",
+      "url_template": "https://www.zhihu.com/api/v4/members/{username}/favlists?limit=20&offset={offset}",
+      "kind": "list",
+      "call_sites": [
+        "apps/collector/src/jobs/sync.ts:293",
+        "apps/apify-crawler/src/main.ts:676"
+      ],
+      "params": [
+        "limit=20",
+        "offset=0|20|40|..."
+      ],
+      "include_raw": "",
+      "include_fields": [],
+      "code_reads": [
+        { "path": "json.data", "file": "apps/collector/src/jobs/sync.ts:299 | apps/apify-crawler/src/main.ts:686" },
+        { "path": "json.paging.is_end", "file": "apps/collector/src/jobs/sync.ts:309 | apps/apify-crawler/src/main.ts:702" },
+        { "path": "item.id", "file": "apps/collector/src/jobs/sync.ts:302 | apps/apify-crawler/src/main.ts:695" },
+        { "path": "item.title", "file": "apps/collector/src/jobs/sync.ts:302 | apps/apify-crawler/src/main.ts:695" },
+        { "path": "item.updated_time", "file": "apps/collector/src/jobs/sync.ts:303 | apps/apify-crawler/src/main.ts:696" }
+      ],
+      "coverage": {
+        "requested_not_read": [],
+        "both": [],
+        "read_not_requested": [
+          "json.data",
+          "json.paging.is_end",
+          "item.id",
+          "item.title",
+          "item.updated_time"
+        ]
+      }
+    },
+    {
+      "id": "collections_items",
+      "url_template": "https://www.zhihu.com/api/v4/collections/{collectionId}/items?include={include}&limit=20&offset={offset}",
+      "kind": "list",
+      "call_sites": [
+        "apps/collector/src/jobs/sync.ts:328",
+        "apps/apify-crawler/src/main.ts:722"
+      ],
+      "params": [
+        "include=<URL 编码的 include 串，见 include_raw>",
+        "limit=20",
+        "offset=0|20|40|..."
+      ],
+      "include_raw": "data[*].content.is_normal,admin_closed_comment,reward_info,is_collapsed,annotation_action,annotation_detail,collapse_reason,collapsed_by,suggest_edit,comment_count,can_comment,content,voteup_count,reshipment_settings,comment_permission,mark_infos,created_time,updated_time,review_info,question,excerpt,is_labeled,label_info,relationship.is_authorized,voting,is_author,is_thanked,is_nothelp,is_recognized,visit_count,favorite_count;data[*].content.author.badge[?(type=best_answerer)].topics",
+      "include_fields": [
+        "data[*].content.is_normal",
+        "data[*].content.admin_closed_comment",
+        "data[*].content.reward_info",
+        "data[*].content.is_collapsed",
+        "data[*].content.annotation_action",
+        "data[*].content.annotation_detail",
+        "data[*].content.collapse_reason",
+        "data[*].content.collapsed_by",
+        "data[*].content.suggest_edit",
+        "data[*].content.comment_count",
+        "data[*].content.can_comment",
+        "data[*].content.content",
+        "data[*].content.voteup_count",
+        "data[*].content.reshipment_settings",
+        "data[*].content.comment_permission",
+        "data[*].content.mark_infos",
+        "data[*].content.created_time",
+        "data[*].content.updated_time",
+        "data[*].content.review_info",
+        "data[*].content.question",
+        "data[*].content.excerpt",
+        "data[*].content.is_labeled",
+        "data[*].content.label_info",
+        "data[*].content.relationship.is_authorized",
+        "data[*].content.voting",
+        "data[*].content.is_author",
+        "data[*].content.is_thanked",
+        "data[*].content.is_nothelp",
+        "data[*].content.is_recognized",
+        "data[*].content.visit_count",
+        "data[*].content.favorite_count",
+        "data[*].content.author.badge[?(type=best_answerer)].topics"
+      ],
+      "code_reads": [
+        { "path": "json.data", "file": "apps/collector/src/jobs/sync.ts:333 | apps/apify-crawler/src/main.ts:736" },
+        { "path": "json.paging.is_end", "file": "apps/collector/src/jobs/sync.ts:334 | apps/apify-crawler/src/main.ts:737" },
+        { "path": "row.content", "file": "apps/collector/src/jobs/sync.ts:339 | apps/apify-crawler/src/main.ts:746" },
+        { "path": "item.type", "file": "apps/collector/src/jobs/sync.ts:340 | apps/apify-crawler/src/main.ts:747" },
+        { "path": "item.id", "file": "apps/collector/src/jobs/sync.ts:353 | apps/apify-crawler/src/main.ts:775" },
+        { "path": "item.question.id", "file": "apps/collector/src/jobs/sync.ts:345 | apps/apify-crawler/src/main.ts:753" },
+        { "path": "item.question.title", "file": "apps/collector/src/jobs/sync.ts:347 | apps/apify-crawler/src/main.ts:762" },
+        { "path": "item.url", "file": "apps/collector/src/jobs/sync.ts:346 | apps/apify-crawler/src/main.ts:756" },
+        { "path": "item.title", "file": "apps/collector/src/jobs/sync.ts:347 | apps/apify-crawler/src/main.ts:762" },
+        { "path": "item.content", "file": "apps/collector/src/jobs/sync.ts:350 | apps/apify-crawler/src/main.ts:767" },
+        { "path": "item.content[].content", "file": "apps/apify-crawler/src/main.ts:771（pin 的 content 是块数组 [{type,content}]，逐块取 b.content 拼接）" },
+        { "path": "item.author.name", "file": "apps/collector/src/jobs/sync.ts:356 | apps/apify-crawler/src/main.ts:778" },
+        { "path": "item.author.url_token", "file": "apps/collector/src/jobs/sync.ts:356 | apps/apify-crawler/src/main.ts:778" },
+        { "path": "item.author.avatar_url", "file": "apps/collector/src/jobs/sync.ts:356 | apps/apify-crawler/src/main.ts:778" },
+        { "path": "item.author.headline", "file": "apps/collector/src/jobs/sync.ts:356 | apps/apify-crawler/src/main.ts:778" },
+        { "path": "item.excerpt", "file": "apps/collector/src/jobs/sync.ts:360 | apps/apify-crawler/src/main.ts:782" },
+        { "path": "item.voteup_count", "file": "apps/collector/src/jobs/sync.ts:361 | apps/apify-crawler/src/main.ts:783" },
+        { "path": "item.reaction.statistics.like_count", "file": "apps/collector/src/jobs/sync.ts:361 | apps/apify-crawler/src/main.ts:783" },
+        { "path": "item.reaction.statistics.upvote_count", "file": "apps/collector/src/jobs/sync.ts:361 | apps/apify-crawler/src/main.ts:783" },
+        { "path": "item.comment_count", "file": "apps/collector/src/jobs/sync.ts:362 | apps/apify-crawler/src/main.ts:784" },
+        { "path": "item.favorite_count", "file": "apps/collector/src/jobs/sync.ts:363 | apps/apify-crawler/src/main.ts:785" },
+        { "path": "item.thanks_count", "file": "apps/collector/src/jobs/sync.ts:363（仅 collector 仍保留该兜底；main.ts:785 已改为 favorite_count ?? reaction.statistics.favorites ?? 0，不再读 thanks_count）" },
+        { "path": "item.reaction.statistics.favorites", "file": "apps/collector/src/jobs/sync.ts:363 | apps/apify-crawler/src/main.ts:785" },
+        { "path": "item.reaction.statistics.favorite_count", "file": "apps/collector/src/jobs/sync.ts:363" },
+        { "path": "item.visit_count", "file": "apps/collector/src/jobs/sync.ts:364 | apps/apify-crawler/src/main.ts:786" },
+        { "path": "item.reaction.statistics.visit_count", "file": "apps/collector/src/jobs/sync.ts:364 | apps/apify-crawler/src/main.ts:786" },
+        { "path": "item.is_collapsed", "file": "apps/collector/src/jobs/sync.ts:365 | apps/apify-crawler/src/main.ts:787" },
+        { "path": "item.is_labeled", "file": "apps/collector/src/jobs/sync.ts:366 | apps/apify-crawler/src/main.ts:788" },
+        { "path": "item.label_info", "file": "apps/collector/src/jobs/sync.ts:367 | apps/apify-crawler/src/main.ts:789" },
+        { "path": "item.created_time", "file": "apps/collector/src/jobs/sync.ts:368 | apps/apify-crawler/src/main.ts:790" },
+        { "path": "item.updated_time", "file": "apps/collector/src/jobs/sync.ts:369 | apps/apify-crawler/src/main.ts:791" }
+      ],
+      "coverage": {
+        "requested_not_read": [
+          "data[*].content.is_normal",
+          "data[*].content.admin_closed_comment",
+          "data[*].content.reward_info",
+          "data[*].content.annotation_action",
+          "data[*].content.annotation_detail",
+          "data[*].content.collapse_reason",
+          "data[*].content.collapsed_by",
+          "data[*].content.suggest_edit",
+          "data[*].content.can_comment",
+          "data[*].content.reshipment_settings",
+          "data[*].content.comment_permission",
+          "data[*].content.mark_infos",
+          "data[*].content.review_info",
+          "data[*].content.relationship.is_authorized",
+          "data[*].content.voting",
+          "data[*].content.is_author",
+          "data[*].content.is_thanked",
+          "data[*].content.is_nothelp",
+          "data[*].content.is_recognized",
+          "data[*].content.author.badge[?(type=best_answerer)].topics"
+        ],
+        "both": [
+          "comment_count",
+          "content",
+          "voteup_count",
+          "created_time",
+          "updated_time",
+          "question（读 .id/.title）",
+          "excerpt",
+          "is_collapsed",
+          "is_labeled",
+          "label_info",
+          "visit_count",
+          "favorite_count"
+        ],
+        "read_not_requested": [
+          "item.type",
+          "item.id",
+          "item.url",
+          "item.title",
+          "item.content[].content（pin 块）",
+          "item.author.name",
+          "item.author.url_token",
+          "item.author.avatar_url",
+          "item.author.headline",
+          "item.thanks_count（仅 collector）",
+          "item.reaction.statistics.like_count",
+          "item.reaction.statistics.upvote_count",
+          "item.reaction.statistics.favorites",
+          "item.reaction.statistics.favorite_count",
+          "item.reaction.statistics.visit_count",
+          "json.paging.is_end"
+        ]
+      }
+    },
+    {
+      "id": "v3_moments_activities",
+      "url_template": "https://www.zhihu.com/api/v3/moments/{username}/activities?limit=20",
+      "kind": "list",
+      "call_sites": [
+        "apps/collector/src/jobs/sync.ts:428",
+        "apps/apify-crawler/src/main.ts:909"
+      ],
+      "params": [
+        "limit=20",
+        "（翻页完全跟随 json.paging.next 返回的完整 URL；该 URL 内含 before_id/page_num/offset 等游标参数，代码只透传不构造——page_num/offset 被读取用于断点比较，见 main.ts:899-904）"
+      ],
+      "include_raw": "",
+      "include_fields": [],
+      "code_reads": [
+        { "path": "json.data", "file": "apps/collector/src/jobs/sync.ts:440 | apps/apify-crawler/src/main.ts:933" },
+        { "path": "json.paging.is_end", "file": "apps/collector/src/jobs/sync.ts:518 | apps/apify-crawler/src/main.ts:1056" },
+        { "path": "json.paging.next", "file": "apps/collector/src/jobs/sync.ts:519 | apps/apify-crawler/src/main.ts:1057" },
+        { "path": "paging.next URL 的 page_num 参数", "file": "apps/apify-crawler/src/main.ts:899（hasReachedCursor 断点比较）" },
+        { "path": "paging.next URL 的 offset 参数", "file": "apps/apify-crawler/src/main.ts:903" },
+        { "path": "item.action_text", "file": "apps/collector/src/jobs/sync.ts:443 | apps/apify-crawler/src/main.ts:944" },
+        { "path": "item.created_time", "file": "apps/collector/src/jobs/sync.ts:491 | apps/apify-crawler/src/main.ts:999" },
+        { "path": "item.target", "file": "apps/collector/src/jobs/sync.ts:445 | apps/apify-crawler/src/main.ts:946" },
+        { "path": "target.id", "file": "apps/collector/src/jobs/sync.ts:446 | apps/apify-crawler/src/main.ts:947" },
+        { "path": "target.type", "file": "apps/collector/src/jobs/sync.ts:453 | apps/apify-crawler/src/main.ts:954" },
+        { "path": "target.question.title", "file": "apps/collector/src/jobs/sync.ts:455 | apps/apify-crawler/src/main.ts:956" },
+        { "path": "target.question.id", "file": "apps/collector/src/jobs/sync.ts:456 | apps/apify-crawler/src/main.ts:957" },
+        { "path": "target.title", "file": "apps/collector/src/jobs/sync.ts:459 | apps/apify-crawler/src/main.ts:960" },
+        { "path": "target.author.name", "file": "apps/collector/src/jobs/sync.ts:472 | apps/apify-crawler/src/main.ts:973" },
+        { "path": "target.author.url_token", "file": "apps/collector/src/jobs/sync.ts:472 | apps/apify-crawler/src/main.ts:973" },
+        { "path": "target.author.avatar_url", "file": "apps/collector/src/jobs/sync.ts:472 | apps/apify-crawler/src/main.ts:973" },
+        { "path": "target.author.headline", "file": "apps/collector/src/jobs/sync.ts:472 | apps/apify-crawler/src/main.ts:973" },
+        { "path": "target.content", "file": "apps/collector/src/jobs/sync.ts:474 | apps/apify-crawler/src/main.ts:975" },
+        { "path": "target.excerpt", "file": "apps/collector/src/jobs/sync.ts:476 | apps/apify-crawler/src/main.ts:977" },
+        { "path": "target.voteup_count", "file": "apps/collector/src/jobs/sync.ts:465 | apps/apify-crawler/src/main.ts:966" },
+        { "path": "target.reaction.statistics.like_count", "file": "apps/collector/src/jobs/sync.ts:465 | apps/apify-crawler/src/main.ts:966" },
+        { "path": "target.comment_count", "file": "apps/collector/src/jobs/sync.ts:478 | apps/apify-crawler/src/main.ts:979" },
+        { "path": "target.favorite_count", "file": "apps/collector/src/jobs/sync.ts:479 | apps/apify-crawler/src/main.ts:980" },
+        { "path": "target.thanks_count", "file": "apps/collector/src/jobs/sync.ts:479 | apps/apify-crawler/src/main.ts:980" },
+        { "path": "target.reaction.statistics.favorites", "file": "apps/collector/src/jobs/sync.ts:479 | apps/apify-crawler/src/main.ts:980" },
+        { "path": "target.reaction.statistics.favorite_count", "file": "apps/collector/src/jobs/sync.ts:479 | apps/apify-crawler/src/main.ts:980" },
+        { "path": "target.visit_count", "file": "apps/collector/src/jobs/sync.ts:480 | apps/apify-crawler/src/main.ts:981" },
+        { "path": "target.reaction.statistics.visit_count", "file": "apps/collector/src/jobs/sync.ts:480 | apps/apify-crawler/src/main.ts:981" },
+        { "path": "target.is_collapsed", "file": "apps/collector/src/jobs/sync.ts:481 | apps/apify-crawler/src/main.ts:982" },
+        { "path": "target.is_labeled", "file": "apps/collector/src/jobs/sync.ts:482 | apps/apify-crawler/src/main.ts:983" },
+        { "path": "target.label_info", "file": "apps/collector/src/jobs/sync.ts:483 | apps/apify-crawler/src/main.ts:984" },
+        { "path": "target.created_time", "file": "apps/collector/src/jobs/sync.ts:484 | apps/apify-crawler/src/main.ts:985" },
+        { "path": "target.updated_time", "file": "apps/collector/src/jobs/sync.ts:485 | apps/apify-crawler/src/main.ts:986" }
+      ],
+      "coverage": {
+        "requested_not_read": [],
+        "both": [],
+        "read_not_requested": [
+          "json.data",
+          "json.paging.is_end",
+          "json.paging.next",
+          "item.action_text",
+          "item.created_time",
+          "target.*（id/type/question.id/question.title/title/author.*/content/excerpt/voteup_count/reaction.statistics.*/comment_count/favorite_count/thanks_count/visit_count/is_collapsed/is_labeled/label_info/created_time/updated_time）"
+        ]
+      }
+    },
+    {
+      "id": "members_followees",
+      "url_template": "https://www.zhihu.com/api/v4/members/{username}/followees?include=data%5B*%5D.answer_count,articles_count,follower_count,headline,avatar_url&limit=20&offset={offset}",
+      "kind": "list",
+      "call_sites": [
+        "apps/apify-crawler/src/main.ts:1191"
+      ],
+      "params": [
+        "include=data%5B*%5D.answer_count,articles_count,follower_count,headline,avatar_url（源码中即为此 URL 编码形态）",
+        "limit=20",
+        "offset=0|20|40|..."
+      ],
+      "include_raw": "data[*].answer_count,articles_count,follower_count,headline,avatar_url",
+      "include_fields": [
+        "data[*].answer_count",
+        "data[*].articles_count",
+        "data[*].follower_count",
+        "data[*].headline",
+        "data[*].avatar_url"
+      ],
+      "code_reads": [
+        { "path": "json.data", "file": "apps/apify-crawler/src/main.ts:1201" },
+        { "path": "json.paging.is_end", "file": "apps/apify-crawler/src/main.ts:1223" },
+        { "path": "u.url_token", "file": "apps/apify-crawler/src/main.ts:1210" },
+        { "path": "u.name", "file": "apps/apify-crawler/src/main.ts:1210" },
+        { "path": "u.id", "file": "apps/apify-crawler/src/main.ts:1213" },
+        { "path": "u.avatar_url", "file": "apps/apify-crawler/src/main.ts:1215" },
+        { "path": "u.headline", "file": "apps/apify-crawler/src/main.ts:1216" },
+        { "path": "u.answer_count", "file": "apps/apify-crawler/src/main.ts:1217" },
+        { "path": "u.articles_count", "file": "apps/apify-crawler/src/main.ts:1218" },
+        { "path": "u.follower_count", "file": "apps/apify-crawler/src/main.ts:1219" }
+      ],
+      "coverage": {
+        "requested_not_read": [],
+        "both": [
+          "answer_count",
+          "articles_count",
+          "follower_count",
+          "headline",
+          "avatar_url"
+        ],
+        "read_not_requested": [
+          "u.url_token（默认字段，不在 include 中）",
+          "u.name（默认字段）",
+          "u.id（默认字段）",
+          "json.paging.is_end"
+        ]
+      },
+      "notes": [
+        "FIELD_AUDIT.md 指出：followees 的 answer_count/articles_count/follower_count 必须带 include 才返回，当前 include 正确；若被删则专栏文章全部不抓。"
+      ]
+    },
+    {
+      "id": "member_answers",
+      "url_template": "https://www.zhihu.com/api/v4/members/{urlToken}/answers?include={include}&limit={limit}&offset={offset}&sort_by={sortBy}",
+      "kind": "list",
+      "call_sites": [
+        "apps/apify-crawler/src/main.ts:1412"
+      ],
+      "params": [
+        "include=<URL 编码的 include 串，见 include_raw>",
+        "limit=min(20, maxScan-offset)，最大 20",
+        "offset=计划起点或按上一页实际返回条数推进（main.ts:1545）",
+        "sort_by=created|voteups（两种扫描计划，见 main.ts:1383-1400）"
+      ],
+      "include_raw": "data[*].is_normal,comment_count,content,voteup_count,created_time,updated_time,question,excerpt,is_collapsed,is_labeled,label_info,visit_count,favorite_count",
+      "include_fields": [
+        "data[*].is_normal",
+        "data[*].comment_count",
+        "data[*].content",
+        "data[*].voteup_count",
+        "data[*].created_time",
+        "data[*].updated_time",
+        "data[*].question",
+        "data[*].excerpt",
+        "data[*].is_collapsed",
+        "data[*].is_labeled",
+        "data[*].label_info",
+        "data[*].visit_count",
+        "data[*].favorite_count"
+      ],
+      "code_reads": [
+        { "path": "json.data", "file": "apps/apify-crawler/src/main.ts:1421" },
+        { "path": "json.paging.is_end", "file": "apps/apify-crawler/src/main.ts:1424" },
+        { "path": "item.id", "file": "apps/apify-crawler/src/main.ts:1434" },
+        { "path": "item.content", "file": "apps/apify-crawler/src/main.ts:1451" },
+        { "path": "item.question.title", "file": "apps/apify-crawler/src/main.ts:1457 | apps/apify-crawler/src/main.ts:1289 | apps/apify-crawler/src/main.ts:1494" },
+        { "path": "item.question.id", "file": "apps/apify-crawler/src/main.ts:1458 | apps/apify-crawler/src/main.ts:1465" },
+        { "path": "item.author.name", "file": "apps/apify-crawler/src/main.ts:1460（兜底 u.name）" },
+        { "path": "item.author.url_token", "file": "apps/apify-crawler/src/main.ts:1461（兜底 u.urlToken）" },
+        { "path": "item.author.avatar_url", "file": "apps/apify-crawler/src/main.ts:1462（兜底 u.avatarUrl）" },
+        { "path": "item.author.headline", "file": "apps/apify-crawler/src/main.ts:1463（兜底 u.headline）" },
+        { "path": "item.excerpt", "file": "apps/apify-crawler/src/main.ts:1468 | apps/apify-crawler/src/main.ts:1289 | apps/apify-crawler/src/main.ts:1496" },
+        { "path": "item.voteup_count", "file": "apps/apify-crawler/src/main.ts:1470 | apps/apify-crawler/src/main.ts:1284 | apps/apify-crawler/src/main.ts:1488" },
+        { "path": "item.reaction.statistics.like_count", "file": "apps/apify-crawler/src/main.ts:1470 | apps/apify-crawler/src/main.ts:1284 | apps/apify-crawler/src/main.ts:1488" },
+        { "path": "item.comment_count", "file": "apps/apify-crawler/src/main.ts:1471 | apps/apify-crawler/src/main.ts:1285 | apps/apify-crawler/src/main.ts:1498" },
+        { "path": "item.favorite_count", "file": "apps/apify-crawler/src/main.ts:1472 | apps/apify-crawler/src/main.ts:1286 | apps/apify-crawler/src/main.ts:1499" },
+        { "path": "item.reaction.statistics.favorites", "file": "apps/apify-crawler/src/main.ts:1472 | apps/apify-crawler/src/main.ts:1286 | apps/apify-crawler/src/main.ts:1499" },
+        { "path": "item.visit_count", "file": "apps/apify-crawler/src/main.ts:1473（注意：此处无 reaction.statistics.visit_count 兜底，直接 || 0）" },
+        { "path": "item.is_collapsed", "file": "apps/apify-crawler/src/main.ts:1474 | apps/apify-crawler/src/main.ts:1287 | apps/apify-crawler/src/main.ts:1500" },
+        { "path": "item.is_labeled", "file": "apps/apify-crawler/src/main.ts:1475 | apps/apify-crawler/src/main.ts:1288 | apps/apify-crawler/src/main.ts:1501" },
+        { "path": "item.label_info", "file": "apps/apify-crawler/src/main.ts:1476 | apps/apify-crawler/src/main.ts:1288 | apps/apify-crawler/src/main.ts:1501" },
+        { "path": "item.created_time", "file": "apps/apify-crawler/src/main.ts:1477" },
+        { "path": "item.updated_time", "file": "apps/apify-crawler/src/main.ts:1478" }
+      ],
+      "coverage": {
+        "requested_not_read": [
+          "data[*].is_normal"
+        ],
+        "both": [
+          "comment_count",
+          "content",
+          "voteup_count",
+          "created_time",
+          "updated_time",
+          "question（读 .id/.title）",
+          "excerpt",
+          "is_collapsed",
+          "is_labeled",
+          "label_info",
+          "visit_count",
+          "favorite_count"
+        ],
+        "read_not_requested": [
+          "item.id",
+          "item.reaction.statistics.like_count",
+          "item.reaction.statistics.favorites",
+          "item.author.name",
+          "item.author.url_token",
+          "item.author.avatar_url",
+          "item.author.headline",
+          "item.title（仅共用评估器 evaluateForAutoBackup main.ts:1289 读取；回答响应无顶层 title，恒 undefined）",
+          "json.paging.is_end"
+        ]
+      },
+      "notes": [
+        "代码注释 main.ts:1469 自证：『following 列表不下发顶层 voteup_count/favorite_count，需回退到 reaction.statistics』；main.ts:1282-1283 同样注释。"
+      ]
+    },
+    {
+      "id": "member_articles",
+      "url_template": "https://www.zhihu.com/api/v4/members/{urlToken}/articles?include={include}&limit={limit}&offset={offset}",
+      "kind": "list",
+      "call_sites": [
+        "apps/apify-crawler/src/main.ts:1590"
+      ],
+      "params": [
+        "include=<URL 编码的 include 串，见 include_raw>",
+        "limit=min(20, maxArticles-offset)，最大 20",
+        "offset=0|按上一页实际返回条数推进（main.ts:1692）",
+        "（无 sort_by 参数，与 member_answers 不同）"
+      ],
+      "include_raw": "data[*].content,voteup_count,comment_count,created,updated,title,excerpt",
+      "include_fields": [
+        "data[*].content",
+        "data[*].voteup_count",
+        "data[*].comment_count",
+        "data[*].created",
+        "data[*].updated",
+        "data[*].title",
+        "data[*].excerpt"
+      ],
+      "code_reads": [
+        { "path": "json.data", "file": "apps/apify-crawler/src/main.ts:1599" },
+        { "path": "json.paging.is_end", "file": "apps/apify-crawler/src/main.ts:1601" },
+        { "path": "item.id", "file": "apps/apify-crawler/src/main.ts:1610" },
+        { "path": "item.content", "file": "apps/apify-crawler/src/main.ts:1618" },
+        { "path": "item.title", "file": "apps/apify-crawler/src/main.ts:1623 | apps/apify-crawler/src/main.ts:1289 | apps/apify-crawler/src/main.ts:1655" },
+        { "path": "item.author.name", "file": "apps/apify-crawler/src/main.ts:1626（兜底 u.name）" },
+        { "path": "item.author.url_token", "file": "apps/apify-crawler/src/main.ts:1627（兜底 u.urlToken）" },
+        { "path": "item.author.avatar_url", "file": "apps/apify-crawler/src/main.ts:1628（兜底 u.avatarUrl）" },
+        { "path": "item.author.headline", "file": "apps/apify-crawler/src/main.ts:1629（兜底 u.headline）" },
+        { "path": "item.excerpt", "file": "apps/apify-crawler/src/main.ts:1633 | apps/apify-crawler/src/main.ts:1657" },
+        { "path": "item.voteup_count", "file": "apps/apify-crawler/src/main.ts:1635 | apps/apify-crawler/src/main.ts:1649" },
+        { "path": "item.reaction.statistics.like_count", "file": "apps/apify-crawler/src/main.ts:1635 | apps/apify-crawler/src/main.ts:1649" },
+        { "path": "item.comment_count", "file": "apps/apify-crawler/src/main.ts:1636 | apps/apify-crawler/src/main.ts:1659" },
+        { "path": "item.favorite_count", "file": "apps/apify-crawler/src/main.ts:1637 | apps/apify-crawler/src/main.ts:1660" },
+        { "path": "item.reaction.statistics.favorites", "file": "apps/apify-crawler/src/main.ts:1637 | apps/apify-crawler/src/main.ts:1660" },
+        { "path": "item.visit_count", "file": "apps/apify-crawler/src/main.ts:1638（注意：visit_count 不在 include 中，且无 reaction 兜底，直接 || 0）" },
+        { "path": "item.created", "file": "apps/apify-crawler/src/main.ts:1639" },
+        { "path": "item.created_time", "file": "apps/apify-crawler/src/main.ts:1639（兜底）" },
+        { "path": "item.updated", "file": "apps/apify-crawler/src/main.ts:1640" },
+        { "path": "item.updated_time", "file": "apps/apify-crawler/src/main.ts:1640（兜底）" },
+        { "path": "item.is_collapsed", "file": "apps/apify-crawler/src/main.ts:1661 | apps/apify-crawler/src/main.ts:1287（仅 AI 候选路径与共用评估器）" },
+        { "path": "item.is_labeled", "file": "apps/apify-crawler/src/main.ts:1662 | apps/apify-crawler/src/main.ts:1288" },
+        { "path": "item.label_info", "file": "apps/apify-crawler/src/main.ts:1662 | apps/apify-crawler/src/main.ts:1288" },
+        { "path": "item.question.title", "file": "apps/apify-crawler/src/main.ts:1289（共用评估器 evaluateForAutoBackup；文章响应无 question，恒 undefined）" }
+      ],
+      "coverage": {
+        "requested_not_read": [],
+        "both": [
+          "content",
+          "voteup_count",
+          "comment_count",
+          "created（读 item.created，兜底 item.created_time）",
+          "updated（读 item.updated，兜底 item.updated_time）",
+          "title",
+          "excerpt"
+        ],
+        "read_not_requested": [
+          "item.id",
+          "item.visit_count（include 未请求、代码在读）",
+          "item.created_time（兜底）",
+          "item.updated_time（兜底）",
+          "item.reaction.statistics.like_count",
+          "item.reaction.statistics.favorites",
+          "item.is_collapsed",
+          "item.is_labeled",
+          "item.label_info",
+          "item.author.name",
+          "item.author.url_token",
+          "item.author.avatar_url",
+          "item.author.headline",
+          "item.question.title（共用评估器，恒 undefined）",
+          "json.paging.is_end"
+        ]
+      }
+    },
+    {
+      "id": "answers_favlists",
+      "url_template": "https://www.zhihu.com/api/v4/answers/{answerId}/favlists?limit=1&offset=0",
+      "kind": "list",
+      "call_sites": [
+        "apps/api/src/routes/contents.ts:72"
+      ],
+      "params": [
+        "limit=1",
+        "offset=0"
+      ],
+      "include_raw": "",
+      "include_fields": [],
+      "code_reads": [
+        { "path": "json.paging", "file": "apps/api/src/routes/contents.ts:75" },
+        { "path": "json.paging.totals", "file": "apps/api/src/routes/contents.ts:75-76（typeof === 'number' 才采用，作为回答真实收藏数）" }
+      ],
+      "coverage": {
+        "requested_not_read": [],
+        "both": [],
+        "read_not_requested": [
+          "json.paging.totals"
+        ]
+      },
+      "notes": [
+        "实际用法是『查总数』：仅当回答详情 favorite_count === 0 时调用，用 paging.totals 充当收藏数（contents.ts:70-82）。"
+      ]
+    },
+    {
+      "id": "article_detail_zhuanlan",
+      "url_template": "https://zhuanlan.zhihu.com/api/articles/{articleId}",
+      "kind": "detail",
+      "call_sites": [
+        "apps/api/src/routes/contents.ts:41"
+      ],
+      "params": [],
+      "include_raw": "",
+      "include_fields": [],
+      "code_reads": [
+        { "path": "data.error.message", "file": "apps/api/src/routes/contents.ts:58" },
+        { "path": "data.error.code", "file": "apps/api/src/routes/contents.ts:59" },
+        { "path": "data.voteup_count", "file": "apps/api/src/routes/contents.ts:65" },
+        { "path": "data.comment_count", "file": "apps/api/src/routes/contents.ts:66" },
+        { "path": "data.visit_count", "file": "apps/api/src/routes/contents.ts:67" },
+        { "path": "data.favorite_count", "file": "apps/api/src/routes/contents.ts:68" },
+        { "path": "data.thanks_count", "file": "apps/api/src/routes/contents.ts:68" },
+        { "path": "data.reaction.statistics.favorites", "file": "apps/api/src/routes/contents.ts:68" },
+        { "path": "data.reaction.statistics.favorite_count", "file": "apps/api/src/routes/contents.ts:68" }
+      ],
+      "coverage": {
+        "requested_not_read": [],
+        "both": [],
+        "read_not_requested": [
+          "data.error.code",
+          "data.error.message",
+          "data.voteup_count",
+          "data.comment_count",
+          "data.visit_count",
+          "data.favorite_count",
+          "data.thanks_count",
+          "data.reaction.statistics.favorites",
+          "data.reaction.statistics.favorite_count"
+        ]
+      },
+      "notes": [
+        "专栏文章详情接口（zhuanlan 域名），无 query 参数；用于 /:pk/sync-live 回写文章统计。"
+      ]
+    }
+  ],
+  "notes": [
+    "全仓 grep 'zhihu.com/api'（apps/**/*.ts，排除 node_modules）仅命中 3 个源文件：apps/collector/src/jobs/sync.ts、apps/apify-crawler/src/main.ts、apps/api/src/routes/contents.ts；另有 1 个 zhuanlan.zhihu.com/api/articles/{id}（contents.ts:41）。除此之外 apps/worker、apps/web 无知乎 API 调用。",
+    "include 串 byte 级一致的两对：我的回答列表 include 在 sync.ts:80 与 main.ts:264 完全相同；收藏夹条目 include 在 sync.ts:316 与 main.ts:709 完全相同。",
+    "所有评论类接口（root_comments/child_comments）都不带 include，字段完全依赖知乎默认返回面。",
+    "collector(sync.ts) 与 apify-crawler(main.ts) 的差异：收藏夹收藏数兜底——sync.ts:363 仍读 thanks_count（FIELD_AUDIT.md 指出这导致收藏数实为感谢数），main.ts:785 已改为 favorite_count ?? reaction.statistics.favorites ?? 0；我的回答列表——sync.ts 每条再请求一次 /answers/{id} 详情拿统计（sync.ts:104），main.ts 已删除该多余请求（注释 main.ts:316-317）。",
+    "visit_count 读取形态不一致：answers_list/collections/moments 路径有 reaction.statistics.visit_count 兜底（sync.ts:100/364/480、main.ts:320/786/981），而 member_answers/main.ts:1473 与 member_articles/main.ts:1638 直接 item.visit_count || 0 无兜底；member_articles 的 visit_count 甚至不在 include 中。",
+    "member_articles 的时间字段：include 请求 created/updated，代码读 item.created || item.created_time、item.updated || item.updated_time（main.ts:1639-1640），created_time/updated_time 属兜底读取。",
+    "v3 moments 翻页：初始 URL 只带 limit=20，后续每页直接 GET json.paging.next 返回的完整 URL（游标内含 before_id/page_num/offset，代码不自行构造，仅读取 page_num/offset 做断点比较，main.ts:899-904）。",
+    "FIELD_AUDIT.md（2026-10-28，真机 12 次实测）背景结论，供本轮比对：answers 列表 include 中 annotation_detail、label_info、is_recognized、favorite_count、voteup_count、visit_count、author.badge[].topics 知乎不返回（badge 恒空数组）；真实收藏数在 reaction.statistics.favorites、浏览量疑似只在 question.visit_count；articles 列表顶层 voteup_count/favorite_count/visit_count 默认不返回导致文章赞数恒 0；followees 的计数字段必须带 include 才返回。",
+    "include 项计数（按逗号拆分）：answers_list_mine=32（31 标量+1 badge 选择器）、answer_detail=4、collections_items=32（31+1）、members_followees=5、member_answers=13、member_articles=7；评论类与 favlists/moments/zhuanlan 详情无 include。FIELD_AUDIT.md 所述『40 个键』为另一种计数口径。",
+    "唯一标注 unverified 的读取：member_articles 的 item.question.title 与 member_answers 的 item.title 均来自共用评估器 evaluateForAutoBackup（main.ts:1289），该字段在对应响应中恒为 undefined（代码事实可证），不代表知乎会返回。"
+  ]
+}

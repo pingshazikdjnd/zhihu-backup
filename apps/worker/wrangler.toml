@@ -20,16 +20,20 @@ bucket_name = "zhihu-backup-storage"
 binding = "AI"
 
 [vars]
-# Apify Actor 把数据 POST 回来的地址，必须是公网可达的 workers.dev 域名。
-# 部署后拿到真实域名，回填这里再 deploy 一次。
-WORKER_URL = "https://gemini-zhihu-api.1490262644.workers.dev"
+# Apify Actor / 爬虫把数据 POST 回来的地址：
+# 生产环境使用 Pages 域名（通过 Pages 的 _worker.js 转发到 Worker，绕开国内对 *.workers.dev 的 DNS 污染）。
+# ⚠️ wrangler deploy 以本文件为准：这里没写的明文变量会在部署时被清掉（除非加 --keep-vars），
+# 所以 WORKER_URL 必须保留在此处。值取自下方 ALLOWED_ORIGIN 里的 Pages 域名；
+# 若你换了域名/用了自定义域名，请同步修改这一行（不要再填 *.workers.dev）。
+WORKER_URL = "https://zhihu-backup.pages.dev"
 
 # 你的知乎 url_token（个人主页 /people/<token> 里的那段）
 ZHIHU_USERNAME = "yang-xu-heng-94"
 
-# 前端域名白名单（CORS）。必须填真实域名，否则浏览器端所有请求会被拦。
-# 多个域名用英文逗号分隔。留空 = 只放行 localhost（本地开发）。
-# 同源访问（直接打开 worker 域名）不需要 CORS，不受此限制。
+# 前端域名白名单（CORS）。必须填真实域名，否则浏览器跨域请求会被拦截。
+# 多个域名用英文逗号分隔，如 "https://zhihu-backup.pages.dev,https://your-custom-domain.com"。
+# 支持 *.pages.dev 通配，如果使用自定义域名请务必加入白名单。留空 = 只放行 localhost（本地开发）。
+# Pages 前端走同源 _worker.js 转发时不受 CORS 限制，但跨域直接请求 Worker 时必须在此放行。
 ALLOWED_ORIGIN = "https://zhihu-backup.pages.dev"
 
 # 云端 Apify 已停用：镜像为旧代码，且与本地 08:05/20:05 任务并发双写。

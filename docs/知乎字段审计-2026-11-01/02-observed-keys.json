@@ -1,0 +1,194 @@
+{
+  "meta": {
+    "generated_at": "2026-11-01",
+    "scope": "G:/gemini zhihu/data/** 只读扫描，抽取『知乎真实返回过』的字段证据",
+    "privacy": "只记录字段名/类型/量级，不含 Cookie、token 或任何用户值",
+    "evidence_legend": "verified=真机请求知乎 API 的实测产物；synthetic=项目自造数据（非知乎返回）；internal=项目自建存储结构"
+  },
+  "sources": [
+    {
+      "file": "G:/gemini zhihu/data/plan-verify-b/articles-probe.json",
+      "evidence": "verified",
+      "endpoint_guess": "GET https://www.zhihu.com/api/v4/members/{username}/articles?limit=2&offset=0（无 include 参数，status=200，实测脚本 fetch-articles.mjs 同目录佐证）",
+      "count": 2,
+      "keys": [
+        "updated", "force_login_when_click_read_more", "copyright_permission", "endorsements", "excerpt",
+        "article_type", "is_navigator", "navigator_vote", "id", "vote_next_step", "reaction", "paid_info",
+        "author", "url", "comment_permission", "title", "created", "content_need_truncated", "image_url",
+        "excerpt_title", "type"
+      ],
+      "key_paths": [
+        "paging.is_end", "paging.totals",
+        "items[].updated", "items[].force_login_when_click_read_more", "items[].copyright_permission",
+        "items[].endorsements", "items[].excerpt", "items[].article_type", "items[].is_navigator",
+        "items[].navigator_vote", "items[].id", "items[].vote_next_step", "items[].reaction",
+        "items[].reaction.statistics", "items[].reaction.relation",
+        "items[].reaction.statistics.like_count", "items[].reaction.statistics.favorites",
+        "items[].paid_info", "items[].author", "items[].url", "items[].comment_permission",
+        "items[].title", "items[].created", "items[].content_need_truncated", "items[].image_url",
+        "items[].excerpt_title", "items[].type"
+      ],
+      "types_observed": {
+        "id": "string", "title": "string", "type": "article",
+        "created": "number 秒级(1e9+)", "updated": "number 秒级(1e9+)",
+        "content": "absent（无 include 时不返回）",
+        "excerpt": "string（实测 len=157 / 120）",
+        "voteup_count": "absent", "comment_count": "absent"
+      }
+    },
+    {
+      "file": "G:/gemini zhihu/data/plan-verify-b/articles-probe2.json",
+      "evidence": "verified",
+      "endpoint_guess": "GET https://www.zhihu.com/api/v4/members/{username}/articles?limit=2&offset=0&include=...（带 include 参数，status=200）",
+      "count": 2,
+      "keys": [
+        "updated", "force_login_when_click_read_more", "copyright_permission", "endorsements", "excerpt",
+        "article_type", "is_navigator", "excerpt_title", "navigator_vote", "id", "vote_next_step", "reaction",
+        "paid_info", "author", "url", "comment_permission", "created", "content", "content_need_truncated",
+        "image_url", "title", "type"
+      ],
+      "key_paths": [
+        "paging.is_end", "paging.totals",
+        "items[].updated", "items[].force_login_when_click_read_more", "items[].copyright_permission",
+        "items[].endorsements", "items[].excerpt", "items[].article_type", "items[].is_navigator",
+        "items[].excerpt_title", "items[].navigator_vote", "items[].id", "items[].vote_next_step",
+        "items[].reaction", "items[].reaction.statistics", "items[].reaction.relation",
+        "items[].reaction.statistics.like_count", "items[].reaction.statistics.favorites",
+        "items[].paid_info", "items[].author", "items[].url", "items[].comment_permission",
+        "items[].created", "items[].content", "items[].content_need_truncated", "items[].image_url",
+        "items[].title", "items[].type"
+      ],
+      "types_observed": {
+        "id": "string", "title": "string", "type": "article",
+        "created": "number 秒级(1e9+)", "updated": "number 秒级(1e9+)",
+        "content": "string（实测 len=14891 / 54835）",
+        "voteup_count": "absent", "comment_count": "absent"
+      }
+    },
+    {
+      "file": "G:/gemini zhihu/data/plan-verify-a/verify-metrics.json",
+      "evidence": "verified",
+      "endpoint_guess": "phase2 真机实测汇总：articles 列表（无 include / 带 code include）、answers 列表（带 include）、/favlists 列表",
+      "count": 4,
+      "keys": [
+        "articles_no_include: reaction=true, reaction.statistics=[favorites,like_count]; voteup_count=false, favorite_count=false, visit_count=false, thanks_count=false, comment_count=false",
+        "articles_with_code_include: voteup_count=true, comment_count=true; favorite_count=false, visit_count=false; created/updated=number",
+        "answers_code_include: comment_count=true, question 含 visit_count=true, reaction.statistics=[favorites,like_count]; voteup_count=false, favorite_count=false, visit_count=false, thanks_count=false",
+        "favlists: [id,is_public,title,type,url]（仅 5 个字段）; updated_time=false, item_count=false"
+      ],
+      "key_paths": [
+        "phase2.articles_no_include.status=200",
+        "phase2.articles_no_include.reaction",
+        "phase2.articles_no_include.reaction_statistics[]=favorites|like_count",
+        "phase2.articles_with_code_include.voteup_count=true",
+        "phase2.articles_with_code_include.comment_count=true",
+        "phase2.articles_with_code_include.created:number",
+        "phase2.articles_with_code_include.updated:number",
+        "phase2.answers_code_include.comment_count=true",
+        "phase2.answers_code_include.question_has_visit_count=true",
+        "phase2.answers_code_include.reaction_statistics[]=favorites|like_count",
+        "phase2.favlists.fields[]=id|is_public|title|type|url",
+        "phase1.comment_sample.is_end=true（answers 评论采样 roots=20, partial=true）"
+      ]
+    },
+    {
+      "file": "G:/gemini zhihu/data/plan-verify-b/r2-proto/root-*.json",
+      "evidence": "synthetic",
+      "note": "500 个文件为项目自造的评论树原型数据（GBK 乱码的合成中文文本），非知乎原始返回；字段名与 proto-schema.sql/comments 表一致",
+      "endpoint_guess": "本地 R2 原型存储对象（评论树）",
+      "count": 5,
+      "keys": [
+        "root_id", "content_pk", "complete", "child_count", "children",
+        "children[].id", "children[].parent_comment_id", "children[].author_name", "children[].author_avatar",
+        "children[].content_md", "children[].time_text", "children[].location", "children[].likes",
+        "children[].is_author", "children[].is_featured"
+      ],
+      "key_paths": [
+        ".root_id", ".content_pk", ".complete", ".child_count", ".children",
+        ".children[].id", ".children[].parent_comment_id", ".children[].author_name", ".children[].author_avatar",
+        ".children[].content_md", ".children[].time_text", ".children[].location", ".children[].likes",
+        ".children[].is_author", ".children[].is_featured"
+      ],
+      "sampled": ["root-00002.json", "root-00011.json", "root-00158.json", "root-00347.json", "root-00786.json"]
+    },
+    {
+      "file": "G:/gemini zhihu/data/plan-verify-b/harness/c1.json + c2.json + c3.json",
+      "evidence": "synthetic",
+      "note": "期3 变更检测 harness 的自造 camelCase 固件（project 规范化条目格式），非知乎原始返回",
+      "endpoint_guess": "POST /ingest/content 的请求体 fixture",
+      "count": 3,
+      "keys": [
+        "sourceType", "sourceId", "title", "sourceUrl", "author", "author.name", "author.urlToken",
+        "author.avatarUrl", "author.headline", "question", "question.id", "question.title",
+        "contentHtml", "contentMd", "excerpt", "voteupCount", "commentCount", "favoriteCount",
+        "visitCount", "isCollapsed", "isLabeled", "createdTime", "updatedTime"
+      ],
+      "key_paths": [
+        ".sourceType", ".sourceId", ".title", ".sourceUrl", ".author", ".author.name", ".author.urlToken",
+        ".author.avatarUrl", ".author.headline", ".question", ".question.id", ".question.title",
+        ".contentHtml", ".contentMd", ".excerpt", ".voteupCount", ".commentCount", ".favoriteCount",
+        ".visitCount", ".isCollapsed", ".isLabeled", ".createdTime", ".updatedTime"
+      ]
+    }
+  ],
+  "articles_probe_diff": {
+    "only_in_probe": [],
+    "only_in_probe2": ["content"],
+    "common": [
+      "updated", "force_login_when_click_read_more", "copyright_permission", "endorsements", "excerpt",
+      "article_type", "is_navigator", "excerpt_title", "navigator_vote", "id", "vote_next_step",
+      "reaction", "paid_info", "author", "url", "comment_permission", "title", "created",
+      "content_need_truncated", "image_url", "type"
+    ],
+    "note": "两次探测同一接口（limit=2&offset=0），item 内 keys 完全稳定（两次各 2 条 item 一致）；唯一差异是 probe2 带 include 参数后多返回 content 字段，且 content 实测 len=14891/54835。即：字段集合随请求参数变化，无参时 content 不出现。"
+  },
+  "not_found": [
+    {
+      "where": "G:/gemini zhihu/data/**/*.log（paging-verify、glm-verify-a/b、fix-verify、fix4-verify、plan-verify-a/b harness 共 16 个日志）",
+      "what": "知乎原始响应字段",
+      "result": "not found：日志均为同步脚本控制台输出（Playwright 直连）、wrangler/miniflare 请求日志（POST /ingest/content 等）与 D1 内部 ZodError（harness/dev2.log，针对 D1 batch 而非知乎字段），未打印任何知乎响应体"
+    },
+    {
+      "where": "G:/gemini zhihu/data/plan-verify-b/v3/r2/zhihu-backup-storage/blobs/（4 个 miniflare blob）",
+      "what": "结构化知乎字段",
+      "result": "not found：blob 仅存原始 HTML 正文（抽查为测试文本 'hello world 第一版'）"
+    }
+  ],
+  "schema_tables": {
+    "contents": [
+      "pk", "source_type", "source_id", "source_url", "title", "author_name", "author_url_token",
+      "author_avatar", "author_headline", "question_id", "question_title", "content_html", "content_md",
+      "excerpt", "voteup_count", "comment_count", "favorite_count", "visit_count", "is_collapsed",
+      "is_labeled", "label_info", "created_time", "updated_time", "content_hash", "first_seen_at",
+      "last_seen_at", "is_deleted", "deleted_at"
+    ],
+    "content_versions": [
+      "id", "content_pk", "version_hash", "title", "content_html", "content_md", "excerpt",
+      "voteup_count", "comment_count", "snapshot_at"
+    ],
+    "comments": [
+      "id", "content_pk", "parent_comment_id", "author_name", "author_avatar", "be_replied", "content_md",
+      "img_url", "time_text", "location", "likes", "is_author", "is_top", "is_featured", "comment_hash",
+      "first_seen_at", "last_seen_at", "is_deleted", "deleted_at"
+    ],
+    "comment_versions": [
+      "id", "comment_id", "content_pk", "version_hash", "content_md", "img_url", "likes", "snapshot_at"
+    ],
+    "collections": [
+      "id", "title", "owner_token", "first_seen_at", "last_seen_at", "updated_time"
+    ],
+    "collection_items": [
+      "id", "collection_id", "content_pk", "source_type", "source_id", "title", "author_name",
+      "source_url", "first_seen_at", "last_seen_at", "is_removed", "removed_at"
+    ],
+    "collection_snapshots": [
+      "id", "collection_id", "snapshot_at", "item_count", "added_count", "removed_count"
+    ],
+    "sync_runs": ["id", "job_type", "status", "message", "started_at", "finished_at"],
+    "change_events": [
+      "id", "event_type", "entity_type", "entity_pk", "content_pk", "summary", "payload_json", "created_at"
+    ],
+    "upvotes": ["id", "content_pk", "first_seen_at", "last_seen_at", "upvote_time"],
+    "__note": "项目自建表（D1/SQLite），非知乎返回。来源：G:/gemini zhihu/data/schema.sql；与 G:/gemini zhihu/data/app.db 实测一致（sqlite3 -readonly PRAGMA table_info 校验，app.db 另有系统表 sqlite_sequence）。行数实测：contents=29689, content_versions=34642, comments=3610, comment_versions=4129, collections=13, collection_items=1091, collection_snapshots=164, change_events=85524, sync_runs=11, upvotes=28971。"
+  }
+}

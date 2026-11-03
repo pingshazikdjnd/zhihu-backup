@@ -1,0 +1,145 @@
+{
+  "endpoint": "members",
+  "requests": [
+    {
+      "id": "A_member_noinc",
+      "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94",
+      "status": 200,
+      "ms": 254,
+      "note": "无 include，默认字段基线（26 键）"
+    },
+    {
+      "id": "B_member_inc_datastar",
+      "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94?include=data%5B*%5D.answer_count,articles_count,follower_count,following_count,voteup_count,thanked_count,favorited_count,question_count,pins_count,logs_count,headline,description,avatar_url,avatar_url_template,badge,name,url_token,gender,user_type,is_org,is_following,is_followed,is_blocking,is_blocked,relationship,locations,business,employments,educations,school,company,job,cover_url,marked_answers_text,account_status,is_bind_phone",
+      "status": 200,
+      "ms": 339,
+      "note": "include 生效，55 键"
+    },
+    {
+      "id": "B2_member_inc_plain",
+      "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94?include=answer_count,articles_count,follower_count,following_count,voteup_count,thanked_count,favorited_count,question_count,pins_count,logs_count,headline,description,avatar_url,avatar_url_template,badge,name,url_token,gender,user_type,is_org,is_following,is_followed,is_blocking,is_blocked,relationship,locations,business,employments,educations,school,company,job,cover_url,marked_answers_text,account_status,is_bind_phone",
+      "status": 200,
+      "ms": 244,
+      "note": "与 B 返回键集完全一致（55 键），两种 include 语法等价"
+    },
+    {
+      "id": "C_followees_inc",
+      "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94/followees?limit=2&offset=0&include=data%5B*%5D.answer_count,articles_count,follower_count,headline,avatar_url,name,url_token,description",
+      "status": 200,
+      "ms": 277,
+      "note": "include 生效（description 除外）；paging.totals=102"
+    },
+    {
+      "id": "D_followers_noinc",
+      "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94/followers?limit=2&offset=0",
+      "status": 200,
+      "ms": 232,
+      "note": "无 include 列表项基线（20 键）；paging.totals=1209"
+    },
+    {
+      "id": "E_me",
+      "url": "https://www.zhihu.com/api/v4/me",
+      "status": 200,
+      "ms": 298,
+      "note": "无 include，46 键"
+    }
+  ],
+  "member_keys": [
+    "id", "url_token", "name", "use_default_avatar", "avatar_url", "avatar_url_template",
+    "is_org", "type", "url", "user_type", "headline", "headline_render", "gender",
+    "is_advertiser", "ip_info", "vip_info", "kvip_info", "project_count",
+    "available_medals_count", "org_verify_status", "is_realname", "has_applying_column",
+    "is_new_rename", "has_agent_content", "ai_assistant_info", "extra"
+  ],
+  "member_keys_with_include": [
+    "id", "url_token", "name", "use_default_avatar", "avatar_url", "avatar_url_template",
+    "is_org", "type", "url", "user_type", "headline", "headline_render", "gender",
+    "is_advertiser", "ip_info", "vip_info", "kvip_info", "project_count",
+    "available_medals_count", "org_verify_status", "is_realname", "has_applying_column",
+    "is_new_rename", "has_agent_content", "ai_assistant_info", "extra",
+    "description", "badge", "badge_v2", "account_status",
+    "is_following", "is_followed", "is_blocking", "is_blocked",
+    "follower_count", "follower_count_text", "follower_count_num", "follower_count_unit",
+    "following_count", "following_count_num", "following_count_unit",
+    "answer_count", "question_count", "articles_count", "favorited_count",
+    "pins_count", "logs_count", "voteup_count", "thanked_count",
+    "marked_answers_text", "business", "locations", "employments", "educations", "cover_url"
+  ],
+  "followee_keys": [
+    "id", "url_token", "name", "use_default_avatar", "avatar_url", "avatar_url_template",
+    "is_org", "type", "url", "user_type", "headline", "headline_render", "gender",
+    "is_advertiser", "ip_info", "vip_info", "kvip_info",
+    "badge", "badge_v2", "is_following", "is_followed",
+    "follower_count", "follower_count_text", "follower_count_num", "follower_count_unit",
+    "answer_count", "articles_count", "available_medals_count", "is_realname", "has_applying_column"
+  ],
+  "follower_keys": [
+    "id", "url_token", "name", "use_default_avatar", "avatar_url", "avatar_url_template",
+    "is_org", "type", "url", "user_type", "headline", "headline_render", "gender",
+    "is_advertiser", "ip_info", "vip_info", "kvip_info",
+    "available_medals_count", "is_realname", "has_applying_column"
+  ],
+  "me_vs_member_diff": {
+    "only_me": [
+      "answer_count", "question_count", "articles_count", "columns_count", "zvideo_count",
+      "favorite_count", "pins_count", "voteup_count", "thanked_count",
+      "line_comment_count", "line_like_count", "line_comment_only_count",
+      "uid", "default_notifications_count", "follow_notifications_count",
+      "vote_thank_notifications_count", "messages_count", "creation_count",
+      "has_add_baike_summary_permission", "editor_info", "can_create_sub_account",
+      "account_type", "sub_account_control_status"
+    ],
+    "only_member": [
+      "project_count", "is_new_rename", "has_agent_content"
+    ],
+    "only_me_vs_member_with_include": [
+      "columns_count", "zvideo_count", "favorite_count",
+      "line_comment_count", "line_like_count", "line_comment_only_count",
+      "uid", "default_notifications_count", "follow_notifications_count",
+      "vote_thank_notifications_count", "messages_count", "creation_count",
+      "has_add_baike_summary_permission", "editor_info", "can_create_sub_account",
+      "account_type", "sub_account_control_status"
+    ],
+    "only_member_with_include_only": [
+      "description", "badge", "badge_v2", "account_status",
+      "is_following", "is_followed", "is_blocking", "is_blocked",
+      "follower_count", "follower_count_text", "follower_count_num", "follower_count_unit",
+      "following_count", "following_count_num", "following_count_unit",
+      "project_count", "favorited_count", "logs_count", "marked_answers_text",
+      "business", "locations", "employments", "educations", "cover_url",
+      "is_new_rename", "has_agent_content"
+    ]
+  },
+  "privacy_fields": [
+    "gender",
+    "ip_info",
+    "locations",
+    "business",
+    "employments",
+    "educations",
+    "school",
+    "company",
+    "job",
+    "is_bind_phone",
+    "is_realname",
+    "email",
+    "phone_number"
+  ],
+  "notes": [
+    "共 6 个请求全部 200（A/B/B2/C/D/E），间隔>3s，未触发 403/40353/40362。",
+    "include 生效性：members/{token} 单对象端点带 data[*]. 前缀与裸字段名两种 include 语法均生效，返回键集完全一致（55 键）；对比 A（26 键）新增 29 键。",
+    "计数结论：answer_count/articles_count/follower_count/following_count/voteup_count/thanked_count/favorited_count/question_count/pins_count/logs_count 全部必须 include 才返回，默认不返回；gender/ip_info 是默认返回。",
+    "include 请求 36 项中 31 项以顶层键返回（其中 headline/avatar_url/avatar_url_template/name/url_token/gender/user_type/is_org 本就是默认字段）；relationship、is_bind_phone 未返回；school/company/job 不是顶层键，而是 educations[].school、employments[].company/job 的 include 别名（educations[0].school 实测返回）。",
+    "服务器附带赠送字段（未请求但返回）：badge_v2、follower_count_text/_num/_unit、following_count_num/_unit（B/B2）。",
+    "followees 列表项（带 include）30 键：请求 8 项中 description 未返回，其余 7 项生效（headline/avatar_url/name/url_token 本就是默认字段）；badge/badge_v2/is_following/is_followed 未请求也返回。followers 列表项（无 include）20 键，无 badge/is_following/计数字段。",
+    "paging 结构（followees/followers 相同）：is_end/is_start/next/previous/totals；totals=followees 102、followers 1209，与 B 中 following_count/follower_count 一致；next 为完整 URL（offset+limit）。",
+    "me 与 member 的计数口径差异：me 默认就带 answer_count/question_count/articles_count/columns_count/zvideo_count/favorite_count/pins_count/voteup_count/thanked_count/line_*/creation_count，但没有 follower_count/following_count/favorited_count/logs_count；favorite_count(me=13，我的收藏夹数) 与 favorited_count(member include=18908，被收藏数) 是两个字段，勿混淆。",
+    "列表项 ip_info 恒 null（detail 端点才有 'IP 属地…' 字符串）；kvip_info 列表项多 target_url 子字段，detail 无。",
+    "隐私字段处置（汇总时排除在备份表外）：gender(性别)、ip_info(IP属地→位置)、locations(所在地)、business(行业)、employments(职业经历,含company/job)、educations(教育经历,含school/major) 为实测下发；school/company/job 为 include 别名；is_bind_phone(手机号) include 请求了但未下发，email/phone_number 本轮所有响应均未出现，均预防性列入排除；is_realname(实名状态) 超出任务六类清单但涉个人身份，建议一并排除。",
+    "嵌套结构：vip_info{is_vip:bool,vip_type:number,rename_days:string,entrance_v2:null,rename_frequency:number,rename_await_days:number}；kvip_info{is_vip:bool[,target_url:string]}；badge_v2{title,merged_badges[],detail_badges[],icon,night_icon}；topic 对象{id,type:'topic',url,name,avatar_url}；educations[]项{school:topic,major:topic}；locations[]项即 topic；business 为 topic|null；account_status 为数组（本账号空）。",
+    "字段类型（实测）：id/url_token/name/avatar_url/avatar_url_template/url/headline/headline_render/description/marked_answers_text/cover_url=string；use_default_avatar/is_org/is_advertiser/is_realname/has_applying_column/is_new_rename/has_agent_content/is_following/is_followed/is_blocking/is_blocked=boolean；gender/follower_count/following_count/answer_count/question_count/articles_count/favorited_count/pins_count/logs_count/voteup_count/thanked_count/project_count/available_medals_count=number；ip_info=string|null；org_verify_status/ai_assistant_info/extra=null；badge=数组；vip_info/kvip_info/badge_v2/business=对象。",
+    "me 的 include 能力本轮未测（任务只要求裸 /me），如需 uid 之外的私有字段（如邮箱/手机号）需另行小规模验证。",
+    "被测账号 followees/followers 数据一致性：C.data 两条目键集一致，D.data 两条目键集一致（键集为 2 条并集=单条）。",
+    "原始响应留存于 zhihu-fields/tmp/out-14-{A,B,B2,C,D,E}.json（含 cookie 的请求记录不含敏感值明文，json 为公开/本人可见字段）。"
+  ]
+}

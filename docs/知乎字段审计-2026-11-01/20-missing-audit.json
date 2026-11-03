@@ -1,0 +1,1345 @@
+{
+ "entity_union": {
+  "answer": {
+   "total_unique": 54,
+   "endpoints": {
+    "answers_list": [
+     "admin_closed_comment",
+     "annotation_action",
+     "answer_type",
+     "author",
+     "biz_ext",
+     "can_comment",
+     "collapse_reason",
+     "collapsed_by",
+     "comment_count",
+     "comment_permission",
+     "content",
+     "content_need_truncated",
+     "created_time",
+     "endorsements",
+     "excerpt",
+     "extras",
+     "force_login_when_click_read_more",
+     "id",
+     "is_collapsed",
+     "is_copyable",
+     "is_labeled",
+     "is_navigator",
+     "is_normal",
+     "mark_infos",
+     "navigator_vote",
+     "question",
+     "reaction",
+     "relationship",
+     "reshipment_settings",
+     "review_info",
+     "reward_info",
+     "same_video_answers",
+     "suggest_edit",
+     "thumbnail",
+     "type",
+     "updated_time",
+     "url",
+     "vote_next_step"
+    ],
+    "answer_detail": [
+     "allow_segment_interaction",
+     "answer_type",
+     "author",
+     "biz_ext",
+     "comment_count",
+     "content_need_truncated",
+     "created_time",
+     "extras",
+     "force_login_when_click_read_more",
+     "id",
+     "is_collapsed",
+     "is_copyable",
+     "is_jump_native",
+     "podcast_audio_enter",
+     "question",
+     "reaction",
+     "relationship",
+     "segment_infos",
+     "thanks_count",
+     "type",
+     "updated_time",
+     "url",
+     "visit_count",
+     "voteup_count"
+    ],
+    "activities_target": [
+     "allow_segment_interaction",
+     "answer_type",
+     "attachment",
+     "author",
+     "can_comment",
+     "comment_count",
+     "comment_permission",
+     "content",
+     "content_need_truncated",
+     "created_time",
+     "endorsements",
+     "excerpt",
+     "excerpt_new",
+     "force_login_when_click_read_more",
+     "id",
+     "is_copyable",
+     "is_navigator",
+     "mark_infos",
+     "navigator_vote",
+     "paid_info",
+     "preview_text",
+     "preview_type",
+     "question",
+     "reaction_instruction",
+     "relationship",
+     "relevant_info",
+     "reshipment_settings",
+     "segment_infos",
+     "thanks_count",
+     "type",
+     "updated_time",
+     "url",
+     "vote_next_step",
+     "voteup_count"
+    ],
+    "recommend_target": [
+     "allow_segment_interaction",
+     "answer_type",
+     "author",
+     "comment_count",
+     "content",
+     "created_time",
+     "excerpt",
+     "excerpt_new",
+     "favorite_count",
+     "id",
+     "is_copyable",
+     "is_labeled",
+     "is_navigator",
+     "navigator_vote",
+     "preview_text",
+     "preview_type",
+     "question",
+     "reaction",
+     "relationship",
+     "reshipment_settings",
+     "segment_infos",
+     "thanks_count",
+     "type",
+     "updated_time",
+     "url",
+     "visited_count",
+     "vote_next_step",
+     "voteup_count"
+    ]
+   },
+   "only_in_one": {
+    "answer_detail": [
+     "is_jump_native",
+     "podcast_audio_enter",
+     "visit_count"
+    ],
+    "answers_list": [
+     "admin_closed_comment",
+     "annotation_action",
+     "collapse_reason",
+     "collapsed_by",
+     "is_normal",
+     "review_info",
+     "reward_info",
+     "same_video_answers",
+     "suggest_edit",
+     "thumbnail"
+    ],
+    "recommend_target": [
+     "favorite_count",
+     "visited_count"
+    ],
+    "activities_target": [
+     "attachment",
+     "paid_info",
+     "reaction_instruction",
+     "relevant_info"
+    ]
+   }
+  },
+  "comment": {
+   "total_unique": 31,
+   "endpoints": {
+    "root_comments": [
+     "address_text",
+     "allow_delete",
+     "allow_like",
+     "allow_reply",
+     "allow_vote",
+     "attached_info",
+     "author",
+     "can_collapse",
+     "can_recommend",
+     "censor_status",
+     "child_comment_count",
+     "child_comments",
+     "collapsed",
+     "content",
+     "created_time",
+     "disliked",
+     "featured",
+     "id",
+     "is_author",
+     "is_delete",
+     "liked",
+     "reply_to_author",
+     "resource_type",
+     "reviewing",
+     "top",
+     "type",
+     "url",
+     "vote_count",
+     "voting"
+    ],
+    "child_comments": [
+     "address_text",
+     "allow_delete",
+     "allow_like",
+     "allow_reply",
+     "attached_info",
+     "author",
+     "can_collapse",
+     "can_recommend",
+     "content",
+     "created_time",
+     "extra_info",
+     "id",
+     "is_author",
+     "is_delete",
+     "liked",
+     "replies_count",
+     "reply_to_author",
+     "resource_type",
+     "top",
+     "type",
+     "url",
+     "vote_count",
+     "voting"
+    ]
+   },
+   "only_in_one": {
+    "root_comments": [
+     "allow_vote",
+     "censor_status",
+     "child_comment_count",
+     "child_comments",
+     "collapsed",
+     "disliked",
+     "featured",
+     "reviewing"
+    ],
+    "child_comments": [
+     "extra_info",
+     "replies_count"
+    ]
+   }
+  },
+  "article": {
+   "total_unique": 70,
+   "endpoints": {
+    "articles_list": [
+     "article_type",
+     "author",
+     "comment_count",
+     "comment_permission",
+     "content",
+     "content_need_truncated",
+     "copyright_permission",
+     "created",
+     "endorsements",
+     "excerpt",
+     "excerpt_title",
+     "force_login_when_click_read_more",
+     "id",
+     "image_url",
+     "is_labeled",
+     "is_navigator",
+     "navigator_vote",
+     "paid_info",
+     "reaction",
+     "title",
+     "type",
+     "updated",
+     "url",
+     "vote_next_step",
+     "voteup_count"
+    ],
+    "article_detail_zhuanlan": [
+     "ab_param",
+     "activity_topping_info",
+     "admin_closed_comment",
+     "allow_segment_interaction",
+     "annotation_action",
+     "article_type",
+     "attached_info",
+     "author",
+     "bar_plugins_flip_time",
+     "can_comment",
+     "can_reference",
+     "can_tip",
+     "column",
+     "comment_count",
+     "comment_permission",
+     "commercial_info",
+     "content",
+     "content_need_truncated",
+     "contributions",
+     "copyright_permission",
+     "created",
+     "emoji_reaction",
+     "endorsements",
+     "excerpt",
+     "excerpt_title",
+     "favlists_count",
+     "force_login_when_click_read_more",
+     "has_column",
+     "has_publishing_draft",
+     "heavy_up_status",
+     "id",
+     "image_height",
+     "image_url",
+     "image_width",
+     "interaction_bar_plugins",
+     "ip_info",
+     "is_favorited",
+     "is_labeled",
+     "is_liked",
+     "is_navigator",
+     "is_new_link_card",
+     "is_normal",
+     "is_title_image_full_screen",
+     "is_visible",
+     "liked_count",
+     "mcn_fp_show",
+     "navigator_vote",
+     "podcast_audio_enter",
+     "reaction",
+     "reaction_instruction",
+     "reason",
+     "republishers",
+     "settings",
+     "share_guide",
+     "share_text",
+     "state",
+     "status",
+     "suggest_edit",
+     "tipjarors_count",
+     "title",
+     "title_image",
+     "topics",
+     "type",
+     "updated",
+     "upvoted_followees",
+     "url",
+     "vote_next_step",
+     "voteup_count",
+     "voting"
+    ]
+   },
+   "only_in_one": {
+    "article_detail_zhuanlan": [
+     "ab_param",
+     "activity_topping_info",
+     "admin_closed_comment",
+     "allow_segment_interaction",
+     "annotation_action",
+     "attached_info",
+     "bar_plugins_flip_time",
+     "can_comment",
+     "can_reference",
+     "can_tip",
+     "column",
+     "commercial_info",
+     "contributions",
+     "emoji_reaction",
+     "favlists_count",
+     "has_column",
+     "has_publishing_draft",
+     "heavy_up_status",
+     "image_height",
+     "image_width",
+     "interaction_bar_plugins",
+     "ip_info",
+     "is_favorited",
+     "is_liked",
+     "is_new_link_card",
+     "is_normal",
+     "is_title_image_full_screen",
+     "is_visible",
+     "liked_count",
+     "mcn_fp_show",
+     "podcast_audio_enter",
+     "reaction_instruction",
+     "reason",
+     "republishers",
+     "settings",
+     "share_guide",
+     "share_text",
+     "state",
+     "status",
+     "suggest_edit",
+     "tipjarors_count",
+     "title_image",
+     "topics",
+     "upvoted_followees",
+     "voting"
+    ],
+    "articles_list": [
+     "paid_info"
+    ]
+   }
+  },
+  "member": {
+   "total_unique": 72,
+   "endpoints": {
+    "member_detail": [
+     "account_status",
+     "ai_assistant_info",
+     "answer_count",
+     "articles_count",
+     "available_medals_count",
+     "avatar_url",
+     "avatar_url_template",
+     "badge",
+     "badge_v2",
+     "business",
+     "cover_url",
+     "description",
+     "educations",
+     "employments",
+     "extra",
+     "favorited_count",
+     "follower_count",
+     "follower_count_num",
+     "follower_count_text",
+     "follower_count_unit",
+     "following_count",
+     "following_count_num",
+     "following_count_unit",
+     "gender",
+     "has_agent_content",
+     "has_applying_column",
+     "headline",
+     "headline_render",
+     "id",
+     "ip_info",
+     "is_advertiser",
+     "is_blocked",
+     "is_blocking",
+     "is_followed",
+     "is_following",
+     "is_new_rename",
+     "is_org",
+     "is_realname",
+     "kvip_info",
+     "locations",
+     "logs_count",
+     "marked_answers_text",
+     "name",
+     "org_verify_status",
+     "pins_count",
+     "project_count",
+     "question_count",
+     "thanked_count",
+     "type",
+     "url",
+     "url_token",
+     "use_default_avatar",
+     "user_type",
+     "vip_info",
+     "voteup_count"
+    ],
+    "followees_list": [
+     "answer_count",
+     "articles_count",
+     "available_medals_count",
+     "avatar_url",
+     "avatar_url_template",
+     "badge",
+     "badge_v2",
+     "follower_count",
+     "follower_count_num",
+     "follower_count_text",
+     "follower_count_unit",
+     "gender",
+     "has_applying_column",
+     "headline",
+     "headline_render",
+     "id",
+     "ip_info",
+     "is_advertiser",
+     "is_followed",
+     "is_following",
+     "is_org",
+     "is_realname",
+     "kvip_info",
+     "name",
+     "type",
+     "url",
+     "url_token",
+     "use_default_avatar",
+     "user_type",
+     "vip_info"
+    ],
+    "followers_list": [
+     "available_medals_count",
+     "avatar_url",
+     "avatar_url_template",
+     "gender",
+     "has_applying_column",
+     "headline",
+     "headline_render",
+     "id",
+     "ip_info",
+     "is_advertiser",
+     "is_org",
+     "is_realname",
+     "kvip_info",
+     "name",
+     "type",
+     "url",
+     "url_token",
+     "use_default_avatar",
+     "user_type",
+     "vip_info"
+    ],
+    "me": [
+     "account_type",
+     "ai_assistant_info",
+     "answer_count",
+     "articles_count",
+     "available_medals_count",
+     "avatar_url",
+     "avatar_url_template",
+     "can_create_sub_account",
+     "columns_count",
+     "creation_count",
+     "default_notifications_count",
+     "editor_info",
+     "extra",
+     "favorite_count",
+     "follow_notifications_count",
+     "gender",
+     "has_add_baike_summary_permission",
+     "has_applying_column",
+     "headline",
+     "headline_render",
+     "id",
+     "ip_info",
+     "is_advertiser",
+     "is_org",
+     "is_realname",
+     "kvip_info",
+     "line_comment_count",
+     "line_comment_only_count",
+     "line_like_count",
+     "messages_count",
+     "name",
+     "org_verify_status",
+     "pins_count",
+     "question_count",
+     "sub_account_control_status",
+     "thanked_count",
+     "type",
+     "uid",
+     "url",
+     "url_token",
+     "use_default_avatar",
+     "user_type",
+     "vip_info",
+     "vote_thank_notifications_count",
+     "voteup_count",
+     "zvideo_count"
+    ],
+    "activities_actor": [
+     "avatar_url",
+     "badge",
+     "badge_v2",
+     "gender",
+     "headline",
+     "id",
+     "is_followed",
+     "is_following",
+     "is_org",
+     "kvip_info",
+     "name",
+     "type",
+     "url",
+     "url_token",
+     "user_type",
+     "vip_info"
+    ],
+    "comment_author_member": [
+     "avatar_url",
+     "avatar_url_template",
+     "badge",
+     "gender",
+     "headline",
+     "id",
+     "is_advertiser",
+     "is_followed",
+     "is_following",
+     "is_org",
+     "name",
+     "type",
+     "url",
+     "url_token",
+     "user_type",
+     "vip_info"
+    ]
+   },
+   "only_in_one": {
+    "me": [
+     "account_type",
+     "can_create_sub_account",
+     "columns_count",
+     "creation_count",
+     "default_notifications_count",
+     "editor_info",
+     "favorite_count",
+     "follow_notifications_count",
+     "has_add_baike_summary_permission",
+     "line_comment_count",
+     "line_comment_only_count",
+     "line_like_count",
+     "messages_count",
+     "sub_account_control_status",
+     "uid",
+     "vote_thank_notifications_count",
+     "zvideo_count"
+    ],
+    "member_detail": [
+     "account_status",
+     "business",
+     "cover_url",
+     "description",
+     "educations",
+     "employments",
+     "favorited_count",
+     "following_count",
+     "following_count_num",
+     "following_count_unit",
+     "has_agent_content",
+     "is_blocked",
+     "is_blocking",
+     "is_new_rename",
+     "locations",
+     "logs_count",
+     "marked_answers_text",
+     "project_count"
+    ]
+   }
+  },
+  "question": {
+   "total_unique": 18,
+   "endpoints": {
+    "answers_list_question": [
+     "author",
+     "created",
+     "id",
+     "question_type",
+     "title",
+     "type",
+     "updated_time",
+     "url",
+     "visit_count"
+    ],
+    "answer_detail_question": [
+     "created",
+     "id",
+     "question_type",
+     "relationship",
+     "title",
+     "type",
+     "updated_time",
+     "url"
+    ],
+    "activities_question": [
+     "answer_count",
+     "author",
+     "bound_topic_ids",
+     "comment_count",
+     "created",
+     "detail",
+     "excerpt",
+     "follower_count",
+     "id",
+     "is_following",
+     "question_type",
+     "reaction_instruction",
+     "relationship",
+     "title",
+     "type",
+     "url"
+    ],
+    "hotlist_target": [
+     "answer_count",
+     "author",
+     "bound_topic_ids",
+     "comment_count",
+     "created",
+     "excerpt",
+     "follower_count",
+     "id",
+     "is_following",
+     "title",
+     "type",
+     "url"
+    ],
+    "recommend_question": [
+     "answer_count",
+     "author",
+     "bound_topic_ids",
+     "comment_count",
+     "created",
+     "detail",
+     "excerpt",
+     "follower_count",
+     "id",
+     "is_following",
+     "question_type",
+     "relationship",
+     "title",
+     "type",
+     "url"
+    ]
+   },
+   "only_in_one": {
+    "activities_question": [
+     "reaction_instruction"
+    ],
+    "answers_list_question": [
+     "visit_count"
+    ]
+   }
+  },
+  "feed_item": {
+   "total_unique": 21,
+   "endpoints": {
+    "activities_item": [
+     "action_text",
+     "actor",
+     "created_time",
+     "id",
+     "interaction",
+     "is_sticky",
+     "target",
+     "type",
+     "verb"
+    ],
+    "hotlist_item": [
+     "attached_info",
+     "card_id",
+     "card_label",
+     "children",
+     "debut",
+     "detail_text",
+     "id",
+     "style_type",
+     "target",
+     "trend",
+     "type"
+    ],
+    "recommend_item": [
+     "action_card",
+     "attached_info",
+     "brief",
+     "created_time",
+     "id",
+     "offset",
+     "target",
+     "type",
+     "updated_time",
+     "verb"
+    ]
+   },
+   "only_in_one": {
+    "hotlist_item": [
+     "card_id",
+     "card_label",
+     "children",
+     "debut",
+     "detail_text",
+     "style_type",
+     "trend"
+    ],
+    "recommend_item": [
+     "action_card",
+     "brief",
+     "offset",
+     "updated_time"
+    ],
+    "activities_item": [
+     "action_text",
+     "actor",
+     "interaction",
+     "is_sticky"
+    ]
+   }
+  }
+ },
+ "nested_inconsistency": [
+  {
+   "object": "author / member（用户卡片）",
+   "diff": "11 个上下文 61 键并集，无两个上下文完全一致。关键分歧：(1) is_privacy 仅 answer_detail author 有，answers 列表 author 无；(2) 推荐流 author 用 followers_count，members/followees/followers 用 follower_count——同一指标两种命名；(3) vip_info/kvip_info 只在 comment author.member、activities actor、member 端点与 collections/items 的 answer/article author 出现；10/12 的 answers/article 列表 author 不带 vip 信息（13-live-collections 已实测集合条目 author.vip_info 存在）；(4) badge_v2 在 answers/article author、activities actor、member 端点有，comment author.member 只有 badge 无 badge_v2，recommend 两个 author 只有 badge 无 badge_v2，hot-list author 8 键最简（无 gender/badge/vip）；(5) ip_info 仅 member 端点（detail 为 string，列表恒 null）；(6) comment author 是唯一 {role, member} 两层包装，role 键仅评论有；(7) uid/description/exposed_medal 仅 zhuanlan 详情 author 有；(8) badge 数组元素形状只在 recommend question.author 见过 {description,type}，answers/activities/member 的 badge 恒空数组、元素形状未验证；(9) followees/followers 列表 kvip_info 多 target_url，member_detail 的 kvip_info 没有"
+  },
+  {
+   "object": "question",
+   "diff": "5 个上下文 18 键并集。answer_count/comment_count/follower_count 只在 feed 三处（activities 16 键/hot-list 12 键/recommend 15 键）出现，answers 两处的 question 不给；visit_count 仅 answers 列表 include 有（answers 详情、activities、hot-list、recommend 均无）；updated_time 仅 answers 两处有（activities question 无）；detail/excerpt 仅 activities/recommend 有；relationship 形状三种：answer_detail 恒空对象、activities 为 {voting,is_thanked,is_nothelp,upvoted_followee_ids}、recommend 为 {is_author}；author 在 answer_detail 的 question 里缺席"
+  },
+  {
+   "object": "reaction",
+   "diff": "列表与推荐流恒 2+2 键（statistics{like_count,favorites} + relation{faved,liked}，answers 列表/articles 列表/recommend 三处一致）；全量只在详情：answer detail statistics 17 键、article detail statistics 18 键、relation 10 键、另含 image_reactions。顶层浏览量命名分叉：recommend target 用 visited_count，answers 列表/detail 用 visit_count"
+  },
+  {
+   "object": "paging",
+   "diff": "标准 v4 列表（answers/articles/members/followees/root_comments）与 hot-list/recommend 均为 5 键 {is_end,is_start,next,previous,totals}；child_comments 的 paging 无 is_start；v3 activities 的 paging 仅 {is_end,need_force_login,next}——无 previous/totals，多 need_force_login，且游标是时间戳+page_num 而非 offset"
+  },
+  {
+   "object": "badge / badge_v2",
+   "diff": "badge_v2 内层 {title,merged_badges,detail_badges,icon,night_icon} 在 answers author 与 member detail 一致（activities actor 未枚举内层）；comment author.member 与 recommend author 无 badge_v2；badge 数组元素唯一实证形状为 recommend question.author 的 {description,type}"
+  },
+  {
+   "object": "topic",
+   "diff": "member 内嵌 topic 为 {id,type:\"topic\",url,name,avatar_url}（locations/business/educations 共用）；zhuanlan 详情 topics[] 为 {id,name,url}（无 type/avatar_url）；feed 三处只用 bound_topic_ids（纯 number 数组）不嵌对象"
+  }
+ ],
+ "external_candidates": [
+  {
+   "entity": "member",
+   "field": "following_topic_count",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "用户 include 字段表：关注话题数"
+  },
+  {
+   "entity": "member",
+   "field": "following_question_count",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "关注问题数"
+  },
+  {
+   "entity": "member",
+   "field": "following_favlists_count",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "关注收藏夹数"
+  },
+  {
+   "entity": "member",
+   "field": "following_columns_count",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "关注专栏数"
+  },
+  {
+   "entity": "member",
+   "field": "avatar_hue",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "用户 include 字段表"
+  },
+  {
+   "entity": "member",
+   "field": "commercial_question_count",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "商业提问数"
+  },
+  {
+   "entity": "member",
+   "field": "included_answers_count",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "收录回答数"
+  },
+  {
+   "entity": "member",
+   "field": "included_articles_count",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "收录文章数"
+  },
+  {
+   "entity": "member",
+   "field": "marked_answers_count",
+   "source": "https://github.com/maxuewei2/zhihu-crawler/blob/master/%E5%88%86%E6%9E%90%E7%9F%A5%E4%B9%8EAPI.md",
+   "verified_live": false,
+   "note": "marked_answers_text 已实测，_count 版本未实测"
+  },
+  {
+   "entity": "member",
+   "field": "mutual_followees_count",
+   "source": "https://github.com/maxuewei2/zhihu-crawler/blob/master/%E5%88%86%E6%9E%90%E7%9F%A5%E4%B9%8EAPI.md",
+   "verified_live": false,
+   "note": "共同关注数"
+  },
+  {
+   "entity": "member",
+   "field": "vote_to_count",
+   "source": "https://github.com/maxuewei2/zhihu-crawler/blob/master/%E5%88%86%E6%9E%90%E7%9F%A5%E4%B9%8EAPI.md | https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "投出的赞同数"
+  },
+  {
+   "entity": "member",
+   "field": "vote_from_count",
+   "source": "https://github.com/maxuewei2/zhihu-crawler/blob/master/%E5%88%86%E6%9E%90%E7%9F%A5%E4%B9%8EAPI.md | https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "收到的赞同数"
+  },
+  {
+   "entity": "member",
+   "field": "thank_to_count",
+   "source": "https://github.com/maxuewei2/zhihu-crawler/blob/master/%E5%88%86%E6%9E%90%E7%9F%A5%E4%B9%8EAPI.md | https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "投出的感谢数"
+  },
+  {
+   "entity": "member",
+   "field": "thank_from_count",
+   "source": "https://github.com/maxuewei2/zhihu-crawler/blob/master/%E5%88%86%E6%9E%90%E7%9F%A5%E4%B9%8EAPI.md | https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "收到的感谢数"
+  },
+  {
+   "entity": "member",
+   "field": "hosted_live_count",
+   "source": "https://github.com/maxuewei2/zhihu-crawler/blob/master/%E5%88%86%E6%9E%90%E7%9F%A5%E4%B9%8EAPI.md | https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "主持 Live 数"
+  },
+  {
+   "entity": "member",
+   "field": "participated_live_count",
+   "source": "https://github.com/maxuewei2/zhihu-crawler/blob/master/%E5%88%86%E6%9E%90%E7%9F%A5%E4%B9%8EAPI.md | https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "参与 Live 数"
+  },
+  {
+   "entity": "member",
+   "field": "allow_message",
+   "source": "https://github.com/maxuewei2/zhihu-crawler/blob/master/%E5%88%86%E6%9E%90%E7%9F%A5%E4%B9%8EAPI.md | https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "是否可私信"
+  },
+  {
+   "entity": "member",
+   "field": "message_thread_token",
+   "source": "https://github.com/maxuewei2/zhihu-crawler/blob/master/%E5%88%86%E6%9E%90%E7%9F%A5%E4%B9%8EAPI.md | https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "私信 token"
+  },
+  {
+   "entity": "member",
+   "field": "is_active",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "账号状态类"
+  },
+  {
+   "entity": "member",
+   "field": "is_force_renamed",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "是否被强制更名"
+  },
+  {
+   "entity": "member",
+   "field": "is_bind_sina",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "是否绑定微博（隐私类）"
+  },
+  {
+   "entity": "member",
+   "field": "is_privacy_protected",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "隐私保护开关"
+  },
+  {
+   "entity": "member",
+   "field": "sina_weibo_url",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "新浪微博（隐私类）"
+  },
+  {
+   "entity": "member",
+   "field": "sina_weibo_name",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "新浪微博名（隐私类）"
+  },
+  {
+   "entity": "member",
+   "field": "show_sina_weibo",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "是否展示微博"
+  },
+  {
+   "entity": "member",
+   "field": "is_org_createpin_white_user",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "组织发想法白名单"
+  },
+  {
+   "entity": "member",
+   "field": "industry_category",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "行业分类"
+  },
+  {
+   "entity": "member",
+   "field": "org_name",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "组织名"
+  },
+  {
+   "entity": "member",
+   "field": "org_homepage",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "组织主页"
+  },
+  {
+   "entity": "answer",
+   "field": "is_sticky",
+   "source": "https://yifei.me/note/460 | https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/question.ts",
+   "verified_live": false,
+   "note": "回答字段表 + RSSHub include 原文"
+  },
+  {
+   "entity": "answer",
+   "field": "editable_content",
+   "source": "https://yifei.me/note/460 | https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/question.ts",
+   "verified_live": false,
+   "note": "可编辑正文（include 项）"
+  },
+  {
+   "entity": "answer",
+   "field": "collapsed_counts",
+   "source": "https://yifei.me/note/460 | https://github.com/YaoZeyuan/ZhihuHelp_archived/issues/89",
+   "verified_live": false,
+   "note": "被折叠评论数（include 项，区别于评论包装层同名键）"
+  },
+  {
+   "entity": "answer",
+   "field": "reviewing_comments_count",
+   "source": "https://yifei.me/note/460",
+   "verified_live": false,
+   "note": "审核中评论数（include 项）"
+  },
+  {
+   "entity": "answer",
+   "field": "paid_info_content",
+   "source": "https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/question.ts",
+   "verified_live": false,
+   "note": "include 项；真机 activities target 有 paid_info 但无 paid_info_content"
+  },
+  {
+   "entity": "answer",
+   "field": "mark_infos[].url",
+   "source": "https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/question.ts",
+   "verified_live": false,
+   "note": "include data[*].mark_infos[*].url；真机 mark_infos 恒空数组，元素形状未验证"
+  },
+  {
+   "entity": "answer",
+   "field": "settings.table_of_content.enabled",
+   "source": "https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/question.ts",
+   "verified_live": false,
+   "note": "目录设置（include 项）"
+  },
+  {
+   "entity": "answer",
+   "field": "hermes_label",
+   "source": "https://github.com/YaoZeyuan/ZhihuHelp_archived/issues/89",
+   "verified_live": false,
+   "note": "话题精华 include 中 answer target 的字段"
+  },
+  {
+   "entity": "answer",
+   "field": "author.follower_count",
+   "source": "https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/question.ts",
+   "verified_live": false,
+   "note": "include data[*].author.follower_count；10/15 真机回答 author 不带粉丝数（author.vip_info 已在 13-live-collections 的收藏夹 answer.author 实测观测到，不再列为遗漏）"
+  },
+  {
+   "entity": "article",
+   "field": "hermes_label",
+   "source": "https://github.com/YaoZeyuan/ZhihuHelp_archived/issues/89",
+   "verified_live": false,
+   "note": "话题精华 include 中 article target 的字段"
+  },
+  {
+   "entity": "article",
+   "field": "annotation_detail",
+   "source": "https://github.com/YaoZeyuan/ZhihuHelp_archived/issues/89",
+   "verified_live": false,
+   "note": "话题精华 include 中 article target 的字段；真机文章详情只有 annotation_action"
+  },
+  {
+   "entity": "article",
+   "field": "upvoted_followees / voting（列表 include）",
+   "source": "https://notebook.community/phiedulxp/quora-mining/notebook/zhihu-api",
+   "verified_live": false,
+   "note": "members/{u}/articles include 原文含 upvoted_followees,voting；真机列表未请求（详情端点倒是有这两键）"
+  },
+  {
+   "entity": "question",
+   "field": "topics",
+   "source": "https://github.com/zly2006/zhihu-plus-plus/commit/7a5285311300aa75aa3605bb3ceb5386a44f807c",
+   "verified_live": false,
+   "note": "Question 模型 topics: List<Topic>（对象数组，真机只见 bound_topic_ids 纯 id 数组）"
+  },
+  {
+   "entity": "question",
+   "field": "collapsed_answer_count",
+   "source": "https://github.com/zly2006/zhihu-plus-plus/commit/7a5285311300aa75aa3605bb3ceb5386a44f807c",
+   "verified_live": false,
+   "note": "折叠回答数"
+  },
+  {
+   "entity": "question",
+   "field": "status",
+   "source": "https://github.com/zly2006/zhihu-plus-plus/commit/7a5285311300aa75aa3605bb3ceb5386a44f807c",
+   "verified_live": false,
+   "note": "问题状态对象"
+  },
+  {
+   "entity": "question",
+   "field": "can_comment",
+   "source": "https://github.com/zly2006/zhihu-plus-plus/commit/7a5285311300aa75aa3605bb3ceb5386a44f807c",
+   "verified_live": false,
+   "note": "问题层评论开关"
+  },
+  {
+   "entity": "question",
+   "field": "thumbnail_info",
+   "source": "https://github.com/zly2006/zhihu-plus-plus/commit/7a5285311300aa75aa3605bb3ceb5386a44f807c",
+   "verified_live": false,
+   "note": "问题缩略图信息"
+  },
+  {
+   "entity": "pin",
+   "field": "content（块数组：text/image/video/link，video 含 playlist，link 含 title）",
+   "source": "https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/pin/utils.ts",
+   "verified_live": false,
+   "note": "pin 正文块结构"
+  },
+  {
+   "entity": "pin",
+   "field": "created / updated（双时间戳）",
+   "source": "https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/pin/utils.ts",
+   "verified_live": false,
+   "note": "parseDate(target.created/target.updated)"
+  },
+  {
+   "entity": "pin",
+   "field": "excerpt_title",
+   "source": "https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/pin/utils.ts",
+   "verified_live": false,
+   "note": "想法标题摘要"
+  },
+  {
+   "entity": "pin",
+   "field": "origin_pin",
+   "source": "https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/pin/utils.ts",
+   "verified_live": false,
+   "note": "转发原想法（递归 pin 对象）"
+  },
+  {
+   "entity": "pin",
+   "field": "tags",
+   "source": "https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/pin/utils.ts",
+   "verified_live": false,
+   "note": "想法标签"
+  },
+  {
+   "entity": "pin",
+   "field": "endpoint: GET api.zhihu.com/pins/{token}/moments 与 GET /api/v4/pins/{id}",
+   "source": "https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/pin/people.ts | https://github.com/DIYgod/RSSHub/discussions/18136",
+   "verified_live": false,
+   "note": "pin 数据源端点（本次真机未取得 pin 样本）"
+  }
+ ],
+ "code_wants_but_api_missing": [
+  {
+   "field": "answers_list.voteup_count",
+   "evidence": "sync.ts:98 / main.ts:318 读取；10-live 中 proj/max 两轮 include 均请求仍未返回（requested_not_returned）",
+   "impact": "回答列表赞同数恒 undefined；只能逐条 /answers/{id}?include=voteup_count（detail_inc 实测可返回）或走 activities target（34 键含 voteup_count）"
+  },
+  {
+   "field": "answers_list.favorite_count",
+   "evidence": "sync.ts:99 / main.ts:319 读取；include 未返回；真实收藏数在 reaction.statistics.favorites（10/12 实测）",
+   "impact": "该字段名永远缺；备份必须以 statistics.favorites 为准；sync.ts:363 的 thanks_count 兜底实为感谢数（口径错误）"
+  },
+  {
+   "field": "answers_list.visit_count",
+   "evidence": "sync.ts:100 读取 + main.ts:1473（member_answers 无兜底直读）；include 未返回",
+   "impact": "列表层浏览量拿不到；仅 /answers/{id} detail include 可取；main.ts:1473 恒 0"
+  },
+  {
+   "field": "answers_list.thanks_count",
+   "evidence": "10-live max 轮 include 请求未返回；仅 detail_inc 返回 thanks_count",
+   "impact": "感谢数列表层缺失，需逐条 detail"
+  },
+  {
+   "field": "answers_list.label_info",
+   "evidence": "10-live proj/max include 请求未返回",
+   "impact": "标注信息备份缺；main.ts:1476/1662 读取恒 undefined"
+  },
+  {
+   "field": "answers_list.annotation_detail",
+   "evidence": "10-live proj/max include 请求未返回",
+   "impact": "标注详情缺失"
+  },
+  {
+   "field": "answers_list.{voting,is_author,is_thanked,is_nothelp,is_recognized}（顶层）",
+   "evidence": "include 请求未返回；实测位置为 relationship.voting/is_thanked/is_nothelp、relationship.is_author（10/15）",
+   "impact": "顶层读取恒 undefined，须改读 relationship.*"
+  },
+  {
+   "field": "answers_list.author.badge[?(type=best_answerer)].topics",
+   "evidence": "10-live include 请求未返回；author.badge 实测恒空数组",
+   "impact": "优秀回答者徽章话题无法备份"
+  },
+  {
+   "field": "reaction.statistics.upvote_count",
+   "evidence": "sync.ts:98 / main.ts:318/783/1470/1635 读取该拼写；真机所有端点无此键，详情实为 up_vote_count（10 detail_inc、12 zhuanlan）",
+   "impact": "赞同数兜底全部死代码（键名拼写错误）"
+  },
+  {
+   "field": "reaction.statistics.favorite_count",
+   "evidence": "sync.ts:99/363 读取；真机 5 个 reaction.statistics 上下文（列表 2 键、详情 17/18 键、recommend 2 键）均无 favorite_count，真实键为 favorites",
+   "impact": "收藏数兜底死代码"
+  },
+  {
+   "field": "reaction.statistics.visit_count",
+   "evidence": "sync.ts:100/364、main.ts:320/786/981/1473/1638 读取；真机所有 reaction.statistics 均无 visit_count（文章详情 18 键也无）",
+   "impact": "浏览量兜底全部失效"
+  },
+  {
+   "field": "answer_detail.favorite_count",
+   "evidence": "detail_inc include 请求未返回（10 requested_not_returned）；zhuanlan 详情顶层也无",
+   "impact": "单条收藏数只能走 /answers/{id}/favlists 的 paging.totals（01 接口 12 已这么用，但该端点未实测）或 statistics.favorites"
+  },
+  {
+   "field": "articles_list.visit_count",
+   "evidence": "12-live：列表 include 被忽略、zhuanlan 详情 69 键无、reaction.statistics 无 visit_count",
+   "impact": "文章浏览量任何端点都拿不到，备份不可能有真实值"
+  },
+  {
+   "field": "articles_list.thanks_count",
+   "evidence": "12-live：列表 include 被忽略；zhuanlan 详情只有 tipjarors_count（打赏）",
+   "impact": "文章感谢数无法备份"
+  },
+  {
+   "field": "articles_list.{is_collapsed,label_info}",
+   "evidence": "main.ts:1661-1662 读取；12-live 列表 25 键无这两键",
+   "impact": "文章折叠/标注状态备份恒 undefined"
+  },
+  {
+   "field": "article_detail_zhuanlan.{favorite_count,thanks_count,visit_count}",
+   "evidence": "contents.ts:65-68 读取；12-live 详情实际键为 favlists_count/tipjarors_count，无这三个键",
+   "impact": "sync-live 统计回写三字段恒 undefined；收藏数应读 favlists_count 或 statistics.favorites"
+  },
+  {
+   "field": "activities.target.{favorite_count,visit_count}",
+   "evidence": "sync.ts:479-480 / main.ts:980-981 读取；15-live target.answer 34 键无这两键",
+   "impact": "v3 动态流作内容源时收藏/浏览数恒 undefined"
+  },
+  {
+   "field": "activities.target.reaction（statistics.* 兜底）",
+   "evidence": "sync.ts:479-480 兜底读 target.reaction.statistics.*；15-live target 无 reaction 对象（仅 reaction_instruction）",
+   "impact": "兜底链第二级也失效"
+  },
+  {
+   "field": "activities.target.{is_collapsed,is_labeled,label_info}",
+   "evidence": "sync.ts:481-483 读取；15-live target 34 键无",
+   "impact": "动态流内容的折叠/标注状态缺失"
+  },
+  {
+   "field": "comments.reply_to_comment_id",
+   "evidence": "sync.ts:188、main.ts:430、contents.ts:148 读取；11-live 全部 81 条观测路径（根评论 R + 子评论 B）无此键",
+   "impact": "楼中楼被回复评论的 ID 缺失，回复关系退化为 reply_to_author.member.name 一个名字"
+  },
+  {
+   "field": "comments.reaction.statistics.like_count",
+   "evidence": "评论点赞兜底读取；11-live 评论对象无 reaction 对象",
+   "impact": "兜底死代码（vote_count 本身正常，无害但无效）"
+  },
+  {
+   "field": "comments.{img,imageUrl,image_url}",
+   "evidence": "main.ts:224 pickCommentImageUrl 在 427/460/593 三处传入；11-live 全文 grep 三键均不存在，attached_info 为不透明串",
+   "impact": "评论图片备份功能恒空输出"
+  }
+ ],
+ "verdict": {
+  "answer": {
+   "tested": 54,
+   "suspected_missing": 9,
+   "note": "author.vip_info 已由 13-live-collections 的收藏夹 answer.author 实测观测到，从外部候选中移除"
+  },
+  "comment": {
+   "tested": 31,
+   "suspected_missing": 2
+  },
+  "article": {
+   "tested": 70,
+   "suspected_missing": 5
+  },
+  "member": {
+   "tested": 72,
+   "suspected_missing": 18,
+   "note": "另有 11 个隐私/组织类候选（is_bind_sina、sina_weibo_url/name、is_privacy_protected、is_force_renamed、is_active、show_sina_weibo、is_org_createpin_white_user、industry_category、org_name、org_homepage）按 14 号报告隐私策略不计入备份遗漏"
+  },
+  "question": {
+   "tested": 18,
+   "suspected_missing": 5
+  },
+  "pin": {
+   "tested": 0,
+   "suspected_missing": 6
+  },
+  "favlist": {
+   "tested": 18,
+   "suspected_missing": 0,
+   "note": "13-live-collections 已实测：members/{u}/favlists 列表项 5 键（id/title/type/is_public/url），collections/{id} 详情 18 键（含 answer_count/follower_count/creator；creator 仅详情存在）；collections/{id}/items 亦已实测。旧『零样本/零实测』表述已过时"
+  },
+  "feed_item": {
+   "tested": 21,
+   "suspected_missing": 3
+  },
+  "untested_endpoints": [
+   "/api/v4/questions/{id}（403/10003 需签名）",
+   "/api/v4/pins/*（窗口内无 pin 未测）",
+   "/api/v4/members/{u}/votes 与 /upvotes（停止规则未发）",
+   "/api/v4/answers/{id}/favlists",
+   "/api/v4/articles/{id}/root_comments（404，文章评论真实端点未知）"
+  ],
+  "top5_risks": [
+   "answers 列表端点 voteup_count/visit_count/favorite_count/thanks_count 连 include 都拿不到（10 实测 requested_not_returned）——列表统计全靠逐条 detail 补齐，任何跳过该步骤的同步都会让赞同/浏览/收藏/感谢归零",
+   "comments.reply_to_comment_id 与 comments.img*：三处代码在读、真机 81 条路径不存在——楼中楼回复关系退化为仅名字、评论图片备份恒空",
+   "article 实体 visit_count/thanks_count 在列表与 zhuanlan 详情都不存在——文章浏览/感谢数无法备份；favorite_count 只能走 statistics.favorites/favlists_count，代码读的顶层键全部落空",
+   "reaction.statistics 三个伪键兜底（upvote_count/favorite_count/visit_count）在任何真机响应中都不存在——所有 fallback 死代码，收藏口径只剩 favorites（recommend 推荐流还把浏览量改名为 visited_count）",
+   "pin / votes / question 直连三端点零实测（403 需签名或未测）——这些实体的备份字段集仍未知；favlists 与 collections/{id}/items 已在 13-live-collections 实测（列表项 5 键、详情 18 键、条目外层 content/created）；question 目前只能靠 activities 内嵌 16 键面（无 updated_time/visit_count/topics）"
+  ]
+ }
+}

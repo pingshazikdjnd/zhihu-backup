@@ -12,13 +12,33 @@ const CONFIG = {
     "table", "thead", "tbody", "tr", "th", "td", "hr",
     "figure", "figcaption", "span", "div", "sub", "sup"
   ],
-  ALLOWED_ATTR: ["href", "src", "alt", "title", "class", "colspan", "rowspan", "target", "rel"],
+  ALLOWED_ATTR: ["href", "src", "alt", "title", "class", "colspan", "rowspan", "target", "rel", "referrerpolicy"],
   // 显式禁掉，双保险
   FORBID_ATTR: ["onerror", "onload", "onclick", "onmouseover", "style", "srcset"],
   ALLOW_DATA_ATTR: false,
   // 不允许 javascript: 协议
   ALLOW_UNKNOWN_PROTOCOLS: false
 } as const;
+
+// 正文图片直连知乎图床时不要带 Referer（部分图床校验来源会 403），
+// 外链统一新窗口打开并切断 window.opener。
+// 模块级只注册一次，避免 HMR / 多次 import 重复挂 hook。
+let hookInstalled = false;
+if (!hookInstalled) {
+  DOMPurify.addHook("afterSanitizeAttributes", (node: Element) => {
+    if (node.tagName === "IMG") {
+      node.setAttribute("referrerpolicy", "no-referrer");
+    }
+    if (node.tagName === "A") {
+      const href = node.getAttribute("href") || "";
+      if (href.startsWith("http://") || href.startsWith("https://")) {
+        node.setAttribute("target", "_blank");
+        node.setAttribute("rel", "noopener noreferrer nofollow");
+      }
+    }
+  });
+  hookInstalled = true;
+}
 
 export function sanitizeHtml(html?: string | null): string {
   if (!html) return "";

@@ -1,9 +1,28 @@
 import { db } from "../db.js";
 
-export function upsertUpvote(contentPk: string, upvoteTime: string) {
+export function upsertUpvote(contentPk: string, upvoteTime: string): {
+  created: boolean;
+  unchanged?: boolean;
+  skipped?: boolean;
+} {
   const now = new Date().toISOString();
-  
-  const existing = db.prepare(`SELECT 1 FROM upvotes WHERE content_pk = ?`).get(contentPk);
+
+  // upvotes 表没有外键：悬空 contentPk 会写入永久不可见的僵尸行
+  // （listUpvotes 的 JOIN 读不到它，也无任何清理路径）
+  const contentExists = db.prepare(`SELECT 1 FROM contents WHERE pk = ?`).get(contentPk);
+  if (!contentExists) {
+    return { created: false, skipped: true };
+  }
+
+  // 赞同时间没变就是没有新信息：无谓的 ON CONFLICT DO UPDATE 会每轮重写全量赞同行，
+  // 直接跳过写库，把写入额度留给真正的新数据
+  const existing = db.prepare(
+    `SELECT upvote_time FROM upvotes WHERE content_pk = ?`
+  ).get(contentPk) as { upvote_time: string } | undefined;
+
+  if (existing && existing.upvote_time === upvoteTime) {
+    return { created: false, unchanged: true };
+  }
 
   db.prepare(`
     INSERT INTO upvotes (content_pk, first_seen_at, last_seen_at, upvote_time)
@@ -15,7 +34,9 @@ export function upsertUpvote(contentPk: string, upvoteTime: string) {
 }
 
 export function listUpvotes(params?: { page?: number }) {
-  const page = params?.page || 1;
+  // page 钳制：超大值会让 OFFSET 超出 SQLite int64 直接 500
+  const parsedPage = Number(params?.page ?? 1);
+  const page = Number.isFinite(parsedPage) ? Math.min(Math.max(Math.trunc(parsedPage), 1), 100000) : 1;
   const limit = 50;
   const offset = (page - 1) * limit;
 

@@ -41,6 +41,9 @@ jobs:
           VITE_ZHIHU_USERNAME: ci-placeholder
         run: pnpm --filter web build
 
+      - name: Run DB write regression tests
+        run: node --test scripts/db-write-regression.test.mjs
+
   # 端到端接口冒烟：起本地 Worker + 本地 D1，跑真实请求
   smoke:
     runs-on: ubuntu-latest
@@ -84,8 +87,10 @@ jobs:
           fi
 
           cd ../..
-          bash scripts/smoke-test.sh
-          STATUS=$?
+          # 不要直接 `bash scripts/smoke-test.sh`：run 步骤默认带 bash -e，
+          # 失败会立即退出，后面的 wrangler.log 与 kill $WPID 都不会执行。
+          STATUS=0
+          bash scripts/smoke-test.sh || STATUS=$?
 
           kill $WPID 2>/dev/null || true
 

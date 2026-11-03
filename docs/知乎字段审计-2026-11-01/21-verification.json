@@ -1,0 +1,96 @@
+{
+  "meta": {
+    "date": "2026-11-01",
+    "runner": "G:/gemini zhihu/apps/collector/.fieldprobe/fetch.mjs",
+    "requests_sent": 9,
+    "requests_budget": 9,
+    "statuses": "200 x9 (R1,R2,R2b,R3,R4,R6,R7,R8,R8b); 无 403/40353/40362",
+    "interval_ms": ">=3200（每次调用前显式 sleep 3 + 启动耗时）",
+    "raw_responses_dir": "C:/Users/lixueshu/.zcode/workspace/draft-282a22d6-6c50-4cd4-b066-81fbd9865666/zhihu-fields/tmp/verify21/",
+    "scope_note": "所有结论只依据本次 9 个请求的响应；URL 目标（账号/收藏夹 id）沿用了项目已知对象，但证据全部来自本轮响应。",
+    "request_log": [
+      { "id": "v21_r1_answers_noinc", "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94/answers?limit=5&offset=0", "status": 200, "out": "out-r1.json" },
+      { "id": "v21_r2_answers_inc", "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94/answers?limit=5&offset=0&include=data%5B*%5D.voteup_count,data%5B*%5D.favorite_count,...（原始逗号+重复 data[*]. 前缀）", "status": 200, "out": "out-r2.json", "note": "include 被服务端整体静默忽略（连 comment_count/content 都没返回）——include 语法陷阱实锤" },
+      { "id": "v21_r2b_answers_inc_fixed", "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94/answers?limit=5&offset=0&include=data%5B*%5D.voteup_count%2Ccomment_count%2Cvisit_count%2Cfavorite_count%2Cthanks_count%2Ccontent%2Creaction.statistics", "status": 200, "out": "out-r2b.json" },
+      { "id": "v21_r3_answer_detail_inc", "url": "https://www.zhihu.com/api/v4/answers/2095990096667341029?include=voteup_count%2Ccomment_count%2Cvisit_count%2Cfavorite_count%2Cthanks_count%2Creaction", "status": 200, "out": "out-r3.json" },
+      { "id": "v21_r4_root_comments_inc", "url": "https://www.zhihu.com/api/v4/answers/2082485163410331245/root_comments?limit=5&offset=0&include=data%5B*%5D.img_url%2Cimage_url%2CimageUrl%2Cis_top%2Cis_featured%2Clike_count%2Clikes%2Ccontent%2Cvote_count", "status": 200, "out": "out-r4.json" },
+      { "id": "v21_r6_articles_inc", "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94/articles?limit=2&offset=0&include=data%5B*%5D.content%2Cvoteup_count%2Ccomment_count%2Cis_labeled%2Cfavorite_count%2Cvisit_count%2Cthanks_count%2Creaction.statistics", "status": 200, "out": "out-r6.json" },
+      { "id": "v21_r7_members_inc", "url": "https://www.zhihu.com/api/v4/members/yang-xu-heng-94?include=answer_count%2Carticles_count%2Cfollower_count%2Cfollowing_count%2Cvoteup_count%2Cthanked_count%2Cfavorited_count%2Cquestion_count%2Cpins_count%2Clogs_count", "status": 200, "out": "out-r7.json" },
+      { "id": "v21_r8_collections_items_inc", "url": "https://www.zhihu.com/api/v4/collections/822239827/items?limit=50&offset=0&include=data%5B*%5D.favorite_count%2Cvisit_count%2Cthanks_count%2Creaction.statistics%2Cis_labeled%2Clabel_info", "status": 200, "out": "out-r8.json", "note": "异常：totals=0、data=[] 空响应（疑似 limit=50 触发；%2C 编码 include 亦为嫌疑）" },
+      { "id": "v21_r8b_collections_items_inc20", "url": "https://www.zhihu.com/api/v4/collections/822239827/items?include=data%5B*%5D.content.voteup_count,comment_count,visit_count,favorite_count,thanks_count,excerpt,content,question,author.name,author.headline,reaction.statistics,is_labeled,created_time,updated_time,type&limit=20&offset=0", "status": 200, "out": "out-r8b.json" }
+    ]
+  },
+  "assertions": [
+    {
+      "id": 1,
+      "claim": "answers 列表即使 include 也拿不到 voteup_count / favorite_count / visit_count / thanks_count；只有 comment_count、content 需要 include；reaction.statistics 仅 {like_count, favorites}",
+      "result": "PASS",
+      "request": "R1(无include) + R2b(include=data[*].voteup_count%2Ccomment_count%2Cvisit_count%2Cfavorite_count%2Cthanks_count%2Ccontent%2Creaction.statistics)，均为 GET /api/v4/members/yang-xu-heng-94/answers?limit=5&offset=0",
+      "status": 200,
+      "counterexample": "",
+      "evidence": "R1（无 include，9 条）：comment_count/content/voteup_count/favorite_count/visit_count/thanks_count 全部不存在；reaction.statistics={like_count,favorites}。R2b（include 生效形态，9 条）：comment_count（0/0/0/0/1/2/0/343/2）与 content 均返回；voteup_count/favorite_count/visit_count/thanks_count 虽被显式请求仍全部缺席；reaction.statistics 仍恰为 {like_count,favorites} 两键。附带发现：R2 用原始逗号+每项重复 data[*]. 前缀的 include 被服务端整体静默忽略（响应与 R1 完全一致，连 comment_count/content 都不出现）——include 必须写成『首项带 data[*]. 前缀 + %2C 分隔』才生效。"
+    },
+    {
+      "id": 2,
+      "claim": "answer 详情：favorite_count 缺失；reaction.statistics 有 17 个键",
+      "result": "PASS",
+      "request": "R3: GET /api/v4/answers/2095990096667341029?include=voteup_count%2Ccomment_count%2Cvisit_count%2Cfavorite_count%2Cthanks_count%2Creaction",
+      "status": 200,
+      "counterexample": "",
+      "evidence": "favorite_count 被 include 显式请求，响应顶层 23 键中无此键（voteup_count=36、visit_count=1049、thanks_count=1、comment_count=0 均返回）。reaction.statistics 恰 17 键：applaud_count,bullet_count,comment_count,down_vote_count,favorites,interest_play_count,like_count,plaincontent_like_count,plaincontent_vote_up_count,play_count,pv_count,question_answer_count,question_follower_count,republishers,share_count,subscribe_count,up_vote_count。"
+    },
+    {
+      "id": 3,
+      "claim": "评论接口忽略 include；没有 img_url / image_url / imageUrl；点赞字段叫 vote_count；top/featured 是键名（不是 is_top/is_featured）",
+      "result": "PASS",
+      "request": "R4: GET /api/v4/answers/2082485163410331245/root_comments?limit=5&offset=0&include=data%5B*%5D.img_url%2Cimage_url%2CimageUrl%2Cis_top%2Cis_featured%2Clike_count%2Clikes%2Ccontent%2Cvote_count",
+      "status": 200,
+      "counterexample": "",
+      "evidence": "totals=6，返回 5 条根评论。对整份响应做键树遍历：img_url/image_url/imageUrl/is_top/like_count/likes 一次都不出现（include 用的是 R2b 验证过可生效的形态，新增 0 字段，data[] 键并集恰 29 个=默认模式：含 content,censor_status,can_recommend,child_comment_count 等）；vote_count 存在（样本 379，number）；top 与 featured 作为 boolean 键存在（样本 top=false、featured=true），is_top/is_featured 不存在。注：『忽略 include』与『被请求字段本身不存在』在单请求下不可区分，但两者对该结论的操作含义一致（请求这些字段拿不到任何东西）。"
+    },
+    {
+      "id": 4,
+      "claim": "文章列表 include 只多出 content/voteup_count/comment_count/is_labeled；favorite_count / visit_count / thanks_count 拿不到；真实收藏在 reaction.statistics.favorites",
+      "result": "PASS",
+      "request": "R6: GET /api/v4/members/yang-xu-heng-94/articles?limit=2&offset=0&include=data%5B*%5D.content%2Cvoteup_count%2Ccomment_count%2Cis_labeled%2Cfavorite_count%2Cvisit_count%2Cthanks_count%2Creaction.statistics",
+      "status": 200,
+      "counterexample": "",
+      "evidence": "两条文章 item 均 25 键：content（HTML 正文）、voteup_count（4/3）、comment_count（0/0）、is_labeled（false）四个 include 项全部返回；favorite_count/visit_count/thanks_count 显式请求仍缺席；reaction.statistics 恰为 {like_count,favorites}（favorites=1/12，即真实收藏数载体；like_count=0 与 voteup_count=4 分离）。25 键 = 结论所称 21 默认键 + 4 个 include 键，键集与该并集完全吻合，无第 5 个 include 新增键。caveat：无 include 的 21 键基线本轮因预算未复测（见 unverified）。"
+    },
+    {
+      "id": 5,
+      "claim": "members 的 answer_count/articles_count/follower_count 等计数必须 include 才返回",
+      "result": "PASS",
+      "request": "R7: GET /api/v4/members/yang-xu-heng-94?include=answer_count%2Carticles_count%2Cfollower_count%2Cfollowing_count%2Cvoteup_count%2Cthanked_count%2Cfavorited_count%2Cquestion_count%2Cpins_count%2Clogs_count",
+      "status": 200,
+      "counterexample": "",
+      "evidence": "include 方向 10/10 全部以顶层 number 返回：answer_count=562, articles_count=22, follower_count=1209, following_count=102, voteup_count=36253, thanked_count=19278, favorited_count=18909, question_count=96, pins_count=21, logs_count=457；并附赠 follower_count_text/_num/_unit、following_count_num/_unit 展示字段（与结论的『赠送』描述一致），响应共 41 顶层键。caveat：『无 include 时不返回』这一反向因预算耗尽本轮未复测（见 unverified），但本轮无任何反证。"
+    },
+    {
+      "id": 6,
+      "claim": "collections/items 忽略 include；content.answer 27 键、content.article 14 键；favorite_count/visit_count 在收藏夹里也拿不到",
+      "result": "PASS",
+      "request": "R8b: GET /api/v4/collections/822239827/items?include=data%5B*%5D.content.voteup_count,comment_count,visit_count,favorite_count,thanks_count,excerpt,content,question,author.name,author.headline,reaction.statistics,is_labeled,created_time,updated_time,type&limit=20&offset=0（另 R8: 同端点 limit=50 +%2C编码include 得空响应，见 evidence 尾注）",
+      "status": 200,
+      "counterexample": "",
+      "evidence": "totals=921，20 条（19 answer + 1 article）；外层 item 仅 {content, created} 两键。content.answer 恰 27 键（answer_type,attached_info,attachment,author,comment_count,comment_permission,content,created_time,excerpt,id,is_collapsed,is_copyable,is_deleted,is_mine,is_normal,is_visible,question,relationship,reshipment_settings,suggest_edit,thanks_count,thumbnail,thumbnail_info,type,updated_time,url,voteup_count）；content.article 恰 14 键（author,column,comment_count,comment_permission,content,created,excerpt_title,id,image_url,title,type,updated,url,voteup_count）。include 显式请求的 favorite_count/visit_count/reaction.statistics/is_labeled 一个都没出现（answer/article 两侧均无 reaction），include 未新增任何键；thanks_count 在 answer 侧存在（27 键之一）。尾注（异常）：R8 用 limit=50 + %2C 编码 include 请求同一收藏夹返回 200 但 totals=0/data=[]，R8b（limit=20 + 原始逗号 include）正常返回 921/20 条；R2b 已证明 %2C 编码在 v4 answers 列表可用，故首要嫌疑是 items 端点对 limit=50（>20?）返回空页——采集器翻页请把 limit 控制在 20 以内并复测确认。"
+    },
+    {
+      "id": 7,
+      "claim": "v3 activities 的 data[] 只有 9 个键；target.answer 34 键、target.question 16 键",
+      "result": "UNVERIFIED",
+      "request": "未发出（GET /api/v3/moments/yang-xu-heng-94/activities 计划在 R9）",
+      "status": null,
+      "counterexample": "",
+      "evidence": "9 个请求预算在验证 1-6 时耗尽（其中 1 个用于修正 include 语法、1 个用于复测 R8 空响应异常），activities 请求未能发出，无法给出独立证据。"
+    }
+  ],
+  "summary": { "pass": 6, "fail": 0, "partial": 0 },
+  "unverified": [
+    "断言7（v3 activities data[] 9键 / target.answer 34键 / target.question 16键）：预算 9/9 用尽，未发出请求，无本轮独立证据。",
+    "断言5 的反向（members 无 include 时计数确实不返回）：本轮只验证了 include 方向（10/10 计数返回），未再发无 include 的 members 请求。",
+    "断言4 的『只多出』基线（articles 无 include 时恰 21 键）：本轮只验证了 include 响应恰为所称 21+4 并集、4 个 include 键在场、3 个计数器缺席，未发无 include 的 articles 请求。",
+    "断言3 的『忽略 include』与『字段不存在』在单请求下不可分离：R4 只能证明被请求字段一律不返回、响应等于默认模式。",
+    "R8 异常的成因（collections/items limit=50 或 %2C 编码 include 导致 totals=0 空响应）未做单变量隔离复测。"
+  ]
+}

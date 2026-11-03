@@ -6,6 +6,7 @@ export const contentsStore = {
   hasMoreAnswers: true,
   hasMoreUpvotes: true,
   activeTab: "answers" as "answers" | "upvotes",
+  sortBy: "time" as "time" | "vote",
   scrollPosition: 0
 };
 

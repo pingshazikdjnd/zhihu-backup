@@ -7,7 +7,7 @@ const stripHtml = (html: string) => html ? html.replace(/<[^>]+>/g, '').substrin
 
 export default function ContentsPage() {
   const [activeTab, setActiveTab] = useState<"answers" | "upvotes">(contentsStore.activeTab);
-  const [sortBy, setSortBy] = useState<"time" | "vote">("time");
+  const [sortBy, setSortBy] = useState<"time" | "vote">(contentsStore.sortBy);
   
   // Data caching
   const [answersData, setAnswersData] = useState<any[]>(contentsStore.answersData);
@@ -27,24 +27,35 @@ export default function ContentsPage() {
   const [keyword, setKeyword] = useState("");
   const [searchResults, setSearchResults] = useState<any[] | null>(null);
   const [searchTotal, setSearchTotal] = useState(0);
+  const [searchError, setSearchError] = useState("");
   const [answersTotal, setAnswersTotal] = useState<number | null>(null);
+  const searchSeqRef = useRef(0);
 
   useEffect(() => {
     const kw = keyword.trim();
+    // 每次输入变化（含清空）都作废上一轮搜索，避免慢请求回包覆盖新关键字的结果
+    const seq = ++searchSeqRef.current;
+    setSearchError("");
     if (!kw) {
       setSearchResults(null);
+      // 清空关键字会作废在途请求，它回包后不会再清 loading，这里主动收尾
+      setIsLoading(false);
       return;
     }
     const timer = setTimeout(async () => {
       setIsLoading(true);
       try {
         const res = await api<{ data: any[]; total?: number }>(`/api/contents?q=${encodeURIComponent(kw)}`);
+        if (seq !== searchSeqRef.current) return;
         setSearchResults(res.data);
         setSearchTotal(res.total ?? res.data.length);
-      } catch {
-        setSearchResults([]);
+      } catch (e: any) {
+        if (seq === searchSeqRef.current) {
+          setSearchError(e?.message || "搜索请求失败");
+          setSearchResults(null);
+        }
       }
-      setIsLoading(false);
+      if (seq === searchSeqRef.current) setIsLoading(false);
     }, 300);
     return () => clearTimeout(timer);
   }, [keyword]);
@@ -64,6 +75,10 @@ export default function ContentsPage() {
   useEffect(() => {
     contentsStore.activeTab = activeTab;
   }, [activeTab]);
+
+  useEffect(() => {
+    contentsStore.sortBy = sortBy;
+  }, [sortBy]);
 
   const fetchAnswers = async (page: number, sort = sortBy) => {
     setIsLoading(true);
@@ -150,10 +165,12 @@ export default function ContentsPage() {
 
   // Load more trigger
   const lastElementRef = useCallback((node: HTMLAnchorElement) => {
-    if (isLoading) return;
+    // 上一次请求失败时不能再挂 observer：否则哨兵元素持续可见，
+    // 失败 -> 重挂 -> 再失败，形成无限请求风暴
+    if (isLoading || error) return;
     if (observer.current) observer.current.disconnect();
     observer.current = new IntersectionObserver(entries => {
-      if (entries[0].isIntersecting && !isLoading) {
+      if (entries[0].isIntersecting && !isLoading && !error) {
         // 页码只在请求成功后由 fetchAnswers/fetchUpvotes 提交。
         // 之前在 setState updater 里 +1 并顺带 fetch：updater 同步执行而
         // 页码回滚只在成功时——一次网络失败就永久跳过那一页（50 条无感丢失），
@@ -166,7 +183,7 @@ export default function ContentsPage() {
       }
     });
     if (node) observer.current.observe(node);
-  }, [isLoading, hasMoreAnswers, hasMoreUpvotes, activeTab, answersPage, upvotesPage]);
+  }, [isLoading, error, hasMoreAnswers, hasMoreUpvotes, activeTab, answersPage, upvotesPage]);
 
   const currentItems = searchResults !== null ? searchResults : (activeTab === "answers" ? answersData : upvotesData);
   const sortedItems = currentItems;
@@ -191,8 +208,22 @@ export default function ContentsPage() {
   return (
     <div>
       {error && (
-        <div className="card" style={{ color: "#dc2626", fontSize: 14 }}>
-          {error}
+        <div className="card" style={{ color: "#dc2626", fontSize: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <span>{error}</span>
+          <button
+            type="button"
+            className="btn-ghost"
+            onClick={() => {
+              setError("");
+              if (activeTab === "answers") {
+                fetchAnswers(answersData.length === 0 ? 1 : answersPage + 1);
+              } else {
+                fetchUpvotes(upvotesData.length === 0 ? 1 : upvotesPage + 1);
+              }
+            }}
+          >
+            点击重试
+          </button>
         </div>
       )}
       <div className="tab-bar" style={{ justifyContent: "space-between" }}>
@@ -217,6 +248,12 @@ export default function ContentsPage() {
           />
         </div>
       </div>
+
+      {searchError && (
+        <div className="card" style={{ color: "#dc2626", fontSize: 14 }}>
+          搜索失败：{searchError}
+        </div>
+      )}
 
       <div className="cards">
         {sortedItems.map((item, index) => {
@@ -258,7 +295,7 @@ export default function ContentsPage() {
           );
         })}
         {isLoading && <p className="loading-state">加载中...</p>}
-        {!isLoading && sortedItems.length === 0 && (
+        {!isLoading && sortedItems.length === 0 && !searchError && (
           <p className="empty-state">
             {searchResults !== null ? `没有找到匹配「${keyword}」的内容` : "这里空空如也~"}
           </p>
