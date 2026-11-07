@@ -345,6 +345,19 @@ export function createZhihuJson(stats: ZhihuRiskStats, deps: ZhihuFetchDeps = {}
                 /* 读 body 失败不影响主流程 */
             }
 
+            // 知乎对「评论已关闭 / 内容已删除或无权查看评论」会返回 HTTP 403（如 code=106 "评论已关闭"）：
+            // 这是业务态无评论，不是账号风控，绝不能暂停 60s 重试，也不计入 authRejected / riskFailStreak
+            if (status === 403 && /评论已关闭|"code"\s*:\s*106\b|评论功能已关闭|暂时无法查看评论/.test(detail)) {
+                throw recordFailure(
+                    "http",
+                    status,
+                    label,
+                    `知乎内容已关闭评论 (${label}): HTTP 403 ${detail}`,
+                    false,
+                    false
+                );
+            }
+
             if (isRetryableStatus(status)) {
                 const reason = `HTTP ${status}${detail ? `: ${detail}` : ""}`;
                 if (!isLastAttempt) {

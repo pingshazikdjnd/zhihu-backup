@@ -84,10 +84,10 @@ export default function ContentsPage() {
     setIsLoading(true);
     setError("");
     try {
-      // 作者 token 不再写死：换账号或换环境只改 VITE_ZHIHU_USERNAME。
-      // 不配就退化成"全部内容"，至少不会永远空白。
-      const author = (import.meta.env.VITE_ZHIHU_USERNAME as string | undefined) || "";
-      const authorQuery = author ? `&author=${encodeURIComponent(author)}` : "";
+      // 直接由服务端按 Worker 的 ZHIHU_USERNAME 精准过滤本人创作（回答 + 专栏文章），
+      // 不再因未配置前端 VITE_ZHIHU_USERNAME 而把收藏夹/关注答主的他人回答混进来
+      const envAuthor = (import.meta.env.VITE_ZHIHU_USERNAME as string | undefined) || "";
+      const authorQuery = envAuthor ? `&author=${encodeURIComponent(envAuthor)}` : "&mine=1";
       const res = await api<{ data: any[]; total?: number }>(`/api/contents?page=${page}${authorQuery}&sort=${sort}`);
       const myAnswers = res.data;
 

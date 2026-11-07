@@ -536,6 +536,25 @@ async function replaceCommentsByRootInner(
           content_md, img_url, time_text, location, likes, is_author, is_top, is_featured,
           comment_hash, child_count, first_seen_at, last_seen_at, is_deleted, deleted_at
         ) VALUES (?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+        ON CONFLICT(id) DO UPDATE SET
+          content_pk = excluded.content_pk,
+          parent_comment_id = NULL,
+          author_name = COALESCE(NULLIF(excluded.author_name, ''), comments.author_name),
+          author_avatar = COALESCE(NULLIF(excluded.author_avatar, ''), comments.author_avatar),
+          be_replied = NULL,
+          content_md = COALESCE(NULLIF(excluded.content_md, ''), comments.content_md),
+          img_url = COALESCE(NULLIF(excluded.img_url, ''), comments.img_url),
+          time_text = COALESCE(NULLIF(excluded.time_text, ''), comments.time_text),
+          location = COALESCE(NULLIF(excluded.location, ''), comments.location),
+          likes = excluded.likes,
+          is_author = excluded.is_author,
+          is_top = excluded.is_top,
+          is_featured = excluded.is_featured,
+          comment_hash = excluded.comment_hash,
+          child_count = excluded.child_count,
+          last_seen_at = excluded.last_seen_at,
+          is_deleted = 0,
+          deleted_at = NULL
       `).bind(
         root.id,
         input.contentPk,

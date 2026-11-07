@@ -8,6 +8,12 @@ const COOKIE_KEY = "zhihu_cookie";
 const WRITE_TOKEN_KEY = "cookie_write_token";
 const SYNC_CONFIG_KEY = "sync_config";
 const R2_SYNC_CONFIG_KEY = "meta/sync_config.json";
+// 反代 DeepSeek（OpenAI 兼容接口）的 API Key 单独存 app_settings：
+// 绝不写进 sync_config JSON / R2、绝不出现在任何 GET 响应里，前端只知道「有没有配」。
+const FALLBACK_AI_KEY_KEY = "fallback_ai_api_key";
+const DEFAULT_FALLBACK_AI_MODEL = "deepseek-v4.1-flash";
+// 本地 Worker 默认把请求打到同机反代；云端未显式配置公网 https 地址时由 recommend.ts 拒绝直连回环地址
+const DEFAULT_FALLBACK_AI_BASE_URL = "http://127.0.0.1:8788/v1";
 export const EXTERNAL_TARGETS_KEY = "external_storage_targets";
 export const R2_EXTERNAL_TARGETS_KEY = "meta/external_storage_targets.json";
 
@@ -598,7 +604,19 @@ export type SyncConfig = {
   commentsFollowing: CommentSyncMode;
   followingSensitivity: "strict" | "standard" | "relaxed";
   preferredAiModel: string;
+  /** Workers AI 额度耗尽/不可用时的替补引擎 Base URL（OpenAI 兼容），空串=未配置 */
+  fallbackAiBaseUrl?: string;
+  /** 替补引擎模型名，默认 deepseek-v4.1-flash */
+  fallbackAiModel?: string;
+  /** 只读标记：替补引擎 Key 是否已保存（明文 Key 永不回传前端） */
+  hasFallbackAiKey?: boolean;
   updatedAt?: string | null;
+};
+
+/** 写入用 patch：fallbackAiApiKey 只写不读（保存后只回 hasFallbackAiKey） */
+export type SyncConfigPatch = Partial<SyncConfig> & {
+  /** 非空=保存；"__CLEAR__"=清空；留空=保留原值 */
+  fallbackAiApiKey?: string;
 };
 
 export const DEFAULT_SYNC_CONFIG: SyncConfig = {
@@ -609,6 +627,9 @@ export const DEFAULT_SYNC_CONFIG: SyncConfig = {
   commentsFollowing: "hot",
   followingSensitivity: "standard",
   preferredAiModel: "@cf/qwen/qwen3-30b-a3b-fp8",
+  fallbackAiBaseUrl: "",
+  fallbackAiModel: DEFAULT_FALLBACK_AI_MODEL,
+  hasFallbackAiKey: false,
   updatedAt: null
 };
 
@@ -620,6 +641,39 @@ const VALID_AI_MODELS = new Set([
   "@cf/zai-org/glm-5.3-flash",
   "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 ]);
+
+/** 替补引擎 Base URL 归一：只接受 http/https，去掉尾斜杠；非法值回退原值 */
+function normalizeFallbackBaseUrl(value: unknown, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+  const raw = value.trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return fallback;
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return fallback;
+  }
+}
+
+/** 替补引擎模型名归一：trim + 截断，空则默认 deepseek-v4.1-flash */
+function normalizeFallbackModel(value: unknown, fallback: string): string {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return fallback || DEFAULT_FALLBACK_AI_MODEL;
+  return raw.slice(0, 120);
+}
+
+/** 读取替补引擎 Key（仅服务端内部使用，任何 GET 接口都不得回传明文） */
+async function readFallbackAiApiKey(): Promise<string> {
+  try {
+    const row = await db.prepare(
+      `SELECT value FROM app_settings WHERE key = ?`
+    ).get<{ value: string }>(FALLBACK_AI_KEY_KEY);
+    return typeof row?.value === "string" ? row.value.trim() : "";
+  } catch {
+    return "";
+  }
+}
 
 export async function getSyncConfig(bucket: any): Promise<SyncConfig> {
   let r2Cfg: Partial<SyncConfig> | null = null;
@@ -647,11 +701,51 @@ export async function getSyncConfig(bucket: any): Promise<SyncConfig> {
     commentsFollowing: VALID_COMMENT_MODES.has(merged.commentsFollowing as CommentSyncMode) ? (merged.commentsFollowing as CommentSyncMode) : "hot",
     followingSensitivity: VALID_SENSITIVITY.has(merged.followingSensitivity) ? merged.followingSensitivity : "standard",
     preferredAiModel: VALID_AI_MODELS.has(merged.preferredAiModel) ? merged.preferredAiModel : "@cf/qwen/qwen3-30b-a3b-fp8",
+    fallbackAiBaseUrl: normalizeFallbackBaseUrl(merged.fallbackAiBaseUrl, ""),
+    fallbackAiModel: normalizeFallbackModel(merged.fallbackAiModel, DEFAULT_FALLBACK_AI_MODEL),
+    // 只暴露布尔标记：明文 Key 只存在 app_settings.fallback_ai_api_key 与 env secret 中
+    hasFallbackAiKey: (await readFallbackAiApiKey()) !== "",
     updatedAt: merged.updatedAt || null
   };
 }
 
-export async function saveSyncConfig(bucket: any, patch: Partial<SyncConfig>): Promise<SyncConfig> {
+/**
+ * 替补 AI 引擎（OpenAI 兼容）的运行时配置。
+ * 优先级：网页保存的 D1/R2 配置 > 环境变量 > 默认值（本机 127.0.0.1:8788 反代）。
+ * 注意：baseUrl 是否允许直连由 services/recommend.ts 的 resolveFallbackEndpoint 再做 SSRF 校验。
+ */
+export type FallbackAiConfig = {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  /** db=网页设置，env=环境变量，none=都没配（仍使用本地默认地址，仅本地可用） */
+  source: "db" | "env" | "none";
+};
+
+export async function getFallbackAiConfig(env: Bindings): Promise<FallbackAiConfig> {
+  let cfg: SyncConfig | null = null;
+  try {
+    cfg = await getSyncConfig(env.BUCKET);
+  } catch {
+    cfg = null;
+  }
+  const dbKey = await readFallbackAiApiKey();
+  const envBase = String(env.FALLBACK_AI_BASE_URL || "").trim();
+  const envKey = String(env.FALLBACK_AI_API_KEY || "").trim();
+  const envModel = String(env.FALLBACK_AI_MODEL || "").trim();
+  const dbBase = String(cfg?.fallbackAiBaseUrl || "").trim();
+  const baseUrl = (dbBase || envBase || DEFAULT_FALLBACK_AI_BASE_URL).replace(/\/+$/, "");
+  const apiKey = dbKey || envKey;
+  const model = normalizeFallbackModel(cfg?.fallbackAiModel, envModel || DEFAULT_FALLBACK_AI_MODEL);
+  return {
+    baseUrl,
+    apiKey,
+    model,
+    source: dbBase || dbKey ? "db" : envBase || envKey ? "env" : "none"
+  };
+}
+
+export async function saveSyncConfig(bucket: any, patch: SyncConfigPatch): Promise<SyncConfig> {
   const current = await getSyncConfig(bucket);
   const now = new Date().toISOString();
   const next: SyncConfig = {
@@ -661,8 +755,26 @@ export async function saveSyncConfig(bucket: any, patch: Partial<SyncConfig>): P
     commentsFollowing: VALID_COMMENT_MODES.has(patch.commentsFollowing as CommentSyncMode) ? (patch.commentsFollowing as CommentSyncMode) : current.commentsFollowing,
     followingSensitivity: VALID_SENSITIVITY.has(patch.followingSensitivity as string) ? (patch.followingSensitivity as any) : current.followingSensitivity,
     preferredAiModel: VALID_AI_MODELS.has(patch.preferredAiModel as string) ? (patch.preferredAiModel as string) : current.preferredAiModel,
+    fallbackAiBaseUrl: normalizeFallbackBaseUrl(patch.fallbackAiBaseUrl, current.fallbackAiBaseUrl || ""),
+    fallbackAiModel: normalizeFallbackModel(patch.fallbackAiModel, current.fallbackAiModel || DEFAULT_FALLBACK_AI_MODEL),
     updatedAt: now
   };
+
+  // 替补引擎 Key：非空=保存，__CLEAR__=清空，留空=保留原值（前端只提交「有变化」的密钥）
+  const rawKey = typeof patch.fallbackAiApiKey === "string" ? patch.fallbackAiApiKey.trim() : "";
+  if (rawKey === "__CLEAR__") {
+    try {
+      await db.prepare(`DELETE FROM app_settings WHERE key = ?`).run(FALLBACK_AI_KEY_KEY);
+    } catch { /* ignore */ }
+  } else if (rawKey) {
+    try {
+      await db.prepare(`
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `).run(FALLBACK_AI_KEY_KEY, rawKey, now);
+    } catch { /* ignore */ }
+  }
 
   if (bucket) {
     await bucket.put(R2_SYNC_CONFIG_KEY, JSON.stringify(next), {
@@ -677,7 +789,8 @@ export async function saveSyncConfig(bucket: any, patch: Partial<SyncConfig>): P
     `).run(SYNC_CONFIG_KEY, JSON.stringify(next), now);
   } catch { /* D1 每日写入限额满时由 R2 持久化 */ }
 
-  return next;
+  const savedKey = rawKey && rawKey !== "__CLEAR__" ? rawKey : await readFallbackAiApiKey();
+  return { ...next, hasFallbackAiKey: Boolean(savedKey) };
 }
 
 function isValidCookieString(s: string): boolean {
@@ -1022,6 +1135,9 @@ authRoutes.get("/zhihu-status", async c => {
 
   const activeTokenInfo = await getActiveWriteTokenInfo(c);
   const syncConfig = await getSyncConfig(c.env.BUCKET);
+  // 环境变量注入的 Key 同样算「已配置」，但明文永不回传：只暴露 hasFallbackAiKey
+  const hasFallbackAiKey =
+    Boolean(syncConfig.hasFallbackAiKey) || Boolean(String(c.env.FALLBACK_AI_API_KEY || "").trim());
   let upvotesCursor: string | null = null;
   try {
     const cRow = await db.prepare(`SELECT value FROM app_settings WHERE key = 'upvotes_cursor'`).get<{ value: string }>();
@@ -1045,7 +1161,7 @@ authRoutes.get("/zhihu-status", async c => {
     // 读接口是否也要求 Bearer（默认关闭，保持前端直接可用）
     readAuthRequired: c.env.READ_AUTH_REQUIRED === "true",
     lastRun: await getLastApifyRun(c),
-    syncConfig,
+    syncConfig: { ...syncConfig, hasFallbackAiKey },
     upvotesCursor,
     externalTargetsCount
   });
@@ -1056,19 +1172,24 @@ authRoutes.get("/zhihu-status", async c => {
  */
 authRoutes.get("/settings", async c => {
   const syncConfig = await getSyncConfig(c.env.BUCKET);
-  return c.json({ ok: true, syncConfig });
+  const hasFallbackAiKey =
+    Boolean(syncConfig.hasFallbackAiKey) || Boolean(String(c.env.FALLBACK_AI_API_KEY || "").trim());
+  return c.json({ ok: true, syncConfig: { ...syncConfig, hasFallbackAiKey } });
 });
 
 authRoutes.post("/settings", async c => {
   if (!(await authorizeWrite(c)).ok) {
     return denyWrite(c, "操作密码错误或未填写，请先在设置页输入操作密码");
   }
-  const body = await c.req.json().catch(() => null) as Partial<SyncConfig> | null;
+  const body = await c.req.json().catch(() => null) as SyncConfigPatch | null;
   if (!body || typeof body !== "object") {
     return c.json({ error: "invalid body" }, 400);
   }
   const saved = await saveSyncConfig(c.env.BUCKET, body);
-  return c.json({ ok: true, syncConfig: saved });
+  const hasFallbackAiKey =
+    Boolean(saved.hasFallbackAiKey) || Boolean(String(c.env.FALLBACK_AI_API_KEY || "").trim());
+  // 响应永不包含 fallbackAiApiKey 明文，只有 hasFallbackAiKey 标记
+  return c.json({ ok: true, syncConfig: { ...saved, hasFallbackAiKey } });
 });
 
 /**

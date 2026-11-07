@@ -918,6 +918,11 @@ globalThis.__crawlerContext = {
           paging: { is_end: true }
         });
       }
+      // 回答详情真实统计：members/answers 列表不返回顶层 voteup_count/visit_count，
+      // crawler 会在入库前逐篇请求 /api/v4/answers/{id} 补真实赞同数与真实浏览量
+      if (target.includes("/api/v4/answers/123?")) {
+        return okJson({ id: 123, voteup_count: 10, visit_count: 5, comment_count: 2 });
+      }
       if (target.includes("/answers?")) return okJson({ data: [answerFixture], paging: { is_end: true } });
       if (target.includes("/root_comments")) return okJson({ data: commentFixtures, paging: { is_end: true } });
       if (target.includes("/child_comments")) return okJson({ data: [], paging: { is_end: true } });

@@ -36,6 +36,11 @@ type SyncConfig = {
   commentsFollowing: CommentSyncMode;
   followingSensitivity: "strict" | "standard" | "relaxed";
   preferredAiModel: string;
+  // Workers AI 额度耗尽/不可用时的替补引擎（OpenAI 兼容，反代 DeepSeek）
+  fallbackAiBaseUrl?: string;
+  fallbackAiModel?: string;
+  // 只读标记：后端只返回「有没有配 Key」，明文 Key 永不下发
+  hasFallbackAiKey?: boolean;
   updatedAt?: string | null;
 };
 
@@ -66,7 +71,10 @@ const DEFAULT_CFG: SyncConfig = {
   commentsUpvotes: "hot",
   commentsFollowing: "hot",
   followingSensitivity: "standard",
-  preferredAiModel: "@cf/qwen/qwen3-30b-a3b-fp8"
+  preferredAiModel: "@cf/qwen/qwen3-30b-a3b-fp8",
+  fallbackAiBaseUrl: "",
+  fallbackAiModel: "deepseek-v4.1-flash",
+  hasFallbackAiKey: false
 };
 
 function fmtTime(iso: string | null | undefined) {
@@ -97,6 +105,9 @@ export default function AuthPage() {
   const cfgDirtyRef = useRef(false);
   const [savingCfg, setSavingCfg] = useState(false);
   const [cfgMsg, setCfgMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  // 替补引擎 Key 只写不读：明文绝不进 state 之外的地方，保存后立即清空输入框
+  const [fallbackKeyInput, setFallbackKeyInput] = useState("");
+  const [clearFallbackKey, setClearFallbackKey] = useState(false);
 
   const [cookieInput, setCookieInput] = useState("");
   const [token, setToken] = useState(
@@ -195,13 +206,21 @@ export default function AuthPage() {
     setSavingCfg(true);
     setCfgMsg(null);
     try {
+      // 替补引擎 Key：勾选清除 → "__CLEAR__"；输入了新 Key → 覆盖；留空 → 保留原值（服务端不返回明文）
+      const keyPatch = clearFallbackKey
+        ? { fallbackAiApiKey: "__CLEAR__" }
+        : fallbackKeyInput.trim()
+        ? { fallbackAiApiKey: fallbackKeyInput.trim() }
+        : {};
       const res = await api<{ ok: boolean; syncConfig: SyncConfig }>("/api/auth/settings", {
         method: "POST",
         headers: buildHeaders(),
-        body: JSON.stringify(cfg)
+        body: JSON.stringify({ ...cfg, ...keyPatch })
       });
       if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
       if (res.syncConfig) setCfg(res.syncConfig);
+      setFallbackKeyInput("");
+      setClearFallbackKey(false);
       cfgDirtyRef.current = false;
       setCfgMsg({ type: "ok", text: "同步与评论策略已保存生效！下次自动或手动同步将按新策略执行。" });
       load(false);
@@ -542,6 +561,23 @@ export default function AuthPage() {
     minWidth: 240
   };
 
+  // 替补引擎配置区的输入框/标签样式（与外部存储表单保持一致）
+  const fallbackInputStyle: React.CSSProperties = {
+    width: "100%",
+    boxSizing: "border-box",
+    padding: "8px 12px",
+    borderRadius: 6,
+    border: "1px solid var(--zhihu-border, #d1d5db)",
+    background: "#fff",
+    fontSize: 13
+  };
+  const fallbackLabelStyle: React.CSSProperties = {
+    display: "block",
+    fontSize: 12,
+    fontWeight: 600,
+    marginBottom: 4
+  };
+
   return (
     <div>
       {/* 顶部系统状态概览 */}
@@ -806,6 +842,73 @@ export default function AuthPage() {
               <option value="@cf/zai-org/glm-5.3-flash">智谱 GLM-5.3-Flash（中文语境自然）</option>
               <option value="@cf/meta/llama-3.3-70b-instruct-fp8-fast">Meta Llama-3.3-70B-FP8-Fast（700亿超大参数）</option>
             </select>
+          </div>
+
+          {/* Workers AI 额度耗尽替补引擎：每日 Neurons 用尽 / 模型报错时自动无缝改走反代 DeepSeek */}
+          <div style={{ paddingTop: 10, borderTop: "1px dashed var(--zhihu-border-light, #e2e8f0)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+              <div>
+                <div style={{ fontWeight: 600, fontSize: 14 }}>Workers AI 额度耗尽替补引擎（反代 DeepSeek / OpenAI 兼容接口）</div>
+                <div style={{ fontSize: 12, color: "var(--zhihu-meta)", lineHeight: 1.6, maxWidth: 760 }}>
+                  每日免费 Neurons 用尽（budget-exhausted）或 Workers AI 模型报错时，自动无缝改走这里配置的反代接口完成风险鉴定与关注答主复核，全部留空则读取环境变量 FALLBACK_AI_BASE_URL / FALLBACK_AI_API_KEY / FALLBACK_AI_MODEL，最后回退默认 http://127.0.0.1:8788/v1
+                </div>
+              </div>
+              <span
+                style={{
+                  fontSize: 12,
+                  fontWeight: 500,
+                  padding: "2px 8px",
+                  borderRadius: 12,
+                  background: cfg.hasFallbackAiKey ? "#dcfce7" : "#f1f5f9",
+                  color: cfg.hasFallbackAiKey ? "#15803d" : "#64748b",
+                  border: `1px solid ${cfg.hasFallbackAiKey ? "#bbf7d0" : "#e2e8f0"}`,
+                  whiteSpace: "nowrap"
+                }}
+              >
+                {cfg.hasFallbackAiKey ? "🔑 已保存 Key（脱敏）" : "未配置 Key"}
+              </span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10, marginTop: 10 }}>
+              <div>
+                <label style={fallbackLabelStyle}>Base URL</label>
+                <input
+                  type="text"
+                  placeholder="例如 http://127.0.0.1:8788/v1 或公网反代地址"
+                  value={cfg.fallbackAiBaseUrl || ""}
+                  onChange={e => updateCfg({ fallbackAiBaseUrl: e.target.value })}
+                  style={fallbackInputStyle}
+                />
+              </div>
+              <div>
+                <label style={fallbackLabelStyle}>模型名称</label>
+                <input
+                  type="text"
+                  placeholder="deepseek-v4.1-flash"
+                  value={cfg.fallbackAiModel || ""}
+                  onChange={e => updateCfg({ fallbackAiModel: e.target.value })}
+                  style={fallbackInputStyle}
+                />
+              </div>
+              <div>
+                <label style={fallbackLabelStyle}>API Key</label>
+                <input
+                  type="password"
+                  placeholder={cfg.hasFallbackAiKey ? "已保存密钥，留空则保持不变" : "本地免 Key 可留空"}
+                  value={fallbackKeyInput}
+                  onChange={e => setFallbackKeyInput(e.target.value)}
+                  disabled={clearFallbackKey}
+                  style={{ ...fallbackInputStyle, opacity: clearFallbackKey ? 0.5 : 1 }}
+                />
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginTop: 6, color: "var(--zhihu-meta)" }}>
+                  <input
+                    type="checkbox"
+                    checked={clearFallbackKey}
+                    onChange={e => setClearFallbackKey(e.target.checked)}
+                  />
+                  保存时清除已保存的 Key
+                </label>
+              </div>
+            </div>
           </div>
 
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, paddingTop: 10, borderTop: "1px dashed var(--zhihu-border-light, #e2e8f0)" }}>

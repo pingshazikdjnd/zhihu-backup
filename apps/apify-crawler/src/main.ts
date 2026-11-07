@@ -49,9 +49,22 @@ function followingRiskThreshold(): number {
   return cfg.followingSensitivity === "strict" ? 40 : cfg.followingSensitivity === "relaxed" ? 18 : 25;
 }
 
+// 真人阅读节奏：固定毫秒连续翻页（实测楼中楼 300ms + 根评论 350ms 连打 1 小时）
+// 会被知乎判定为脚本，触发 HTTP 403 code=40352 (/account/unhuman) 临时风控。
+// 所有分页节流统一走随机抖动：既没有固定节奏指纹，也拉高了平均间隔。
+function jitterSleep(minMs: number, maxMs: number): Promise<void> {
+  const ms = Math.floor(minMs + Math.random() * (maxMs - minMs));
+  return new Promise(r => setTimeout(r, ms));
+}
+
 // 失败上报：所有异常都被吞掉的爬虫在 Apify 上永远显示 SUCCEEDED，
 // cookie 失效后零数据入库也毫无感知。这里集中统计，结束时据此决定 run 状态。
 const MAX_DAILY_ESTIMATED_WRITES = 90000; // 90000 < D1 免费版硬顶 100000 行/天：留 10% 余量给配置写入与并发，避免撞墙后整轮 500
+// 本地全量重扒开关：本地 wrangler D1 是磁盘上的 SQLite，没有云端「10 万行/天」硬顶，
+// 因此 UNLIMITED_LOCAL_WRITES=1 时同时放开「写入预算熔断」和「AI 复核调用次数上限」，
+// 否则 102 位关注答主的候选回答/文章会在前 3 次 AI 复核之后全部按规则跳过。
+const UNLIMITED_LOCAL_WRITES =
+  process.env.UNLIMITED_LOCAL_WRITES === "1" || process.env.UNLIMITED_LOCAL_WRITES === "true";
 const stats = {
   saved: 0,
   failed: 0,
@@ -176,7 +189,9 @@ async function post(path: string, body: unknown, opts?: { countStats?: boolean }
     else if (path === "/ingest/followed-users") cost = Math.max(1, (body as any)?.users?.length || 1);
 
     stats.estimatedWrites += cost;
-    if (stats.estimatedWrites >= MAX_DAILY_ESTIMATED_WRITES) {
+    // 本地无限写模式：不按云端 D1 每日行数判定熔断（本地 SQLite 无硬顶），
+    // 仅保留「连续 5 次入库失败」的故障熔断
+    if (!UNLIMITED_LOCAL_WRITES && stats.estimatedWrites >= MAX_DAILY_ESTIMATED_WRITES) {
       if (!stats.circuitBroken) {
         stats.circuitBroken = true;
         console.warn(`\n🛑 [D1每日限额保护] 今日预估写入已达 ${stats.estimatedWrites} 行（已充分吃满 CF 官方 100k 额度并适度利用缓冲）。主动安全挂起，已保存断点，等待明日 08:05 额度刷新后自动续跑！`);
@@ -376,6 +391,41 @@ const sendContent = (b: any) => post("/ingest/content", b);
 // 旧扁平接口 /ingest/comments 仍由 Worker 保留兼容，但爬虫已统一走按根分组接口
 const sendCollectionSnapshot = (b: any) => post("/ingest/collection-snapshot", b);
 
+/**
+ * 补全单篇回答的真实统计（赞同数 / 浏览量 / 评论数）。
+ *
+ * 根因（10-live-answers 真机实测）：members/{token}/answers 列表接口不返回顶层
+ * voteup_count / visit_count；其 reaction.statistics.like_count 是右下角「❤️ 喜欢数」，
+ * 通常只有「▲ 赞同数」的 1%~5%（例：13,026 收藏的回答 like_count 只有 354，
+ * 1,431 赞的回答 like_count 只有 25），visit_count 更是恒缺。
+ * 真实顶层 voteup_count / visit_count 只有回答详情接口
+ * /api/v4/answers/{id}?include=voteup_count,visit_count,comment_count 才返回。
+ *
+ * 单篇 404/被删/风控单条失败时返回 null，调用方回退列表原有字段，绝不中断主流程。
+ */
+async function fetchAnswerTrueStats(
+  context: any,
+  answerId: string
+): Promise<{ voteupCount: number; visitCount: number; commentCount?: number } | null> {
+  // 温和节流：逐篇详情请求是额外流量，固定 250ms 连打容易被判定为脚本
+  await jitterSleep(250, 550);
+  try {
+    const { json } = await zhihuJson(
+      context,
+      `https://www.zhihu.com/api/v4/answers/${answerId}?include=voteup_count,visit_count,comment_count`,
+      { label: `回答详情统计 ${answerId}`, allow404: true }
+    );
+    return {
+      voteupCount: Number(json.voteup_count ?? json.reaction?.statistics?.up_vote_count ?? 0) || 0,
+      visitCount: Number(json.visit_count ?? json.reaction?.statistics?.pv_count ?? 0) || 0,
+      commentCount: typeof json.comment_count === "number" ? json.comment_count : undefined
+    };
+  } catch (e: any) {
+    console.warn(`⚠️ 回答真实统计获取失败 (${answerId})，回退列表字段: ${sanitizeErrorForLog(e)}`);
+    return null;
+  }
+}
+
 
 const ZHIHU_USERNAME = zhihuUsername;
 const ZHIHU_COOKIE_STRING = cookieString;
@@ -547,12 +597,22 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       }
       seenIds.add(idStr);
 
-      // 列表 include 不返回顶层 voteup_count/favorite_count，赞同/收藏数走默认下发的
-      // reaction.statistics（like_count/favorites）；visit_count 列表不存在，只保留顶层兜底。
-      // 不再逐条请求 /answers/{id} 补统计（562 次多余请求）。
-      const finalVoteup = item.voteup_count ?? item.reaction?.statistics?.like_count ?? 0;
+      // ⚠️ 列表字段的真实语义（10-live-answers 真机实测）：
+      // - 顶层 voteup_count / visit_count / favorite_count 在 members/answers 列表里严格不返回；
+      // - reaction.statistics.like_count 是右下角「❤️ 喜欢数」，不是「▲ 赞同数」，
+      //   通常只有赞同数的 1%~5%（13026 收藏的回答 like_count 仅 354，1431 赞的仅 25）；
+      // - visit_count 列表不存在。
+      // 因此真实赞同数与真实浏览量必须走回答详情 /api/v4/answers/{id}：
+      // - 全量模式：逐篇补全（539 篇约 3 分钟），换取 100% 准确的赞同数与十万级真实浏览量；
+      // - 极速模式：只补前 2 页（新回答/涨赞集中在这两页头部，第 3 页后很快触发 20 条早停），
+      //   其余条目沿用列表字段，避免每一轮都为全量历史多打几百次详情请求。
+      const shouldFetchTrueStats = !isFast || pagesScanned <= 2;
+      const trueStats = shouldFetchTrueStats ? await fetchAnswerTrueStats(context, idStr) : null;
+      const finalVoteup = trueStats?.voteupCount ?? item.voteup_count ?? item.reaction?.statistics?.like_count ?? 0;
       const finalFavorite = item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0;
-      const finalVisit = item.visit_count ?? 0;
+      const finalVisit = trueStats?.visitCount ?? item.visit_count ?? 0;
+      const finalCommentCount = trueStats?.commentCount ?? item.comment_count ?? 0;
+
 
       const contentInput = {
         sourceType: "answer" as const,
@@ -565,7 +625,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
         contentMd: "",
         excerpt: item.excerpt || "",
         voteupCount: finalVoteup,
-        commentCount: item.comment_count || 0,
+        commentCount: finalCommentCount,
         favoriteCount: finalFavorite,
         visitCount: finalVisit,
         isCollapsed: item.is_collapsed,
@@ -761,7 +821,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
                 for (const child of chJson.data) pushChild(child);
                 chIsEnd = Boolean(chJson.paging?.is_end);
                 chOffset += 20;
-                await new Promise(r => setTimeout(r, 300));
+                await jitterSleep(900, 1700);
               }
             if (!chIsEnd && chPages >= MAX_COMMENT_PAGES) {
               cIncomplete = true;
@@ -780,7 +840,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
         cIsEnd = Boolean(cJson.paging?.is_end);
         if (cIsEnd) rootEnded = true;
         cOffset += 20;
-        await new Promise(r => setTimeout(r, 500));
+        await jitterSleep(1100, 2000);
       }
       // 没正常翻到 is_end（风控/熔断/页数上限/hot 截断）时本轮必须标记 partial，
       // 否则最后一批会按不完整的根列表做删除对账
@@ -1061,16 +1121,85 @@ export async function syncHotCommentsForContent(
         const childCount = Number(c.child_comment_count) || 0;
         const children: ChildComment[] = [];
         const seenChildIds = new Set<string>();
+        const pushChild = (child: any) => {
+          const childId = String(child.id);
+          if (seenChildIds.has(childId)) return;
+          seenChildIds.add(childId);
+          children.push(toChildComment(child, rootId));
+        };
+        // 根评论接口内联的 child_comments 通常只有前 2~5 条，先收进来再按需翻页补齐
         if (Array.isArray(c.child_comments)) {
-          for (const child of c.child_comments) {
-            const childId = String(child.id);
-            if (seenChildIds.has(childId)) continue;
-            seenChildIds.add(childId);
-            children.push(toChildComment(child, rootId));
-          }
+          for (const child of c.child_comments) pushChild(child);
         }
-        // hot 模式不翻子评论页：内联条数补齐 child_comment_count 才算完整
-        rootsBuffer.push(toRootCommentGroup(c, children, children.length >= childCount));
+
+        // full 模式：楼中楼必须翻页抓全（知乎根评论接口只内联前几条）。
+        // hot 模式（赞同内容）保持轻量：只取 1 页根评论 + 内联楼中楼，不额外翻子评论页。
+        let childrenComplete = children.length >= childCount;
+        if (mode === "full" && childCount > children.length) {
+          const buildChildUrl = (offset: number) =>
+            isArticle
+              ? `https://www.zhihu.com/api/v4/comment_v5/comment/${c.id}/child_comment?order_by=ts&limit=20&offset=${offset === 0 ? "" : offset}`
+              : `https://www.zhihu.com/api/v4/comments/${c.id}/child_comments?offset=${offset}&limit=20`;
+          let chOffset = 0;
+          let chIsEnd = false;
+          let chPages = 0;
+          let chNextUrl = buildChildUrl(chOffset);
+          while (!chIsEnd && chPages < MAX_COMMENT_PAGES && !stats.riskExhausted && !stats.circuitBroken) {
+            let chJson: any;
+            try {
+              // 必须复用带 cookie 的 context.request：裸 fetch 不带登录态，知乎直接 401
+              chJson = (await zhihuJson(context, chNextUrl, {
+                label: `${sourceType} ${sourceId} 楼中楼 ${c.id}`,
+                // 文章关闭评论/被删会 404：属正常业务结果，不污染整轮风控计数
+                ...(isArticle ? { allow404: true } : {})
+              })).json;
+            } catch (e: any) {
+              console.warn(
+                `⚠️ 楼中楼抓取中断 (${sourceType}:${sourceId} 评论 ${c.id}): ${sanitizeErrorForLog(e)}`
+              );
+              cIncomplete = true;
+              break;
+            }
+            const chData: any[] = Array.isArray(chJson.data) ? chJson.data : [];
+            if (chData.length === 0) {
+              // 合法空页：只有明确 is_end 才算翻完
+              chIsEnd = chJson.paging?.is_end === true;
+              break;
+            }
+            chPages++;
+            // 内联与翻页结果按 id 合并去重（同一楼中楼可能两边都返回）
+            for (const child of chData) pushChild(child);
+            // 收够 child_comment_count 即视为完整，不必再多打一页
+            chIsEnd = chJson.paging?.is_end === true || children.length >= childCount;
+            if (!chIsEnd) {
+              // 子评论分页游标：文章 comment_v5 的 offset 可能是游标字符串，回答接口也可能下发
+              // paging.next；两者都优先跟随 next（相对路径按知乎补全），否则按 limit=20 步进
+              const pagingNext = typeof chJson.paging?.next === "string" ? chJson.paging.next : "";
+              let resolvedNext = "";
+              if (pagingNext) {
+                try {
+                  resolvedNext = new URL(pagingNext, "https://www.zhihu.com").toString();
+                } catch {
+                  resolvedNext = "";
+                }
+              }
+              if (resolvedNext && resolvedNext !== chNextUrl) {
+                chNextUrl = resolvedNext;
+              } else {
+                chOffset += 20;
+                chNextUrl = buildChildUrl(chOffset);
+              }
+              await jitterSleep(900, 1700);
+            }
+          }
+          if (!chIsEnd && chPages >= MAX_COMMENT_PAGES) {
+            cIncomplete = true;
+            console.warn(`⚠️ 评论 ${c.id} 楼中楼达到 ${MAX_COMMENT_PAGES} 页上限，本轮标记 partial`);
+          }
+          // 翻到 is_end 或已补齐 child_comment_count 才算子评论完整；中途异常/风控一律不完整
+          childrenComplete = chIsEnd || children.length >= childCount;
+        }
+        rootsBuffer.push(toRootCommentGroup(c, children, childrenComplete));
         if (rootsBuffer.length >= 20) await flushRoots(false);
       }
 
@@ -1103,7 +1232,7 @@ export async function syncHotCommentsForContent(
         }
       }
       if (!cIsEnd && pagesFetched < maxPages) {
-        await new Promise(r => setTimeout(r, 350));
+        await jitterSleep(1100, 2000);
       }
     }
 
@@ -1278,6 +1407,9 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
                   shouldSyncComments(contentInput.commentCount, dbRes.prevCommentCount);
                 if (needHotComments && !stats.circuitBroken) {
                   await syncHotCommentsForContent(context, item.type as "answer" | "article" | "pin", String(item.id), cfg.commentsCollections);
+                  // 每抓完一篇带新评论的条目额外缓冲：收藏夹是「条目 → 评论 → 楼中楼」
+                  // 三连请求最密集的链路，最容易连续高频触发 40352
+                  await jitterSleep(600, 1200);
                 }
                 if (!dbRes.created && !dbRes.changed && !needHotComments) {
                   existingCount++;
@@ -1319,7 +1451,7 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
          }
          if (!cIsEnd) cIsEnd = cJson.paging?.is_end;
          cOffset += 20;
-         await new Promise(r => setTimeout(r, 500));
+         await jitterSleep(800, 1500);
       }
       
       if (items.length > 0 && !stats.circuitBroken) {
@@ -1577,7 +1709,7 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
 
     // 与其他三段对齐的节流：老账号动态可达数千页，背靠背请求极易触发 429
     // 并升级为账号级风控，连坐 answers/collections 两段
-    await new Promise(r => setTimeout(r, 500));
+    await jitterSleep(800, 1500);
   }
 
   if (stats.circuitBroken) {
@@ -1604,12 +1736,14 @@ type FollowingAiCandidate = {
   contentInput: Record<string, unknown>;
 };
 
-// 额度保护：每位答主每轮最多 10 条，整个 run 最多 3 次「成功」复核调用（失败不消耗配额）。
+// 额度保护：每位答主每轮最多 10 条，整个 run 默认最多 3 次「成功」复核调用（失败不消耗配额）。
+// 本地全量模式（UNLIMITED_LOCAL_WRITES=1）放宽到 500 次：本地反代 DeepSeek 不吃 CF 额度，
+// 必须保证 102 位关注答主的候选回答/文章都能轮到 AI 复核，而不是前 3 位之后全部饿死。
 const MAX_AI_CANDIDATES_PER_USER = 10;
 // worker 侧单批 10 条总字符上限 12000：excerpt 先截到 300 字，10*300 留足余量
 const AI_EXCERPT_MAX_CHARS = 300;
 let aiEvalCalls = 0;
-const MAX_AI_EVAL_CALLS = 3;
+const MAX_AI_EVAL_CALLS = UNLIMITED_LOCAL_WRITES ? 500 : 3;
 
 async function evaluateFollowingCandidatesWithAI(
   userName: string,
@@ -1819,17 +1953,28 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
     "俄乌", "中东", "以色列", "巴勒斯坦", "台海", "关税", "贸易战", "芯片封锁"
   ];
 
+  // following 列表接口常不下发 voteup_count/favorite_count（只在 reaction.statistics 里），
+  // 只读顶层字段会让自动抢救判定把高赞神贴当成 0 赞，漏掉该抢救的内容。
+  // 文章列表实测（12-live-articles）：顶层 favorite_count 永不返回，收藏数只能读
+  // 默认下发的 reaction.statistics.favorites；is_collapsed/label_info 未验证（不 include），
+  // 缺失时按下文的 Boolean(undefined)=false 处理，不会误判成已折叠/已黄标。
+  //
+  // 关键：reaction.statistics.like_count 是「❤️ 喜欢数」（约为▲赞同数的 1%~5%），
+  // 不能直接当赞同数用。未拉回答详情前，用保守上界估算赞同量级：
+  // 1 个喜欢 ≈ 10~20 赞、1 个收藏 ≈ 2~4 赞，取二者较大值，确保筛选候选时
+  // 绝不会漏掉真高赞回答（宁可多存，不可漏存）。
+  function effectiveVotes(item: any): number {
+    const likeCount = Number(item?.reaction?.statistics?.like_count) || 0;
+    const favorites = Number(item?.favorite_count ?? item?.reaction?.statistics?.favorites) || 0;
+    return Number(item?.voteup_count ?? Math.max(likeCount * 10, favorites * 2)) || 0;
+  }
+
   function evaluateForAutoBackup(item: any, rawHtml: string): { shouldBackup: boolean; reason: string; riskScore: number; valueScore: number } {
     let risk = 0;
     let value = 0;
     const reasons: string[] = [];
 
-    // following 列表接口常不下发 voteup_count/favorite_count（只在 reaction.statistics 里），
-    // 只读顶层字段会让自动抢救判定把高赞神贴当成 0 赞，漏掉该抢救的内容。
-    // 文章列表实测（12-live-articles）：顶层 favorite_count 永不返回，收藏数只能读
-    // 默认下发的 reaction.statistics.favorites；is_collapsed/label_info 未验证（不 include），
-    // 缺失时按下文的 Boolean(undefined)=false 处理，不会误判成已折叠/已黄标。
-    const voteup = Number(item?.voteup_count ?? item?.reaction?.statistics?.like_count) || 0;
+    const voteup = effectiveVotes(item);
     const comments = Number(item?.comment_count) || 0;
     const favs = Number(item?.favorite_count ?? item?.reaction?.statistics?.favorites) || 0;
     const isCollapsed = Boolean(item?.is_collapsed);
@@ -1885,6 +2030,19 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
     };
   }
 
+  /**
+   * 仅对「最终决定入库」的关注答主回答补真实统计。
+   * 被规则跳过的成千上万条水贴不额外打详情接口（否则每条 250~550ms 节流会拖垮整轮同步），
+   * 只有 forceSave 前 60 篇 / 规则通过 / AI 复核通过的回答才值得多一次详情请求。
+   */
+  async function fillTrueAnswerStats(contentInput: any, answerId: string): Promise<void> {
+    const trueStats = await fetchAnswerTrueStats(context, answerId);
+    if (!trueStats) return;
+    contentInput.voteupCount = trueStats.voteupCount;
+    contentInput.visitCount = trueStats.visitCount;
+    if (trueStats.commentCount !== undefined) contentInput.commentCount = trueStats.commentCount;
+  }
+
   const reportUserProgress = (urlToken: string, resumeOffset: number, historyDone: boolean, lastCheckedAnswerId?: string) =>
     // countStats:false：进度上报是旁路请求，不参与 saved/estimatedWrites/熔断统计
     post("/ingest/followed-user-progress", { urlToken, resumeOffset, historyDone, lastCheckedAnswerId }, { countStats: false }).catch(() => {});
@@ -1918,6 +2076,13 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
     //   - 默认模式：按 voteups 扫描最热 60 篇。首次摸底（!historyDone）时这 60 篇无条件保存，
     //     规则/AI 过滤只作用于 60 篇之外的内容；扫完即标 historyDone = true；
     //   - 全量模式：先看第 1 页最新增量，然后直接从上次保存的断点 prog.resumeOffset 继续往后抓全量，每页更新断点，抓到底标 historyDone = true！
+    // 本地全量重扒断点续跑优化：已经在前几轮完成完整历史摸底（isHistoryDone=true）的答主，
+    // 直接 0 请求秒跳过，把知乎请求预算 100% 留给尚未摸底的后续答主，避免重扫前人再撞 40352
+    if (UNLIMITED_LOCAL_WRITES && isHistoryDone) {
+      console.log(`⏭️ 关注答主 [${u.name}] 已完成全量摸底，断点秒跳过`);
+      continue;
+    }
+
     const onlyIncrementalNow = isFast && isHistoryDone;
     // 首次历史摸底：voteups 前 60 篇是用户明确要保存的存量，必须绕过 evaluateForAutoBackup；
     // 增量模式（historyDone=true）不置位，避免每轮把 voteups 前 20 当新内容重复 POST
@@ -2031,8 +2196,9 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               contentMd: "",
               excerpt: item.excerpt || "",
               // following 列表不下发顶层 voteup_count/favorite_count（include 也拿不到），
-              // reaction.statistics.like_count/favorites 是默认字段，必须保留回退。
-              // 浏览量列表端点不返回，reaction.statistics.visit_count 也不存在，缺失即为 0。
+              // reaction.statistics.like_count/favorites 是默认字段，这里仅作候选评估时的占位回退；
+              // 真正入库前会由 fillTrueAnswerStats 用 /api/v4/answers/{id} 覆盖成
+              // 真实 voteup_count 与真实 visit_count（like_count 是「喜欢数」不是赞同数）。
               voteupCount: item.voteup_count ?? item.reaction?.statistics?.like_count ?? 0,
               commentCount: item.comment_count || 0,
               favoriteCount: item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0,
@@ -2051,7 +2217,8 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               } else {
                 // 规则未通过：只有落在候选池（高赞/长文/中风险）才进入本轮的 AI 复核队列
                 const plainTextLen = cleanedHtml.replace(/<[^>]+>/g, "").trim().length;
-                const voteup = Number(item.voteup_count ?? item.reaction?.statistics?.like_count) || 0;
+                // 用估算赞同量级（like_count 只是喜欢数，直接比较会把高赞回答挡在 AI 复核池外）
+                const voteup = effectiveVotes(item);
                 const isAiCandidate = voteup >= 100 || plainTextLen >= 600 || evalRes.riskScore >= 18;
                 if (isAiCandidate) {
                   if (answerAiCandidates.length < MAX_AI_CANDIDATES_PER_USER) {
@@ -2079,6 +2246,8 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             }
 
             try {
+              // 入库前补真实赞同数/真实浏览量：列表里的 like_count 只是「❤️ 喜欢数」
+              await fillTrueAnswerStats(contentInput, String(item.id));
               const dbRes = await sendContent(contentInput);
               if (
                 cfg.commentsFollowing !== "none" &&
@@ -2117,7 +2286,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
           if (plan.trackResume && !aIsEnd) {
             await reportUserProgress(u.urlToken, aOffset, false);
           }
-          await new Promise(r => setTimeout(r, 500));
+          await jitterSleep(800, 1500);
         }
       }
       // 扫描结束后对本轮候选做一次批量 AI 复核（最多 10 条/答主、全局最多 3 次成功调用）
@@ -2129,6 +2298,8 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
         for (const cand of aiKept) {
           if (stats.circuitBroken) break;
           try {
+            // AI 复核通过、真正要入库的回答：补真实赞同数与真实浏览量后再提交
+            if (cand.sourceType === "answer") await fillTrueAnswerStats(cand.contentInput, cand.sourceId);
             const dbRes = await sendContent(cand.contentInput);
             if (
               cfg.commentsFollowing !== "none" &&
@@ -2291,7 +2462,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
         if (!artIsEnd) artIsEnd = Boolean(artJson.paging?.is_end);
         // 按实际返回条数推进，seenArticleIds 兜底去重
         artOffset += (artJson.data?.length || batchLimit);
-        await new Promise(r => setTimeout(r, 500));
+        await jitterSleep(800, 1500);
       }
 
       // 文章候选同样批量 AI 复核（共用全局 3 次成功调用上限，失败按规则兜底）
