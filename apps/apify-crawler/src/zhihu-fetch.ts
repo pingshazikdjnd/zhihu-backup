@@ -77,6 +77,12 @@ export interface ZhihuJsonOptions {
      * 避免单篇 404 污染整轮风控计数（误判为 partial_risk_controlled）。
      */
     allow404?: boolean;
+    /**
+     * true 时「data 为空 + paging 存在 + is_end !== true」视为合法空页直接返回，
+     * 不暂停重试、不计入 stats.riskEmpty。仅限调用方已确认该接口会合法返回此形态
+     * （如 voteups 排序答案列表的静默过滤页/尾页）；默认 false，不得全局放宽风控空页判定。
+     */
+    allowEmptyPage?: boolean;
 }
 
 export interface ZhihuFetchDeps {
@@ -102,6 +108,7 @@ function isRetryableStatus(status: number): boolean {
 /**
  * 200 + data 为空 + 明确存在 paging 且 is_end 不为 true：知乎风控空页的典型形态。
  * 没有 paging 字段的 `{data: []}` 视为合法空结果（例如空收藏夹/新账号），不重试。
+ * 调用方确认某接口会合法返回该形态时，可用 allowEmptyPage 显式放行（如 voteups 排序列表）。
  */
 function isEmptyRiskPage(json: unknown): boolean {
     if (!json || typeof json !== "object") return false;
@@ -299,7 +306,9 @@ export function createZhihuJson(stats: ZhihuRiskStats, deps: ZhihuFetchDeps = {}
                     );
                 }
 
-                if (isEmptyRiskPage(json)) {
+                // allowEmptyPage：调用方已确认该接口会合法返回此形态（如 voteups 静默过滤页），
+                // 直接按正常空页返回，避免每轮白暂停 3×60s 并把阶段永久卡在 partial_risk_controlled
+                if (!opts.allowEmptyPage && isEmptyRiskPage(json)) {
                     const reason = "data 为空且 paging.is_end !== true（疑似风控空页）";
                     if (!isLastAttempt) {
                         const paused = await pauseForRisk(label, attempt + 1, readRetryAfterMs(res), reason);

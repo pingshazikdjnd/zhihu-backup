@@ -2272,7 +2272,13 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             aJson = (await zhihuJson(
               context,
               `https://www.zhihu.com/api/v4/members/${u.urlToken}/answers?include=${includeStr}&limit=${batchLimit}&offset=${aOffset}&sort_by=${plan.sortBy}`,
-              { label: `[${u.name}] 回答列表(${plan.sortBy})` }
+              {
+                label: `[${u.name}] 回答列表(${plan.sortBy})`,
+                // voteups 是知乎的静默过滤列表：被折叠/删除/降权的回答不进该索引，实测同一批答主
+                // 连续 13 轮冷却后仍返回 data:[] + paging 存在且 is_end !== true，属合法空页而非滑窗风控。
+                // 不显式放行会每轮白暂停 3×60s 并计入 riskEmpty，阶段永远无法完成
+                ...(plan.sortBy === "voteups" ? { allowEmptyPage: true } : {})
+              }
             )).json;
           } catch (e: any) {
             // 401/403/429/5xx/风控空页已在 zhihuJson 内重试并计入终态统计
@@ -2281,7 +2287,8 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             break;
           }
           if (!aJson.data || aJson.data.length === 0) {
-            // 风控空页已在 zhihuJson 内重试并计数；能到这里的是 is_end 的合法空页。
+            // 风控空页已在 zhihuJson 内重试并计数；voteups 排序的合法空页已由调用处
+            // allowEmptyPage 放行，其余接口能到这里的是 is_end 的合法空页。
             // 但没有 paging 字段就无法证明「真的扫到底了」，不能据此上报历史摸底完成
             if (!aJson.paging) completedAllPlans = false;
             break;
