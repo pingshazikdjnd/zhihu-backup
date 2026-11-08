@@ -827,14 +827,22 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
         }
       };
       
+      // 知乎 v4 answers/root_comments 对部分回答会在第 1~2 页就返回 is_end=true
+      //（paging.totals 也明显偏小），根评论被假终止在 20~40 条；comment_v5 的
+      // answers/root_comment 才返回完整游标分页，与文章链路对齐。
+      // full 必须用 order_by=ts：score 排序实测在约 200 根处同样假 is_end。
+      // comment_v5 answers 每页固定 10 条，offset 是游标字符串，需跟随 paging.next。
+      const buildRootCommentsUrl = (offset: number) =>
+        `https://www.zhihu.com/api/v4/comment_v5/answers/${task.answerId}/root_comment?order_by=${
+          cfg.commentsMyAnswers === "full" ? "ts" : "score"
+        }&limit=20&offset=${offset === 0 ? "" : offset}`;
+      let cNextUrl = buildRootCommentsUrl(0);
       while (!cIsEnd && rootPages < MAX_COMMENT_PAGES && !stats.riskExhausted && !stats.circuitBroken) {
         let cJson: any;
         try {
-          cJson = (await zhihuJson(
-            context,
-            `https://www.zhihu.com/api/v4/answers/${task.answerId}/root_comments?limit=20&offset=${cOffset}`,
-            { label: `回答 ${task.answerId} 根评论` }
-          )).json;
+          cJson = (await zhihuJson(context, cNextUrl, {
+            label: `回答 ${task.answerId} 根评论`
+          })).json;
         } catch (e: any) {
           // 401/403/429/5xx/风控空页都已在 zhihuJson 内重试并计入终态统计
           console.warn(`⚠️ 回答 ${task.answerId} 根评论中断: ${sanitizeErrorForLog(e)}`);
@@ -928,6 +936,24 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
         cIsEnd = Boolean(cJson.paging?.is_end);
         if (cIsEnd) rootEnded = true;
         cOffset += 20;
+        if (!cIsEnd) {
+          // comment_v5 的 offset 是游标字符串（如 1380238650_151692731_0），不能按数字步进；
+          // 优先跟随 paging.next，相对路径按知乎域名补全，next 缺失时才退回数字 offset 兜底
+          const pagingNext = typeof cJson.paging?.next === "string" ? cJson.paging.next : "";
+          let resolvedNext = "";
+          if (pagingNext) {
+            try {
+              resolvedNext = new URL(pagingNext, "https://www.zhihu.com").toString();
+            } catch {
+              resolvedNext = "";
+            }
+          }
+          if (resolvedNext && resolvedNext !== cNextUrl) {
+            cNextUrl = resolvedNext;
+          } else {
+            cNextUrl = buildRootCommentsUrl(cOffset);
+          }
+        }
         await jitterSleep(1100, 2000);
       }
       // 没正常翻到 is_end（风控/熔断/页数上限/hot 截断）时本轮必须标记 partial，
@@ -1136,7 +1162,9 @@ async function runArticleScraperBody(browser: Awaited<ReturnType<typeof setupBro
  * 按设置策略（none: 不抓 / hot: 前1页20条高赞热评+内联子评论 / full: 全量分页抓取）
  * 为收藏夹/赞同/关注答主的回答或文章抓取评论。
  *
- * - 回答：/api/v4/answers/{id}/root_comments
+ * - 回答：/api/v4/comment_v5/answers/{id}/root_comment（v4 的 answers/root_comments 对部分回答
+ *   第 1~2 页就假 is_end，根评论被截断在 20~40 条；comment_v5 才能完整游标分页。
+ *   full 用 order_by=ts：score 排序实测在约 200 根处同样假 is_end）
  * - 专栏文章：/api/v4/comment_v5/articles/{id}/root_comment（v4 的 root_comments 端点已废弃恒 404；
  *   comment_v5 的 offset 可能是游标字符串，因此优先跟随 paging.next）
  * - full 模式正常翻到 is_end 时，最后一批带 allRootIds + partial=false 做删除对账；
@@ -1158,7 +1186,9 @@ export async function syncHotCommentsForContent(
   const buildUrl = (offset: number) =>
     isArticle
       ? `https://www.zhihu.com/api/v4/comment_v5/articles/${sourceId}/root_comment?order_by=score&limit=20&offset=${offset === 0 ? "" : offset}`
-      : `https://www.zhihu.com/api/v4/answers/${sourceId}/root_comments?limit=20&offset=${offset}`;
+      : `https://www.zhihu.com/api/v4/comment_v5/answers/${sourceId}/root_comment?order_by=${
+          mode === "full" ? "ts" : "score"
+        }&limit=20&offset=${offset === 0 ? "" : offset}`;
 
   // 中途风控/异常/撞页数上限 → 不允许做删除对账；
   // cFailed 单独记录「请求失败/风控中断」，供下一轮强制重抓，不把页数上限误判为失败
@@ -1324,10 +1354,10 @@ export async function syncHotCommentsForContent(
       cIsEnd = Boolean(cJson.paging?.is_end);
       pagesFetched++;
       if (!cIsEnd) {
-        // comment_v5 的 offset 可能是游标字符串：文章链路优先跟随 paging.next。
+        // comment_v5 的 offset 是游标字符串：回答与文章链路都优先跟随 paging.next。
         // paging.next 也可能是相对路径（/api/v4/comment_v5/...&offset=xxx），
         // 必须按 www.zhihu.com 补全，否则会退回数字 cOffset 拼 URL 导致游标断页。
-        const pagingNext = isArticle && typeof cJson.paging?.next === "string" ? cJson.paging.next : "";
+        const pagingNext = typeof cJson.paging?.next === "string" ? cJson.paging.next : "";
         let resolvedNext = "";
         if (pagingNext) {
           try {

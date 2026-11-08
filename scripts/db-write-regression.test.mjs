@@ -925,6 +925,11 @@ globalThis.__crawlerContext = {
       }
       if (target.includes("/answers?")) return okJson({ data: [answerFixture], paging: { is_end: true } });
       if (target.includes("/root_comments")) return okJson({ data: commentFixtures, paging: { is_end: true } });
+      // 回答评论已改走 comment_v5：/api/v4/comment_v5/answers/{id}/root_comment?order_by=ts|score
+      // 与 /root_comments 一样返回根评论夹具 + is_end，保证主链路与 syncHotCommentsForContent 输出一致
+      if (target.includes("/root_comment?") || target.includes("/root_comment&")) {
+        return okJson({ data: commentFixtures, paging: { is_end: true } });
+      }
       if (target.includes("/child_comments")) return okJson({ data: [], paging: { is_end: true } });
       throw new Error(`unexpected crawler URL: ${target}`);
     }
