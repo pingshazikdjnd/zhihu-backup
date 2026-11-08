@@ -74,6 +74,10 @@ const fmtTime = (t?: string) => {
   return Number.isNaN(d.getTime()) ? t : d.toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
 };
 
+// 楼中楼分批展示：展开先显示 5 条，每次「加载更多」再放 10 条
+const INITIAL_CHILD_COUNT = 5;
+const CHILD_LOAD_STEP = 10;
+
 // 旧版扁平树状渲染组件（向后兼容）
 function LegacyCommentTreeView({ comments }: { comments: LegacyCommentItem[] }) {
   const [visibleCount, setVisibleCount] = useState(50);
@@ -173,6 +177,8 @@ function RootCommentItemView({ comment, contentPk }: { comment: RootComment; con
   const [children, setChildren] = useState<ChildComment[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState("");
+  // 当前已展示的子评论条数（展开后分批递增）
+  const [visibleChildCount, setVisibleChildCount] = useState(INITIAL_CHILD_COUNT);
 
   const childCount = comment.child_count || 0;
 
@@ -192,10 +198,14 @@ function RootCommentItemView({ comment, contentPk }: { comment: RootComment; con
   const toggleExpand = () => {
     if (expanded) {
       setExpanded(false);
+      // 收起时重置分批进度，再次展开回到前 5 条
+      setVisibleChildCount(INITIAL_CHILD_COUNT);
       return;
     }
 
     setExpanded(true);
+    // 每次展开都从首批条数开始
+    setVisibleChildCount(INITIAL_CHILD_COUNT);
     // 已经拉取过子评论则直接展开
     if (children.length > 0) return;
 
@@ -399,7 +409,7 @@ function RootCommentItemView({ comment, contentPk }: { comment: RootComment; con
               <div style={{ fontSize: 13, color: "var(--zhihu-meta)" }}>暂无子回复</div>
             )}
 
-            {children.map(child => (
+            {children.slice(0, visibleChildCount).map(child => (
               <div
                 id={`comment-${child.id}`}
                 key={child.id}
@@ -462,6 +472,26 @@ function RootCommentItemView({ comment, contentPk }: { comment: RootComment; con
                 </div>
               </div>
             ))}
+
+            {/* 分批加载：默认只显示前 5 条，剩余可继续展开 */}
+            {visibleChildCount < children.length && (
+              <div style={{ textAlign: "center", paddingTop: 8 }}>
+                <button
+                  type="button"
+                  onClick={() => setVisibleChildCount(v => v + CHILD_LOAD_STEP)}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    padding: "4px 8px",
+                    color: "var(--zhihu-blue)",
+                    cursor: "pointer",
+                    fontSize: 13
+                  }}
+                >
+                  加载更多回复（还剩 {children.length - visibleChildCount} 条）
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

@@ -259,8 +259,16 @@ button { font-family: inherit; }
   cursor: pointer;
   background: var(--zhihu-border-light);
   color: var(--zhihu-text-2);
+  transition: background-color 0.15s, color 0.15s, box-shadow 0.15s;
 }
-.sort-chip.active { background: var(--zhihu-blue-bg); color: var(--zhihu-blue); font-weight: 500; }
+.sort-chip:hover { color: var(--zhihu-blue); }
+.sort-chip.active {
+  background: var(--zhihu-blue-bg);
+  color: var(--zhihu-blue);
+  font-weight: 600;
+  /* 内描边 + 加粗，让当前排序一眼可辨 */
+  box-shadow: inset 0 0 0 1px var(--zhihu-blue);
+}
 
 /* 搜索框 */
 .search-input {

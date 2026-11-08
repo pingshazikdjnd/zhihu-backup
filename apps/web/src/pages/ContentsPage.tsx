@@ -237,8 +237,8 @@ export default function ContentsPage() {
           {searchResults !== null && (
             <span style={{ fontSize: 13, color: "var(--zhihu-meta)" }}>命中 {searchTotal} 条</span>
           )}
-          <button className={`sort-chip ${sortBy === "time" ? "active" : ""}`} onClick={() => handleSortChange("time")}>按时间</button>
-          <button className={`sort-chip ${sortBy === "vote" ? "active" : ""}`} onClick={() => handleSortChange("vote")}>按赞同数</button>
+          <button className={`sort-chip ${sortBy === "time" ? "active" : ""}`} onClick={() => handleSortChange("time")} aria-pressed={sortBy === "time"}>最新</button>
+          <button className={`sort-chip ${sortBy === "vote" ? "active" : ""}`} onClick={() => handleSortChange("vote")} aria-pressed={sortBy === "vote"}>赞数最多</button>
           <input
             type="search"
             className="search-input"
