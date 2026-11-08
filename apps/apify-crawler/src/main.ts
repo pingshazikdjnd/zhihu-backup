@@ -446,6 +446,11 @@ async function shouldSyncCommentsDeep(
   if (state.incompleteRoots > 0) return true;
   // 只读到 50 根时无法判断根评论是否抓全，不做「明显偏少」推断
   if (state.roots >= 50) return false;
+  // 根评论数本身明显不足：知乎 v4 answers/root_comments 对高评论回答会假 is_end，
+  // 把根评论截断在第一页（20 根），但这些根的子评论往往已抓全。仅看 storedComments
+  // （根+子）会把这类截断误判为「够完整」而永久跳过。评论 = 根 + 子，正常根数极少
+  // 低于评论总数的 1/3；低于即视为根评论被截断，强制重抓（端点已改走 comment_v5 能翻全）。
+  if (state.roots * 3 < expected) return true;
   return state.storedComments * 2 < expected;
 }
 
