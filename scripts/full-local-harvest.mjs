@@ -14,6 +14,14 @@
  *   node scripts/full-local-harvest.mjs --only=stage3_collections_full
  *   node scripts/full-local-harvest.mjs --from=stage4_following_full
  *   node scripts/full-local-harvest.mjs --cooldown-seconds=600  # 覆盖风控冷却秒数（默认 600，最多 12 轮）
+ *   node scripts/full-local-harvest.mjs --repair-comments      # 独立运维入口：补采存量被 v4 截断的评论
+ *
+ * 存量评论补采（--repair-comments）：
+ *   修复前的 v4 根评论端点对高评论回答假 is_end，存量内容只入库第一页 20 条根评论。
+ *   本模式从本地 D1 查出「根评论数 < 评论总数/3 且根评论 < 50」的 answer/article，
+ *   每 50 条一批交给爬虫 runType=repair-comments 全量重抓（翻到 is_end + 删除对账）。
+ *   它不写进度文件、不参与 stage1-5 状态机，默认不运行，必须显式传参触发；
+ *   中途被风控打断或进程退出后重跑同一条命令即可，已补齐的内容会因根评论数增长自动从清单消失。
  *
  * 风控冷却续跑：
  *   任意阶段返回 partial_risk_controlled（知乎临时风控 40352）时不会直接退出，
@@ -107,6 +115,11 @@ const opts = {
   only: "",
   from: "",
   build: true,
+  // 存量评论补采（独立运维入口）：默认关闭，必须显式 --repair-comments 才跑
+  repairComments: false,
+  repairBatchSize: 50,
+  // 单次最多补采多少条（0=不限制）：先小批量试跑、确认风控表现后再全量
+  repairMax: 0,
   // 知乎 40352 滑窗风控冷却：默认休息 10 分钟再自动续跑
   cooldownSeconds: 600,
   waitWorkerSeconds: 120,
@@ -119,7 +132,14 @@ for (const arg of process.argv.slice(2)) {
   else if (arg.startsWith("--only=")) opts.only = arg.slice("--only=".length).trim();
   else if (arg.startsWith("--from=")) opts.from = arg.slice("--from=".length).trim();
   else if (arg === "--skip-build") opts.build = false;
-  else if (arg.startsWith("--cooldown-seconds=")) {
+  else if (arg === "--repair-comments") opts.repairComments = true;
+  else if (arg.startsWith("--repair-batch-size=")) {
+    const n = Number(arg.slice("--repair-batch-size=".length));
+    if (Number.isFinite(n) && n > 0) opts.repairBatchSize = Math.trunc(n);
+  } else if (arg.startsWith("--repair-max=")) {
+    const n = Number(arg.slice("--repair-max=".length));
+    if (Number.isFinite(n) && n >= 0) opts.repairMax = Math.trunc(n);
+  } else if (arg.startsWith("--cooldown-seconds=")) {
     const n = Number(arg.slice("--cooldown-seconds=".length));
     if (Number.isFinite(n) && n >= 0) opts.cooldownSeconds = Math.trunc(n);
   } else if (arg.startsWith("--rest-seconds=")) {
@@ -427,7 +447,7 @@ function appendChildLog(text) {
   } catch { /* 子进程日志落盘失败不影响抓取 */ }
 }
 
-function runChild(command, args, { cwd, env, timeoutMs = 0, silent = false } = {}) {
+function runChild(command, args, { cwd, env, timeoutMs = 0, silent = false, maxCapture = 256 * 1024 } = {}) {
   return new Promise(resolve => {
     const child = spawn(command, args, {
       cwd,
@@ -437,10 +457,11 @@ function runChild(command, args, { cwd, env, timeoutMs = 0, silent = false } = {
     });
     let stdout = "";
     let stderr = "";
-    // 长时间抓取会输出海量日志：只在内存保留前 256KB（wrangler 校验/错误定位足够），
+    // 长时间抓取会输出海量日志：默认只在内存保留前 256KB（wrangler 校验/错误定位足够），
     // 其余仍实时透传到控制台，避免几小时的全量抓取把脚本内存撑爆。
+    // 本地 D1 导出类查询（--json）结果可能有几百 KB，调用方可通过 maxCapture 显式放宽。
     // 另外单独滚动保留最后 128KB，用于识别 main.ts 结束时的 partial_risk_controlled 终态标记
-    const MAX_CAPTURE = 256 * 1024;
+    const MAX_CAPTURE = maxCapture;
     const MAX_TAIL = 128 * 1024;
     let tail = "";
     const pushTail = text => {
@@ -862,6 +883,201 @@ async function runCrawlerStage(stage, ctx) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 存量评论补采（--repair-comments，独立运维入口）
+// ---------------------------------------------------------------------------
+/**
+ * 只读查询本地 D1（固定 --local，绝不允许 --remote）。
+ * --json 结果可能几百 KB，单独放宽内存抓取上限，并静默执行（不把大段 JSON 回显到控制台）。
+ */
+async function queryLocalD1Json(sql, label) {
+  const bin = wranglerBin();
+  if (!bin) throw new Error("找不到 wrangler：请先在仓库根目录执行 pnpm install");
+  const result = await runChild(
+    process.execPath,
+    [bin, "d1", "execute", DB_NAME, "--local", "--yes", "--json", "--command", sql],
+    { cwd: WORKER_DIR, silent: true, maxCapture: 8 * 1024 * 1024 }
+  );
+  if (result.code !== 0) {
+    const detail = String(result.stderr || "").replace(/\s+/g, " ").slice(0, 300);
+    throw new Error(`本地 D1 查询失败（${label}，退出码 ${result.code}）${detail ? `: ${detail}` : ""}`);
+  }
+  const text = String(result.stdout || "");
+  const start = text.search(/\[\s*[{[]/);
+  const end = text.lastIndexOf("]");
+  if (start < 0 || end <= start) throw new Error(`本地 D1 查询结果不是 JSON（${label}）`);
+  let parsed;
+  try {
+    parsed = JSON.parse(text.slice(start, end + 1));
+  } catch (err) {
+    throw new Error(`本地 D1 查询结果解析失败（${label}）: ${err?.message || err}`);
+  }
+  // wrangler --json 输出形如 [{ results: [...], success, meta }]，兼容旧版本的扁平数组
+  if (!Array.isArray(parsed)) throw new Error(`本地 D1 查询结果结构异常（${label}）`);
+  const first = parsed[0];
+  if (Array.isArray(first)) return first;
+  if (first && Array.isArray(first.results)) return first.results;
+  return [];
+}
+
+/**
+ * 补采候选：根评论数明显少于评论总数的 answer/article。
+ * 判定与爬虫 shouldSyncCommentsDeep 保持一致（roots * 3 < comment_count 且 roots < 50），
+ * 上限 50 同时保证「根评论本来就多、只是回复占比高」的正常内容不会被反复补采。
+ */
+const REPAIR_CANDIDATE_SQL = [
+  "SELECT c.pk AS pk",
+  "FROM contents c",
+  "LEFT JOIN (",
+  "  SELECT content_pk AS cp, COUNT(*) AS roots",
+  "  FROM comments",
+  "  WHERE parent_comment_id IS NULL AND is_deleted = 0",
+  "  GROUP BY content_pk",
+  ") r ON r.cp = c.pk",
+  "WHERE c.is_deleted = 0",
+  "  AND c.source_type IN ('answer', 'article')",
+  "  AND c.comment_count > 0",
+  "  AND COALESCE(r.roots, 0) * 3 < c.comment_count",
+  "  AND COALESCE(r.roots, 0) < 50",
+  "ORDER BY c.pk"
+].join("\n");
+
+async function queryRepairCommentTargets() {
+  log("🔎 从本地 D1 查询待补采内容（根评论数 < 评论总数/3 且根评论 < 50）...");
+  const rows = await queryLocalD1Json(REPAIR_CANDIDATE_SQL, "补采候选清单");
+  const targets = [];
+  for (const row of rows) {
+    const pk = String(row?.pk || "").trim();
+    // 只下发 answer/article 且 id 干净的目标，脏数据不进爬虫子进程
+    if (/^(answer|article):\d+$/.test(pk)) targets.push(pk);
+  }
+  return targets;
+}
+
+/** 解析爬虫终态里的「本轮评论补采：成功 X 条 / 跳过 Y 条 / 失败 Z 条」汇总行 */
+function parseRepairSummary(tail) {
+  const m = /本轮评论补采：成功 (\d+) 条 \/ 跳过 (\d+) 条 \/ 失败 (\d+) 条/.exec(String(tail || ""));
+  if (!m) return null;
+  return { ok: Number(m[1]), skipped: Number(m[2]), failed: Number(m[3]) };
+}
+
+/** 用一批 repairTargets 启动一次爬虫子进程（runType=repair-comments） */
+async function runRepairBatch(batch, ctx) {
+  const payload = {
+    runType: "repair-comments",
+    isFast: false,
+    apiUrl: LOCAL_WORKER_URL,
+    apiSecret: ctx.secret,
+    zhihuUsername: ctx.zhihuUsername,
+    cookieString: ctx.cookieString,
+    syncConfig: { ...GOLDEN_POLICY },
+    repairTargets: batch
+  };
+  fs.mkdirSync(KV_DEFAULT_DIR, { recursive: true });
+  fs.writeFileSync(INPUT_JSON_PATH, JSON.stringify(payload, null, 2), "utf8");
+  try {
+    const result = await runChild(process.execPath, ["dist/main.js"], {
+      cwd: CRAWLER_DIR,
+      env: {
+        WORKER_URL: LOCAL_WORKER_URL,
+        API_SECRET: ctx.secret,
+        UNLIMITED_LOCAL_WRITES: "1",
+        APIFY_LOCAL_STORAGE_DIR: STORAGE_DIR,
+        CRAWLEE_STORAGE_DIR: STORAGE_DIR
+      }
+    });
+    return { code: result.code, tail: result.tail };
+  } finally {
+    // 明文凭据（cookie / apiSecret）随 INPUT.json 立即清除
+    try { fs.rmSync(INPUT_JSON_PATH, { force: true }); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * 存量评论补采主流程：分批下发 → 每批结束检查风控/失败 → 命中即停。
+ * 不写 full-harvest-progress.json：补采是独立运维操作，不能污染 stage1-5 的状态机。
+ * 重跑同一命令即可续跑——已补齐的内容根评论数增长后会自动从候选清单消失。
+ */
+async function runRepairCommentsMode(ctx) {
+  const allTargets = await queryRepairCommentTargets();
+  if (allTargets.length === 0) {
+    log("✅ 没有需要补采的内容（所有内容根评论数与评论总数匹配）");
+    return true;
+  }
+  const limit = opts.repairMax > 0 ? Math.min(opts.repairMax, allTargets.length) : allTargets.length;
+  const targets = allTargets.slice(0, limit);
+  const batchSize = Math.max(1, opts.repairBatchSize);
+  const batches = Math.ceil(targets.length / batchSize);
+  log(
+    `🩹 待补采 ${allTargets.length} 条，本轮处理 ${targets.length} 条，分 ${batches} 批` +
+      `（每批 ${batchSize} 条，full 模式重抓根评论+楼中楼）`
+  );
+
+  let processed = 0;
+  let okTotal = 0;
+  let skippedTotal = 0;
+  let failedTotal = 0;
+  let completed = true;
+
+  for (let i = 0; i < targets.length; i += batchSize) {
+    const batch = targets.slice(i, i + batchSize);
+    const batchNo = Math.floor(i / batchSize) + 1;
+    log(`🩹 补采批次 ${batchNo}/${batches}：${batch.length} 条`);
+    const { code, tail } = await runRepairBatch(batch, ctx);
+    const parsed = parseRepairSummary(tail);
+    if (parsed) {
+      okTotal += parsed.ok;
+      skippedTotal += parsed.skipped;
+      failedTotal += parsed.failed;
+    }
+    processed += batch.length;
+
+    // code 2 = 连续失败断路器；partial_risk_controlled 末尾标记 = 被知乎风控中断
+    const riskTerminal = code === 2 || detectRiskTerminal(tail);
+    if (riskTerminal) {
+      completed = false;
+      log(
+        `⛔ 补采批次 ${batchNo} 被风控/熔断中断（退出码 ${code}），已入库部分保留；` +
+          `建议按 ${Math.max(1, Math.round(opts.cooldownSeconds / 60))} 分钟冷却后重跑 --repair-comments，` +
+          `剩余目标会自动继续`
+      );
+      break;
+    }
+    if (code !== 0) {
+      completed = false;
+      const markers = detectRiskMarkers(tail);
+      log(
+        `❌ 补采批次 ${batchNo} 失败（退出码 ${code}${markers.length ? `，命中标记 ${markers.join(" / ")}` : ""}），` +
+          `停止后续批次；修复后重跑 --repair-comments 继续`
+      );
+      break;
+    }
+    log(
+      `✅ 补采批次 ${batchNo} 完成` +
+        (parsed ? `（成功 ${parsed.ok} / 跳过 ${parsed.skipped} / 失败 ${parsed.failed}）` : "")
+    );
+  }
+
+  const remaining = await queryRepairCommentTargets().catch(() => null);
+  log("════════════════════════════════════════════════════════");
+  log(
+    `📊 评论补采结束：下发 ${processed}/${targets.length} 条；` +
+      `爬虫汇总 成功 ${okTotal} / 跳过 ${skippedTotal} / 失败 ${failedTotal} 条`
+  );
+  if (!remaining) {
+    log("ℹ️ 本次未能复核剩余待补采数（D1 查询失败，不影响已入库数据）");
+  } else if (remaining.length === 0) {
+    log("✅ 本地 D1 候选清单已清空：本轮补采内容根评论数均已达到判定阈值");
+  } else {
+    log(
+      `🔁 本地 D1 仍有 ${remaining.length} 条待补采（含本轮失败/未下发的目标），` +
+        `重跑 --repair-comments 继续`
+    );
+  }
+  log("════════════════════════════════════════════════════════");
+  return completed;
+}
+
 /**
  * 执行单个阶段，遇到知乎临时风控（partial_risk_controlled）时冷却续跑：
  *   1. 本轮相比本轮开始前 /api/stats 有正向进展（contents / comments /
@@ -1041,9 +1257,12 @@ function printHelp() {
       "  node scripts/full-local-harvest.mjs --reset-progress",
       "  node scripts/full-local-harvest.mjs --only=stage4_following_full",
       "  node scripts/full-local-harvest.mjs --from=stage3_collections_full",
+      "  node scripts/full-local-harvest.mjs --repair-comments   补采存量被 v4 截断的评论（独立运维入口，不写阶段进度）",
       "",
       "可选参数：",
       "  --skip-build                跳过爬虫编译（直接使用现有 dist/main.js）",
+      "  --repair-batch-size=50      补采每批下发的内容条数（默认 50）",
+      "  --repair-max=0              单次补采最多处理多少条（0=不限制，便于先小批量试跑）",
       `  --cooldown-seconds=600      知乎临时风控（partial_risk_controlled）冷却秒数（默认 600 秒，最多 12 轮）`,
       "  --wait-worker-seconds=120   等待本地 Worker 就绪的秒数（默认 120）",
       "",
@@ -1248,6 +1467,15 @@ async function main() {
     followedProgress: localState?.followedProgress || undefined,
     fullModeUsers: Array.isArray(localState?.fullModeUsers) ? localState.fullModeUsers : []
   };
+
+  // 5.5 存量评论补采：独立运维入口，只有显式 --repair-comments 才触发。
+  // 不写进度文件、不参与 stage1-5 状态机，避免每次全量重扒都重抓几千条存量内容。
+  if (opts.repairComments) {
+    const ok = await runRepairCommentsMode(ctx);
+    process.exitCode = ok ? 0 : 1;
+    return;
+  }
+
   const stages = selectStages();
   let failed = false;
   for (const stage of stages) {

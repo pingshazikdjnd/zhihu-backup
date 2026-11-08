@@ -3,7 +3,7 @@ import { chromium } from "playwright";
 import { createZhihuJson, ZhihuRequestError } from "./zhihu-fetch.js";
 
 interface InputSchema {
-    runType: "all" | "answers" | "articles" | "collections" | "upvotes" | "following" | "following-list";
+    runType: "all" | "answers" | "articles" | "collections" | "upvotes" | "following" | "following-list" | "repair-comments";
     isFast: boolean;
     apiUrl: string;
     apiSecret?: string;
@@ -13,6 +13,11 @@ interface InputSchema {
     upvotesCursor?: string;
     /** 开启了「全量备份」的关注答主 url_token 列表 */
     fullModeUsers?: string[];
+    /**
+     * 存量评论补采目标（runType=repair-comments 专用）：元素形如 "answer:123" / "article:456"。
+     * 只重抓这些内容的评论，不枚举答主、不受 history_done 影响。
+     */
+    repairTargets?: string[];
     /** 每位关注答主的历史扫描进度（断点 offset、是否已完成首次历史摸底、上次最新回答标记点） */
     followedProgress?: Record<string, { resumeOffset: number; historyDone: boolean; syncMode: "default" | "full"; lastCheckedAnswerId?: string }>;
     /** 同步租约持有者：每次 /ingest 请求都会带上 x-sync-owner，Worker 侧自动续租 */
@@ -30,7 +35,7 @@ interface InputSchema {
 await Actor.init();
 const input = await Actor.getInput<InputSchema>();
 if (!input) throw new Error("Missing input");
-const { runType, isFast, apiUrl, apiSecret, zhihuUsername, cookieString, upvotesCursor, fullModeUsers, followedProgress, syncConfig } = input;
+const { runType, isFast, apiUrl, apiSecret, zhihuUsername, cookieString, upvotesCursor, fullModeUsers, followedProgress, syncConfig, repairTargets } = input;
 const fullModeSet = new Set(Array.isArray(fullModeUsers) ? fullModeUsers : []);
 const followedProgMap = followedProgress && typeof followedProgress === "object" ? followedProgress : {};
 // 同步租约：云端 Apify 由 Worker 注入 input.syncOwnerId，本地同步由 local-sync.mjs
@@ -86,6 +91,23 @@ const stats = {
 // 评论分页硬上限（与热评链路 full 模式的 200 页一致），防止 paging.is_end
 // 缺失/被风控时无限翻页
 const MAX_COMMENT_PAGES = 200;
+
+/**
+ * 存量评论补采（runType=repair-comments）的本轮统计。
+ * 补采只走 /ingest/comments-by-root，不写 /ingest/content，stats.saved 恒为 0；
+ * 终态判定必须用这里的 ok 数代替 saved，否则「补采成功」会被误报成「本轮零数据入库」。
+ * 其它 runType 保持 null，原有终态语义完全不变。
+ */
+interface RepairCommentSummary {
+  total: number;
+  ok: number;
+  skipped: number;
+  failed: number;
+  stopped: boolean;
+}
+// 用对象持有而不是裸 let：模块级 let 只会被 TS 控制流分析窄化成初始值 null，
+// 终态读取时看不到函数体内的赋值（否则报 TS2339: Property 'ok' does not exist on type 'never'）
+const repairState: { summary: RepairCommentSummary | null } = { summary: null };
 
 // 异常信息脱敏：cookie / authorization 一旦被拼进日志或 Actor.fail 消息，
 // 就会随 run 记录永久留在 Apify 控制台，等于把账号凭据公开
@@ -1409,6 +1431,82 @@ export async function syncHotCommentsForContent(
   }
 }
 
+/**
+ * 存量评论补采入口（runType=repair-comments）。
+ *
+ * 背景：旧 v4 回答根评论端点对高评论回答会假 is_end，存量内容只入库了第一页 20 条根评论；
+ * 端点改走 comment_v5 游标分页后，需要一条独立通道把这些内容按 full 模式重抓
+ * （翻到 is_end + 删除对账），不枚举答主、不受 history_done 跳过逻辑影响。
+ * 目标由编排脚本按「根评论数明显少于评论总数」从本地 D1 查出后分批传入。
+ */
+export async function runCommentRepairScraper() {
+  const browser = await setupBrowser();
+  try {
+    await runCommentRepairScraperBody(browser);
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+async function runCommentRepairScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
+  const context = await browser.newContext();
+  await context.addCookies(getCookiesArray());
+
+  // 去重：多阶段收藏夹/赞同/关注可能把同一条内容重复排进补采清单，
+  // 重复条目会白白多打一遍全部评论分页
+  const uniqueTargets: string[] = [];
+  const seenPk = new Set<string>();
+  for (const raw of Array.isArray(repairTargets) ? repairTargets : []) {
+    const pk = String(raw || "").trim();
+    if (!pk || seenPk.has(pk)) continue;
+    seenPk.add(pk);
+    uniqueTargets.push(pk);
+  }
+
+  let ok = 0;
+  let skipped = 0;
+  let failed = 0;
+  let stopped = false;
+  console.log(`🩹 开始存量评论补采：目标 ${uniqueTargets.length} 条（full 模式，翻到 is_end 并做删除对账）`);
+
+  for (const pk of uniqueTargets) {
+    // 每条前检查全局风控/熔断：命中立即停止，剩余目标由编排脚本下轮重新下发
+    if (stats.circuitBroken || stats.riskExhausted) {
+      stopped = true;
+      break;
+    }
+    const sep = pk.indexOf(":");
+    const sourceType = sep > 0 ? pk.slice(0, sep) : "";
+    const sourceId = sep > 0 ? pk.slice(sep + 1) : "";
+    if ((sourceType !== "answer" && sourceType !== "article") || !sourceId) {
+      // pin 没有公开根评论接口，其余是无法解析的脏数据：不计失败，只跳过
+      skipped++;
+      continue;
+    }
+    // 评论链路内部会吞掉单条失败（只打 warn + 登记 commentSyncIncomplete），
+    // 用失败计数增量判定本条是否真的成功，失败条数会随终态输出给编排脚本
+    const failureBefore = stats.authRejected + stats.riskEmpty + stats.zhihuRejected + stats.failed;
+    try {
+      await syncHotCommentsForContent(context, sourceType, sourceId, "full");
+    } catch (e) {
+      console.warn(`⚠️ 补采评论异常 (${pk}): ${sanitizeErrorForLog(e)}`);
+    }
+    const failureAfter = stats.authRejected + stats.riskEmpty + stats.zhihuRejected + stats.failed;
+    if (failureAfter > failureBefore) failed++;
+    else ok++;
+    console.log(`🩹 评论补采进度 ${ok + skipped + failed}/${uniqueTargets.length}（${pk}）`);
+    // 与既有评论链路一致的条目间隔：补采是长时间连续请求，固定节奏同样会触发 40352
+    await jitterSleep(800, 1500);
+  }
+
+  if (stats.circuitBroken || stats.riskExhausted) stopped = true;
+  repairState.summary = { total: uniqueTargets.length, ok, skipped, failed, stopped };
+  console.log(
+    `📊 本轮评论补采：成功 ${ok} 条 / 跳过 ${skipped} 条 / 失败 ${failed} 条 / 目标 ${uniqueTargets.length} 条` +
+      (stopped ? "（风控/熔断提前中止，重跑本模式可继续剩余目标）" : "")
+  );
+}
+
 export async function runCollectionScraper() {
   const browser = await setupBrowser();
   try {
@@ -2700,7 +2798,10 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
 // 失败必须让 run 状态可见。之前所有异常都被吞掉后正常 exit，
 // cookie 失效后 run 依然 SUCCEEDED，Worker /auth 页据此误报"一切正常"。
 try {
-  if (runType === "following-list") {
+  if (runType === "repair-comments") {
+    // 存量评论补采：独立通道，只重抓 repairTargets 里的评论，不枚举答主、不受 history_done 影响
+    await runCommentRepairScraper();
+  } else if (runType === "following-list") {
     await runFollowingScraper(true);
   } else if (runType === "following") {
     await runFollowingScraper(false);
@@ -2735,25 +2836,31 @@ try {
   process.exit(1);
 }
 
+// 补采评论模式只走 /ingest/comments-by-root，不写 /ingest/content，stats.saved 恒为 0；
+// 用本轮实际补采成功的内容条数参与终态判定，避免「补采成功」被误判成「本轮零数据入库」。
+// 其它 runType 下 repairSummary 为 null，savedForTerminal 恒等于 stats.saved，语义不变。
+const repairSummary = repairState.summary;
+const savedForTerminal = repairSummary ? repairSummary.ok : stats.saved;
+
 if (stats.circuitBroken) {
-  log.warning(`本轮触发连续失败断路器暂停（已保存 ${stats.saved} 条数据，失败 ${stats.failed} 次），断点已保留供下次继续`);
+  log.warning(`本轮触发连续失败断路器暂停（已保存 ${savedForTerminal} 条数据，失败 ${stats.failed} 次），断点已保留供下次继续`);
   await Actor.exit({ exitCode: 2 });
   process.exit(2);
 }
 
-if ((stats.authRejected > 0 || stats.riskEmpty > 0 || stats.riskExhausted) && stats.saved === 0) {
+if ((stats.authRejected > 0 || stats.riskEmpty > 0 || stats.riskExhausted) && savedForTerminal === 0) {
   await Actor.fail(
     `zhihu_auth_failed: 被知乎 401/403 拒绝 ${stats.authRejected} 次、疑似风控空页 ${stats.riskEmpty} 次、` +
       `风控暂停重试耗尽 ${stats.riskExhausted ? "是" : "否"}（cookie 可能已失效或被风控），本轮零数据入库`
   );
   process.exit(1);
 }
-if (stats.saved === 0 && stats.failed > 0) {
+if (savedForTerminal === 0 && stats.failed > 0) {
   // failed 只统计 Worker 入库失败；知乎侧 429/5xx 已独立计入 zhihuRejected
   await Actor.fail(`ingest_failed: Worker 回传 ${stats.failed} 次全部失败（检查 API_SECRET / WORKER_URL），本轮零数据入库`);
   process.exit(1);
 }
-if (stats.saved === 0 && stats.zhihuRejected > 0) {
+if (savedForTerminal === 0 && stats.zhihuRejected > 0) {
   await Actor.fail(`zhihu_request_failed: 知乎侧请求失败 ${stats.zhihuRejected} 次（429/5xx/非 JSON/网络错误），本轮零数据入库`);
   process.exit(1);
 }
@@ -2764,20 +2871,22 @@ if (stats.saved === 0 && stats.zhihuRejected > 0) {
 const partialRisk =
   stats.riskExhausted || stats.authRejected > 0 || stats.riskEmpty > 0 || stats.zhihuRejected > 0;
 let finalStatusMessage: string | undefined;
-if (partialRisk && stats.saved > 0) {
+if (partialRisk && savedForTerminal > 0) {
   const pauseSec = Math.round(stats.riskPauseMs / 1000);
   const unresolved = stats.authRejected + stats.riskEmpty + stats.zhihuRejected;
-  const msg =
-    `partial_risk_controlled: 未恢复请求失败 ${unresolved} 次（401/403 ${stats.authRejected} 次、` +
-    `风控空页 ${stats.riskEmpty} 次、429/5xx/网络 ${stats.zhihuRejected} 次），本轮数据可能不完整` +
-    `（已保存 ${stats.saved} 条；暂停重试 ${pauseSec} 秒、重试耗尽 ${stats.riskExhausted ? "是" : "否"}）`;
+  const msg = repairSummary
+    ? `partial_risk_controlled: 补采评论被风控中断，已完成 ${repairSummary.ok}/${repairSummary.total} 条` +
+      `（未恢复请求失败 ${unresolved} 次；暂停重试 ${pauseSec} 秒、重试耗尽 ${stats.riskExhausted ? "是" : "否"}），重跑补采命令可继续`
+    : `partial_risk_controlled: 未恢复请求失败 ${unresolved} 次（401/403 ${stats.authRejected} 次、` +
+      `风控空页 ${stats.riskEmpty} 次、429/5xx/网络 ${stats.zhihuRejected} 次），本轮数据可能不完整` +
+      `（已保存 ${savedForTerminal} 条；暂停重试 ${pauseSec} 秒、重试耗尽 ${stats.riskExhausted ? "是" : "否"}）`;
   log.warning(msg);
   // 作为 run 终态状态消息输出（Actor.exit 会标记为 terminal），让控制台/本地脚本都能看到「部分被风控」
   finalStatusMessage = msg.slice(0, 200);
 }
 if (stats.failed > 0 || stats.zhihuRejected > 0 || stats.riskExhausted) {
   log.warning(
-    `本轮完成：交付 ${stats.saved} 条数据；Worker 入库失败 ${stats.failed} 次；` +
+    `本轮完成：${repairSummary ? "补采" : "交付"} ${savedForTerminal} 条数据；Worker 入库失败 ${stats.failed} 次；` +
       `知乎侧请求失败 ${stats.zhihuRejected} 次（429/5xx/非 JSON/网络）；累计风控暂停 ${Math.round(
         stats.riskPauseMs / 1000
       )} 秒`
