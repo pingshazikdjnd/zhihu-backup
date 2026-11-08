@@ -377,6 +377,78 @@ function shouldSyncComments(commentCount: number, prevCommentCount: number | nul
   return now !== prev && (now > 0 || prev > 0);
 }
 
+// 本轮评论抓取失败/中断的内容：同一进程后续阶段再次遇到时必须补抓，
+// 不能因为 contents.comment_count 已写成新值就跳过。
+const commentSyncIncomplete = new Set<string>();
+
+type StoredCommentState = { roots: number; storedComments: number; incompleteRoots: number };
+type StoredRootCommentRow = { is_complete?: unknown; child_count?: unknown };
+
+function isStoredRootCommentRow(value: unknown): value is StoredRootCommentRow {
+  return Boolean(value) && typeof value === "object";
+}
+
+/**
+ * 读取 Worker 已落库的评论线程状态（只读，不请求知乎）。
+ * 返回 null 表示探测失败：不能据此把内容误判为「评论已完整」。
+ */
+async function fetchStoredCommentState(contentPk: string): Promise<StoredCommentState | null> {
+  const base = apiUrl.endsWith("/") ? apiUrl.slice(0, -1) : apiUrl;
+  const headers: Record<string, string> = {};
+  if (apiSecret) headers.authorization = `Bearer ${apiSecret}`;
+  try {
+    const res = await fetch(
+      `${base}/api/contents/${encodeURIComponent(contentPk)}/root-comments?limit=50`,
+      { headers }
+    );
+    if (!res.ok) return null;
+    const json: unknown = await res.json();
+    let rows: StoredRootCommentRow[] = [];
+    if (json && typeof json === "object" && "data" in json) {
+      const data = json.data;
+      rows = Array.isArray(data) ? data.filter(isStoredRootCommentRow) : [];
+    }
+    let incompleteRoots = 0;
+    let storedComments = rows.length;
+    for (const row of rows) {
+      if (Number(row.is_complete ?? 0) !== 1) incompleteRoots++;
+      storedComments += Number(row.child_count) || 0;
+    }
+    return { roots: rows.length, storedComments, incompleteRoots };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 评论是否需要（重新）抓取：
+ * - 评论数变化（原有规则，覆盖新增/被删/清零）；
+ * - full 模式下 Worker 的 comment_threads 存在 is_complete=0（上次楼中楼抓取失败）；
+ * - full 模式下已落库的根评论+子评论不足内容评论数的一半（整页根评论漏抓）；
+ * - 本轮内该内容评论抓取失败过（同一轮多阶段重复遇到时立即补抓）。
+ * hot 模式只抓前 20 条热评，is_complete=0 属预期，不做完整性探测。
+ */
+async function shouldSyncCommentsDeep(
+  contentPk: string,
+  commentCount: number,
+  prevCommentCount: number | null | undefined,
+  mode: "full" | "hot" | "none"
+): Promise<boolean> {
+  if (shouldSyncComments(commentCount, prevCommentCount)) return true;
+  if (mode !== "full") return false;
+  if (commentSyncIncomplete.has(contentPk)) return true;
+  const expected = Number(commentCount) || 0;
+  if (expected <= 0) return false;
+  const [sourceType] = contentPk.split(":");
+  if (sourceType !== "answer" && sourceType !== "article") return false;
+  const state = await fetchStoredCommentState(contentPk);
+  if (!state) return false;
+  if (state.incompleteRoots > 0) return true;
+  // 只读到 50 根时无法判断根评论是否抓全，不做「明显偏少」推断
+  if (state.roots >= 50) return false;
+  return state.storedComments * 2 < expected;
+}
+
 // 知乎 API 统一请求入口（实现见 zhihu-fetch.ts）：
 // - 401 立即失败并计入 authRejected（cookie 失效，暂停无意义）；
 // - 403/429/5xx、200 风控空页、200 非 JSON 会暂停后重试（Retry-After 优先，封顶 120s，
@@ -644,7 +716,12 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
         
         const needComments =
           cfg.commentsMyAnswers !== "none" &&
-          shouldSyncComments(contentInput.commentCount, dbRes.prevCommentCount);
+          await shouldSyncCommentsDeep(
+            `answer:${idStr}`,
+            contentInput.commentCount,
+            dbRes.prevCommentCount,
+            cfg.commentsMyAnswers
+          );
         if (needComments) {
           console.log(`💬 发现待备份/更新评论 (${dbRes.prevCommentCount || 0} -> ${contentInput.commentCount})，加入抓取队列`);
           pendingCommentsQueue.push({
@@ -703,6 +780,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       let cOffset = 0;
       let cIsEnd = false;
       let cIncomplete = false;
+      let cFailed = false;
       let rootPages = 0;
       let rootEnded = false;
       const contentPk = `answer:${task.answerId}`;
@@ -735,11 +813,15 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
             const res = await postCommentsByRoot(contentPk, batch, { partial: true });
             submittedRoots += res.roots;
             submittedChildren += res.children;
-            if (res.aborted) cIncomplete = true;
+            if (res.aborted) {
+              cIncomplete = true;
+              cFailed = true;
+            }
           } catch (e: any) {
             // 瞬时失败已在 postCommentsByRoot 内重试过一次；这里只记录，
             // 整轮标记 partial，避免按不完整数据做删除对账
             cIncomplete = true;
+            cFailed = true;
             console.warn(`⚠️ 评论根批次提交失败 (回答 ${task.answerId}): ${sanitizeErrorForLog(e)}`);
           }
         }
@@ -757,6 +839,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           // 401/403/429/5xx/风控空页都已在 zhihuJson 内重试并计入终态统计
           console.warn(`⚠️ 回答 ${task.answerId} 根评论中断: ${sanitizeErrorForLog(e)}`);
           cIncomplete = true;
+          cFailed = true;
           break;
         }
         // 知乎风控会返回 200 + 空数组；该形态已在 zhihuJson 内重试并计数。
@@ -811,6 +894,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
                 } catch (e: any) {
                   console.warn(`⚠️ 评论 ${c.id} 子评论中断: ${sanitizeErrorForLog(e)}`);
                   cIncomplete = true;
+                  cFailed = true;
                   break;
                 }
                 if (!chJson.data || chJson.data.length === 0) {
@@ -836,7 +920,11 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           await enqueueRoot(toRootCommentGroup(c, children, childrenComplete));
         }
         
-        if (stats.riskExhausted || stats.circuitBroken) break;
+        if (stats.riskExhausted || stats.circuitBroken) {
+          cIncomplete = true;
+          cFailed = true;
+          break;
+        }
         cIsEnd = Boolean(cJson.paging?.is_end);
         if (cIsEnd) rootEnded = true;
         cOffset += 20;
@@ -862,17 +950,29 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           });
           submittedRoots += res.roots;
           submittedChildren += res.children;
-          if (res.aborted) cIncomplete = true;
+          if (res.aborted) {
+            cIncomplete = true;
+            cFailed = true;
+          }
         } catch (err: any) {
           cIncomplete = true;
+          cFailed = true;
           console.error(`❌ 保存评论失败: ${sanitizeErrorForLog(err)}`);
-          if (stats.circuitBroken) break;
+          if (stats.circuitBroken) {
+            commentSyncIncomplete.add(contentPk);
+            break;
+          }
         }
       }
       if (submittedRoots > 0) {
         console.log(`✅ 保存评论: 根 ${submittedRoots} 条 / 子 ${submittedChildren} 条 (回答 ID: ${task.answerId})${cIncomplete ? " [partial]" : ""}`);
       } else if (cIncomplete) {
         console.warn(`⚠️ 回答 ${task.answerId} 评论抓取中断且无数据，跳过本轮提交`);
+      }
+      if (cFailed) {
+        commentSyncIncomplete.add(contentPk);
+      } else if (!cIncomplete) {
+        commentSyncIncomplete.delete(contentPk);
       }
     }
   }
@@ -980,7 +1080,12 @@ async function runArticleScraperBody(browser: Awaited<ReturnType<typeof setupBro
         // 自有文章与回答链路一致：评论数新增或被删（含删光为 0）都要重抓/对账
         if (
           cfg.commentsMyAnswers !== "none" &&
-          shouldSyncComments(contentInput.commentCount, res?.prevCommentCount) &&
+          await shouldSyncCommentsDeep(
+            `article:${articleIdStr}`,
+            contentInput.commentCount,
+            res?.prevCommentCount,
+            cfg.commentsMyAnswers
+          ) &&
           !stats.circuitBroken &&
           !stats.riskExhausted
         ) {
@@ -1055,14 +1160,17 @@ export async function syncHotCommentsForContent(
       ? `https://www.zhihu.com/api/v4/comment_v5/articles/${sourceId}/root_comment?order_by=score&limit=20&offset=${offset === 0 ? "" : offset}`
       : `https://www.zhihu.com/api/v4/answers/${sourceId}/root_comments?limit=20&offset=${offset}`;
 
+  // 中途风控/异常/撞页数上限 → 不允许做删除对账；
+  // cFailed 单独记录「请求失败/风控中断」，供下一轮强制重抓，不把页数上限误判为失败
+  let cIncomplete = false;
+  let cFailed = false;
+
   try {
     let cOffset = 0;
     let cIsEnd = false;
     let nextUrl = buildUrl(cOffset);
     const maxPages = mode === "full" ? MAX_COMMENT_PAGES : 1;
     let pagesFetched = 0;
-    // 中途风控/异常/撞页数上限 → 不允许做删除对账
-    let cIncomplete = false;
     const seenRootIds = new Set<string>();
     const allRootIds: string[] = [];
     let rootsBuffer: RootCommentGroup[] = [];
@@ -1093,6 +1201,7 @@ export async function syncHotCommentsForContent(
       } catch (e: any) {
         console.warn(`⚠️ 抓取评论中断 (${sourceType}:${sourceId}): ${sanitizeErrorForLog(e)}`);
         cIncomplete = true;
+        cFailed = true;
         break;
       }
 
@@ -1105,6 +1214,7 @@ export async function syncHotCommentsForContent(
           await postCommentsByRoot(contentPk, [], { partial: false, allRootIds: [] });
         } else if (!emptyIsEnd) {
           cIncomplete = true;
+          cFailed = true;
         }
         cIsEnd = emptyIsEnd;
         break;
@@ -1158,6 +1268,7 @@ export async function syncHotCommentsForContent(
                 `⚠️ 楼中楼抓取中断 (${sourceType}:${sourceId} 评论 ${c.id}): ${sanitizeErrorForLog(e)}`
               );
               cIncomplete = true;
+              cFailed = true;
               break;
             }
             const chData: any[] = Array.isArray(chJson.data) ? chJson.data : [];
@@ -1206,6 +1317,7 @@ export async function syncHotCommentsForContent(
       if (stats.circuitBroken || stats.riskExhausted) {
         // 中途熔断/风控：本页根评论未抓全，绝不能进入删除对账
         cIncomplete = true;
+        cFailed = true;
         break;
       }
 
@@ -1250,6 +1362,15 @@ export async function syncHotCommentsForContent(
     }
   } catch (e: any) {
     console.warn(`⚠️ 抓取评论跳过 (${sourceType}:${sourceId}): ${sanitizeErrorForLog(e)}`);
+    cFailed = true;
+  }
+
+  // 失败内容登记到本轮重抓集合：contents.comment_count 已被本次入库改成新值，
+  // 仅靠评论数比较下一轮会永久跳过；本轮内再次遇到（多阶段重叠）必须补抓。
+  if (cFailed) {
+    commentSyncIncomplete.add(contentPk);
+  } else if (!cIncomplete) {
+    commentSyncIncomplete.delete(contentPk);
   }
 }
 
@@ -1368,9 +1489,9 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
             }
             const title = item.question?.title || item.title || "无标题";
 
-            // 如果拉到了内容，同时把它存进 contents 表供用户阅读。
-            // 未知类型（zvideo 等）不透传：服务端 enum 会拒，写进去的数据也是错的
-            let contentSaved = true;
+            // 只有正文真正入库成功才写入收藏快照：contentSaved 初值不能为 true，
+            // 否则 item.content 缺失的条目会被当成「内容已保存」写进快照。
+            let contentSaved = false;
             if (item.content && KNOWN_TYPES.has(item.type)) {
               // pin 的 content 是块数组 [{type:"text",content:"..."}] 而非 HTML 字符串，
               // 直接给 cleanHtml 会因非字符串返回空串——想法正文就全丢了
@@ -1402,9 +1523,15 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
               };
               try {
                 const dbRes = await sendContent(contentInput);
+                contentSaved = true;
                 const needHotComments =
                   cfg.commentsCollections !== "none" &&
-                  shouldSyncComments(contentInput.commentCount, dbRes.prevCommentCount);
+                  await shouldSyncCommentsDeep(
+                    `${sourceType}:${item.id}`,
+                    contentInput.commentCount,
+                    dbRes.prevCommentCount,
+                    cfg.commentsCollections
+                  );
                 if (needHotComments && !stats.circuitBroken) {
                   await syncHotCommentsForContent(context, item.type as "answer" | "article" | "pin", String(item.id), cfg.commentsCollections);
                   // 每抓完一篇带新评论的条目额外缓冲：收藏夹是「条目 → 评论 → 楼中楼」
@@ -1422,7 +1549,6 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
                   existingCount = 0;
                 }
               } catch (e: any) {
-                contentSaved = false;
                 cIncomplete = true;
                 console.error(`❌ 收藏条目入库失败: ${title}`, sanitizeErrorForLog(e));
                 if (stats.circuitBroken) {
@@ -1431,6 +1557,11 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
                   break;
                 }
               }
+            } else {
+              // 正文缺失/类型不支持：不写入快照条目，并标记本轮收藏夹不完整，
+              // 避免全量对账把仍在收藏夹里的条目误标 is_removed。
+              cIncomplete = true;
+              console.warn(`⚠️ 收藏条目缺正文或类型不支持，跳过快照: ${sourceType}:${item.id}`);
             }
 
             if (contentSaved) {
@@ -1620,7 +1751,12 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
         if (pk) {
            if (
              cfg.commentsUpvotes !== "none" &&
-             shouldSyncComments(contentInput.commentCount, pk.prevCommentCount) &&
+             await shouldSyncCommentsDeep(
+               `${sourceType}:${sourceId}`,
+               contentInput.commentCount,
+               pk.prevCommentCount,
+               cfg.commentsUpvotes
+             ) &&
              !stats.circuitBroken &&
              !stats.riskExhausted
            ) {
@@ -2251,7 +2387,12 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               const dbRes = await sendContent(contentInput);
               if (
                 cfg.commentsFollowing !== "none" &&
-                shouldSyncComments(contentInput.commentCount, dbRes.prevCommentCount) &&
+                await shouldSyncCommentsDeep(
+                  `answer:${item.id}`,
+                  contentInput.commentCount,
+                  dbRes.prevCommentCount,
+                  cfg.commentsFollowing
+                ) &&
                 !stats.circuitBroken &&
                 !stats.riskExhausted
               ) {
@@ -2303,7 +2444,12 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             const dbRes = await sendContent(cand.contentInput);
             if (
               cfg.commentsFollowing !== "none" &&
-              shouldSyncComments(cand.commentCount, dbRes?.prevCommentCount) &&
+              await shouldSyncCommentsDeep(
+                `answer:${cand.sourceId}`,
+                cand.commentCount,
+                dbRes?.prevCommentCount,
+                cfg.commentsFollowing
+              ) &&
               !stats.circuitBroken &&
               !stats.riskExhausted
             ) {
@@ -2433,7 +2579,12 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             // 关注答主文章：与回答分支一致，评论数新增或被删（含清零）都要同步
             if (
               cfg.commentsFollowing !== "none" &&
-              shouldSyncComments(contentInput.commentCount, dbRes.prevCommentCount) &&
+              await shouldSyncCommentsDeep(
+                `article:${articleIdStr}`,
+                contentInput.commentCount,
+                dbRes.prevCommentCount,
+                cfg.commentsFollowing
+              ) &&
               !stats.circuitBroken &&
               !stats.riskExhausted
             ) {
@@ -2565,17 +2716,19 @@ if (stats.saved === 0 && stats.zhihuRejected > 0) {
   process.exit(1);
 }
 
-// 有部分数据入库但被风控打断：不能静默成功，run 状态明确标注「部分被风控」，
-// 但保持退出码 0/1/2 的既有语义（不新增让本地脚本误判的退出码）
+// 有部分数据入库但存在未恢复的单条失败/风控：不能静默成功。
+// 终态消息里显式给出未恢复次数，本地编排脚本据此判定阶段未完成并冷却续跑
+// （续跑轮次上限由脚本控制，不会无限重试）；退出码语义保持不变。
 const partialRisk =
   stats.riskExhausted || stats.authRejected > 0 || stats.riskEmpty > 0 || stats.zhihuRejected > 0;
 let finalStatusMessage: string | undefined;
 if (partialRisk && stats.saved > 0) {
   const pauseSec = Math.round(stats.riskPauseMs / 1000);
+  const unresolved = stats.authRejected + stats.riskEmpty + stats.zhihuRejected;
   const msg =
-    `partial_risk_controlled: 本轮部分被风控，数据可能不完整（已保存 ${stats.saved} 条；` +
-    `401/403 ${stats.authRejected} 次、风控空页 ${stats.riskEmpty} 次、知乎侧请求失败 ${stats.zhihuRejected} 次、` +
-    `暂停重试 ${pauseSec} 秒、重试耗尽 ${stats.riskExhausted ? "是" : "否"}）`;
+    `partial_risk_controlled: 未恢复请求失败 ${unresolved} 次（401/403 ${stats.authRejected} 次、` +
+    `风控空页 ${stats.riskEmpty} 次、429/5xx/网络 ${stats.zhihuRejected} 次），本轮数据可能不完整` +
+    `（已保存 ${stats.saved} 条；暂停重试 ${pauseSec} 秒、重试耗尽 ${stats.riskExhausted ? "是" : "否"}）`;
   log.warning(msg);
   // 作为 run 终态状态消息输出（Actor.exit 会标记为 terminal），让控制台/本地脚本都能看到「部分被风控」
   finalStatusMessage = msg.slice(0, 200);

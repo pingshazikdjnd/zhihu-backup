@@ -388,13 +388,14 @@ export function createZhihuJson(stats: ZhihuRiskStats, deps: ZhihuFetchDeps = {}
 
             // 400/404/410 等：游标失效或参数错误，重试无意义；计入知乎侧失败但不终止全轮。
             // allow404：单篇内容关闭评论/被删时返回 404 属正常业务结果，不污染风控计数。
+            // 410（如 AccountDestroyError：账号已注销）是永久性结果，重试/续跑都不会变，不计入失败，否则阶段永远无法完成。
             throw recordFailure(
                 "http",
                 status,
                 label,
                 `知乎请求失败 (${label}): HTTP ${status}${detail ? ` ${detail}` : ""}`,
                 false,
-                status === 404 && opts.allow404 === true ? false : countStats
+                (status === 404 && opts.allow404 === true) || status === 410 ? false : countStats
             );
         }
 

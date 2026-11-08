@@ -46,6 +46,8 @@ const KV_DEFAULT_DIR = path.join(STORAGE_DIR, "key_value_stores", "default");
 const INPUT_JSON_PATH = path.join(KV_DEFAULT_DIR, "INPUT.json");
 const PROGRESS_PATH = path.join(LOGS_DIR, "full-harvest-progress.json");
 const LOG_PATH = path.join(LOGS_DIR, "full-harvest.log");
+const CHILD_LOG_PATH = path.join(LOGS_DIR, "full-harvest-child.log");
+const LOCK_PATH = path.join(LOGS_DIR, "full-harvest.lock");
 const WRANGLER_STATE_DIR = path.join(WORKER_DIR, ".wrangler", "state");
 
 /** 本地 Worker 固定端口：与 local-sync / 本地开发约定一致 */
@@ -179,26 +181,64 @@ function emptyProgress() {
 
 function readProgress() {
   if (!fs.existsSync(PROGRESS_PATH)) return emptyProgress();
+  let text = "";
   try {
-    const parsed = JSON.parse(fs.readFileSync(PROGRESS_PATH, "utf8"));
-    if (!parsed || typeof parsed !== "object" || !parsed.stages) return emptyProgress();
+    text = fs.readFileSync(PROGRESS_PATH, "utf8");
+  } catch (err) {
+    console.warn(`⚠️ 读取进度文件失败（${err?.code || err?.message || err}），本轮按空进度继续`);
+    return emptyProgress();
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || !parsed.stages) {
+      throw new Error("进度文件结构无效（缺少 stages）");
+    }
     // 兼容旧文件：补齐新增阶段/字段
     const base = emptyProgress();
     for (const stage of STAGES) {
       if (!parsed.stages[stage.id]) parsed.stages[stage.id] = base.stages[stage.id];
     }
     return { ...base, ...parsed, stages: { ...base.stages, ...parsed.stages } };
-  } catch {
+  } catch (err) {
+    // 解析失败不能直接丢掉旧进度：先备份损坏文件，方便人工恢复
+    const backup = `${PROGRESS_PATH}.corrupt-${timestampSlug()}.bak`;
+    try {
+      fs.copyFileSync(PROGRESS_PATH, backup);
+      console.warn(`⚠️ 进度文件解析失败（${err?.message || err}），已备份到 ${backup}，本轮按空进度继续`);
+    } catch (copyErr) {
+      console.warn(
+        `⚠️ 进度文件解析失败（${err?.message || err}），且备份失败（${copyErr?.message || copyErr}），本轮按空进度继续`
+      );
+    }
     return emptyProgress();
   }
 }
 
+/** Windows 上文件被杀毒/索引短暂占用时 rename 会 EPERM/EACCES/EBUSY，同步重试几次 */
+function sleepSync(ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) { /* 阻塞等待：writeProgress 是同步函数 */ }
+}
+
+// 心跳直接复用最近一次写入的 progress 对象，避免读盘失败时用空进度覆盖真实断点
+let latestProgress = null;
+
 function writeProgress(progress) {
+  latestProgress = progress;
   progress.updatedAt = new Date().toISOString();
   fs.mkdirSync(LOGS_DIR, { recursive: true });
   const tmp = `${PROGRESS_PATH}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(progress, null, 2), "utf8");
-  fs.renameSync(tmp, PROGRESS_PATH);
+  const maxAttempts = 5;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      fs.renameSync(tmp, PROGRESS_PATH);
+      return;
+    } catch (err) {
+      if (attempt >= maxAttempts) throw err;
+      sleepSync(50);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +401,14 @@ async function fetchLocalSyncState(secret) {
   return {
     cookieString: typeof json.cookieString === "string" ? json.cookieString : "",
     zhihuUsername: typeof json.zhihuUsername === "string" ? json.zhihuUsername : "",
-    upvotesCursor: typeof json.upvotesCursor === "string" ? json.upvotesCursor : null
+    upvotesCursor: typeof json.upvotesCursor === "string" ? json.upvotesCursor : null,
+    // 断点续跑的关键状态：history_done / resume_offset / full 模式用户列表。
+    // 少了这两项，重启后已完成的答主会被重新扫一遍，full 模式用户的 resumeOffset 也会丢。
+    followedProgress:
+      json.followedProgress && typeof json.followedProgress === "object" ? json.followedProgress : {},
+    fullModeUsers: Array.isArray(json.fullModeUsers)
+      ? json.fullModeUsers.filter(token => typeof token === "string" && token)
+      : []
   };
 }
 
@@ -370,6 +417,14 @@ async function fetchLocalSyncState(secret) {
 // ---------------------------------------------------------------------------
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** 子进程输出同时落盘（追加）：控制台仍实时输出；silent 子进程可能含凭据，不落盘 */
+function appendChildLog(text) {
+  if (!text) return;
+  try {
+    fs.appendFileSync(CHILD_LOG_PATH, text, "utf8");
+  } catch { /* 子进程日志落盘失败不影响抓取 */ }
 }
 
 function runChild(command, args, { cwd, env, timeoutMs = 0, silent = false } = {}) {
@@ -401,13 +456,19 @@ function runChild(command, args, { cwd, env, timeoutMs = 0, silent = false } = {
       const text = String(chunk);
       if (stdout.length < MAX_CAPTURE) stdout += text;
       pushTail(text);
-      if (!silent) process.stdout.write(text);
+      if (!silent) {
+        process.stdout.write(text);
+        appendChildLog(text);
+      }
     });
     child.stderr.on("data", chunk => {
       const text = String(chunk);
       if (stderr.length < MAX_CAPTURE) stderr += text;
       pushTail(text);
-      if (!silent) process.stderr.write(text);
+      if (!silent) {
+        process.stderr.write(text);
+        appendChildLog(text);
+      }
     });
     child.on("error", err => {
       if (timer) clearTimeout(timer);
@@ -673,14 +734,16 @@ const FATAL_RISK_MARKERS = [
 ];
 
 /**
- * 判断阶段是否真的被风控中途切断（未扫完）：
- * main.ts 只要单篇被删/老文章评论返回 1 次空页或 403，即使主循环 100% 从头扫到尾（重试耗尽 否），
- * 也会打印提示性的 partial_risk_controlled。只有「重试耗尽 是」（stats.riskExhausted=true）
- * 才会真正中断外层循环导致阶段未跑完！
+ * 判断阶段是否存在未恢复的单条失败/风控（终态应视为未完成）：
+ * main.ts 本轮只要有任一条 401/403/429/5xx/风控空页在重试后仍未恢复，
+ * 就会打印 partial_risk_controlled 并带上「未恢复请求失败 N 次」。
+ * 旧版爬虫（现有 dist）只输出「重试耗尽 是/否」：为兼容仍按该字段兜底。
  */
 function isExhaustedPartialRisk(output) {
   const text = String(output || "");
   if (!text.includes("partial_risk_controlled")) return false;
+  const unresolved = /未恢复请求失败\s*(\d+)\s*次/.exec(text);
+  if (unresolved) return Number(unresolved[1]) > 0;
   return !text.includes("重试耗尽 否");
 }
 
@@ -693,7 +756,7 @@ function detectRiskTerminal(output) {
 function detectRiskMarkers(output) {
   const text = String(output || "");
   const hits = FATAL_RISK_MARKERS.filter(marker => text.includes(marker));
-  if (isExhaustedPartialRisk(text)) hits.push("partial_risk_controlled(exhausted)");
+  if (isExhaustedPartialRisk(text)) hits.push("partial_risk_controlled(unresolved)");
   return hits;
 }
 
@@ -880,18 +943,14 @@ async function runStageWithCooldown(stage, ctx, progress) {
     );
 
     // 完成判定：赞同阶段必须「退出码 0 + 游标已清空（明确翻到历史末尾）」，
-    // 其他阶段退出码 0 且没有风控/失败终态标记即完成
+    // 所有阶段都必须没有未恢复的单条失败/风控终态标记，否则冷却续跑补抓。
     const cursorSettled = !isUpvotes || !remainingCursor;
-    if (code === 0 && (isUpvotes ? cursorSettled : !riskTerminal)) {
+    if (code === 0 && cursorSettled && !riskTerminal) {
       entry.status = "completed";
       entry.finishedAt = new Date().toISOString();
       progress.currentStage = null;
       writeProgress(progress);
       log(`✅ 阶段完成 ${stage.id} | ${formatStats(statsAfter)}`);
-      if (riskTerminal) {
-        // 赞同历史已追平但中途评论区被风控：列表完整，个别评论可能缺失
-        log(`⚠️ 注意：本阶段已跑完，但过程中出现过风控标记，个别评论可能需要单独补跑`);
-      }
       return { ok: true, code };
     }
 
@@ -1024,11 +1083,105 @@ function resetProgress(progress) {
   writeProgress(progress);
 }
 
+// ---------------------------------------------------------------------------
+// 单实例锁 / 心跳
+// ---------------------------------------------------------------------------
+let lockAcquired = false;
+
+/**
+ * logs/full-harvest.lock 单实例锁：
+ * - 锁存在且 pid 仍存活 → 打印信息并退出非零，避免两个全量任务同时打知乎；
+ * - pid 已不存在（ESRCH）→ 旧进程异常退出留下的陈旧锁，直接覆盖；
+ * - 无权限探测（EPERM）说明进程很可能仍存在，按存活处理。
+ */
+function acquireInstanceLock() {
+  fs.mkdirSync(LOGS_DIR, { recursive: true });
+  if (fs.existsSync(LOCK_PATH)) {
+    let holder = null;
+    try {
+      holder = JSON.parse(fs.readFileSync(LOCK_PATH, "utf8"));
+    } catch { /* 锁内容损坏按陈旧锁处理 */ }
+    const pid = Number(holder?.pid);
+    if (Number.isInteger(pid) && pid > 0) {
+      try {
+        process.kill(pid, 0);
+        console.error(
+          `❌ 已有全量采集进程在运行（pid ${pid}，启动于 ${holder?.startedAt || "未知"}）。` +
+            `确认其已退出后可删除 ${LOCK_PATH} 再重试`
+        );
+        return false;
+      } catch (err) {
+        if (err?.code !== "ESRCH") {
+          console.error(
+            `❌ 无法确认锁持有进程（pid ${pid}）是否已退出（${err?.code || err?.message}），为避免并发抓取本次退出`
+          );
+          return false;
+        }
+      }
+    }
+    console.warn(`⚠️ 发现陈旧锁（pid ${pid || "未知"} 已不存在），覆盖 ${LOCK_PATH}`);
+  }
+  fs.writeFileSync(
+    LOCK_PATH,
+    JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2),
+    "utf8"
+  );
+  lockAcquired = true;
+
+  const cleanup = () => releaseInstanceLock();
+  process.once("exit", cleanup);
+  for (const sig of ["SIGINT", "SIGTERM"]) {
+    process.once(sig, () => {
+      cleanup();
+      process.exit(sig === "SIGINT" ? 130 : 143);
+    });
+  }
+  return true;
+}
+
+function releaseInstanceLock() {
+  if (!lockAcquired) return;
+  lockAcquired = false;
+  try {
+    const holder = JSON.parse(fs.readFileSync(LOCK_PATH, "utf8"));
+    if (Number(holder?.pid) === process.pid) fs.rmSync(LOCK_PATH, { force: true });
+  } catch { /* 锁已被删除/损坏：无需处理 */ }
+}
+
+let heartbeatTimer = null;
+
+/** 每 60 秒刷新 progress.heartbeatAt，便于外部判断全量任务是否还活着 */
+function startHeartbeat() {
+  if (heartbeatTimer) return;
+  heartbeatTimer = setInterval(() => {
+    if (!latestProgress) return;
+    latestProgress.heartbeatAt = new Date().toISOString();
+    try {
+      writeProgress(latestProgress);
+    } catch (err) {
+      console.warn(`⚠️ 心跳写入进度失败: ${err?.message || err}`);
+    }
+  }, 60_000);
+  heartbeatTimer.unref();
+}
+
+function stopHeartbeat() {
+  if (!heartbeatTimer) return;
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+}
+
 async function main() {
   if (opts.help) {
     printHelp();
     return;
   }
+  if (!acquireInstanceLock()) {
+    process.exitCode = 1;
+    return;
+  }
+  process.once("exit", stopHeartbeat);
+  startHeartbeat();
   ensureDirs();
   log("════════════════════════════════════════════════════════");
   log("🧭 本地全量重扒总控启动");
@@ -1037,6 +1190,7 @@ async function main() {
   log("════════════════════════════════════════════════════════");
 
   let progress = readProgress();
+  latestProgress = progress;
   if (opts.resetProgress) {
     resetProgress(progress);
     log("♻️ 已重置阶段进度（本地数据不清空）");
@@ -1089,7 +1243,10 @@ async function main() {
     secret: localSecret.value,
     cookieString,
     zhihuUsername,
-    upvotesCursor: localState?.upvotesCursor || undefined
+    upvotesCursor: localState?.upvotesCursor || undefined,
+    // 断点状态必须带到子进程：history_done 的答主秒跳过，full 模式用户从 resumeOffset 续跑
+    followedProgress: localState?.followedProgress || undefined,
+    fullModeUsers: Array.isArray(localState?.fullModeUsers) ? localState.fullModeUsers : []
   };
   const stages = selectStages();
   let failed = false;

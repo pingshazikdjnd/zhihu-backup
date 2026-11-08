@@ -324,7 +324,7 @@ for (const t of IMPORT_ROW_TABLES) {
 }
 
 // R2 meta/followed_users.json：history_done / resume_offset 进度（只统计，不打印内容）
-let followedMeta = { exists: false, users: 0, historyDone: 0, resumePending: 0, error: "" };
+let followedMeta = { exists: false, users: 0, historyDone: 0, notHistoryDone: 0, resumePending: 0, error: "" };
 try {
   const metaObj = r2Objects.get("meta/followed_users.json");
   if (metaObj) {
@@ -333,6 +333,7 @@ try {
     followedMeta.exists = true;
     followedMeta.users = list.length;
     followedMeta.historyDone = list.filter((u) => u && u.history_done === true).length;
+    followedMeta.notHistoryDone = list.filter((u) => !u || u.history_done !== true).length;
     followedMeta.resumePending = list.filter(
       (u) => u && u.history_done !== true && Number(u.resume_offset || 0) > 0
     ).length;
@@ -754,6 +755,11 @@ if (followedMeta.exists) {
     "R2 followed_users.json 进度",
     `${fmtInt(followedMeta.historyDone)} / ${fmtInt(followedMeta.users)} 人 history_done`,
     `待续跑 ${fmtInt(followedMeta.resumePending)} 人`
+  );
+  item(
+    "R2 followed_users.json 未完成",
+    `${fmtInt(followedMeta.notHistoryDone)} 人 history_done=false`,
+    followedMeta.notHistoryDone === 0 ? "全部完成首次历史摸底" : "重启后仍需继续扫描（含未存断点的答主）"
   );
 } else {
   item("R2 followed_users.json", "未找到或不可解析", followedMeta.error || "");
