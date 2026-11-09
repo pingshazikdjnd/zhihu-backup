@@ -18,6 +18,8 @@ import {
  *   写入前先 HEAD，命中就不再下载；
  * - 单图失败只回退该图的外链，绝不影响正文入库；
  * - 单篇最多处理 MAX_IMAGES_PER_CONTENT 张，超出的保留外链，避免超长正文拖垮入库请求；
+ * - 全局并发闸门：整个 isolate 同一时刻最多处理 IMAGE_FETCH_CONCURRENCY 张图，
+ *   爬虫批量 POST 多篇正文时共享槽位，图片 buffer 峰值有硬上限；
  * - 图片质量按设置页的 imageQuality 决定：high/compressed 优先抓知乎图床官方
  *   _1440w / _720w 尺寸版本（Workers 无 Canvas，重新编码不可行），失败自动回退原图。
  */
@@ -30,11 +32,40 @@ const IMAGE_API_PREFIX = "/api/images/";
 const MAX_IMAGES_PER_CONTENT = 50;
 // 单张图片下载超时
 const IMAGE_FETCH_TIMEOUT_MS = 10_000;
-// 单张图片体积上限：Workers 单次请求内存有限（并发 4 张同时驻留），
-// 超大图直接保留外链，避免 4 份大 buffer 叠加打爆 isolate 内存
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-// 并发下载数：太高容易被图床限流，太低 50 张图会把入库请求拖长
-const IMAGE_FETCH_CONCURRENCY = 4;
+// 单张图片体积上限：miniflare / Workers 单次请求的堆内存有限。
+// 5MB 覆盖知乎图床 _1440w 版本的常见体积；更大的原图保留外链，
+// 避免一张超大图就把 isolate 堆推高。
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+// 图片并发数：既是单篇正文的分批大小，也是整个 isolate 的全局并发上限。
+// 2 并发 × 5MB = 10MB 是图片下载可同时驻留的内存上界。
+const IMAGE_FETCH_CONCURRENCY = 2;
+
+// 进程内（isolate 内）全局槽位：爬虫批量 POST 时会有多篇内容同时入库，
+// 若只按「每篇 2 并发」计算，N 个请求叠加仍会打爆 miniflare 的 V8 堆。
+// 这里让所有请求共享 IMAGE_FETCH_CONCURRENCY 个槽位，超出部分排队等待。
+let activeImageSlots = 0;
+const imageSlotWaiters: Array<() => void> = [];
+
+/** 占用一个全局图片槽位；返回的 Promise 在拿到槽位后 resolve */
+function acquireImageSlot(): Promise<void> {
+  if (activeImageSlots < IMAGE_FETCH_CONCURRENCY) {
+    activeImageSlots += 1;
+    return Promise.resolve();
+  }
+  return new Promise<void>(resolve => {
+    imageSlotWaiters.push(resolve);
+  });
+}
+
+/** 归还槽位：有等待者时直接移交（activeImageSlots 不变），否则计数减一 */
+function releaseImageSlot(): void {
+  const next = imageSlotWaiters.shift();
+  if (next) {
+    next();
+    return;
+  }
+  activeImageSlots -= 1;
+}
 
 // 图片质量设置在 isolate 内缓存 60 秒：每篇正文入库都读一次 R2/D1 是无意义的读放大。
 // 设置页保存后最迟 1 分钟对新下载的图片生效；已备份对象按 key 命中，不会重复下载。
@@ -334,6 +365,10 @@ async function localizeOne(
     });
   }
 
+  // 显式断开大 buffer 引用：put 返回后它已无用途，尽早交给 GC，
+  // 避免下一张图下载时旧 buffer 还挂在当前作用域里抬高峰值。
+  downloaded = null;
+
   return `${IMAGE_API_PREFIX}${hash}.${ext}`;
 }
 
@@ -361,14 +396,21 @@ export async function processContentImages(
       .slice(0, MAX_IMAGES_PER_CONTENT);
 
     const mapping = new Map<string, string>();
-    // 分批并发：Promise.all 保证同批失败会等到全部 settle 后再进入下一批
+    // 分批并发：Promise.all 保证同批失败会等到全部 settle 后再进入下一批。
+    // 每张图还要先抢全局槽位（跨请求共享），保证同一时刻最多 2 张大 buffer 驻留。
     for (let i = 0; i < targets.length; i += IMAGE_FETCH_CONCURRENCY) {
       const chunk = targets.slice(i, i + IMAGE_FETCH_CONCURRENCY);
       await Promise.all(
         chunk.map(async target => {
           try {
-            const localPath = await localizeOne(target.url, bucket, quality);
-            if (localPath) mapping.set(target.src, localPath);
+            await acquireImageSlot();
+            try {
+              const localPath = await localizeOne(target.url, bucket, quality);
+              if (localPath) mapping.set(target.src, localPath);
+            } finally {
+              // 无论成功/失败/超时都归还槽位，否则一次异常会让后续图片永久排队
+              releaseImageSlot();
+            }
           } catch (err) {
             // 单图失败（HEAD/PUT 异常等）只保留原外链
             warnImage(`localize ${target.url} failed`, err);
