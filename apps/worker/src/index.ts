@@ -14,7 +14,8 @@ import { recommendRoutes } from "./routes/recommend.js";
 import { dbContext } from "./db.js";
 import { getActiveWriteToken } from "./routes/auth.js";
 import { runAndRecord } from "./routes/sync.js";
-import { IMAGE_KEY_PREFIX, IMAGE_OBJECT_NAME_RE, contentTypeForImageName } from "./services/images.js";
+import { IMAGE_KEY_PREFIX, IMAGE_OBJECT_NAME_RE, contentTypeForImageName, isZhihuImageUrl } from "./services/images.js";
+import { findImageFallbackUrl, processImageBatch, IMAGE_TASK_BATCH_MAX_LIMIT } from "./services/image-tasks.js";
 import type { Bindings } from "./types.js";
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -78,7 +79,7 @@ app.use("/api/*", async (c, next) => {
 app.get("/api/health", c => c.json({ ok: true }));
 
 // 正文图片读取：对象名形如 images/{sha256}.{ext}，key 自带内容哈希所以不可变，
-// 可以放心长缓存；数据由入库时的 processContentImages 写入。
+// 可以放心长缓存；数据由 image_tasks 队列的批量下载写入（ingest 只入队不下载）。
 app.get("/api/images/*", async c => {
   const bucket = c.env.BUCKET;
   if (!bucket) return c.json({ error: "R2 bucket not bound" }, 503);
@@ -89,7 +90,24 @@ app.get("/api/images/*", async c => {
   if (!IMAGE_OBJECT_NAME_RE.test(name)) return c.json({ error: "not found" }, 404);
 
   const object = await bucket.get(`${IMAGE_KEY_PREFIX}${name}`);
-  if (!object) return c.json({ error: "not found" }, 404);
+  if (!object) {
+    // 异步下载还没跑完（或已彻底失败）：回退到任务表里的原始知乎外链，
+    // 与 P1 之前「下载失败保留外链」的可见行为一致，避免备份里出现死图。
+    // 只允许重定向到知乎图床域名，防止任务表被写脏后变成开放重定向。
+    const fallback = await findImageFallbackUrl(`${IMAGE_KEY_PREFIX}${name}`).catch(() => null);
+    if (fallback && isZhihuImageUrl(fallback)) {
+      return new Response(null, {
+        status: 302,
+        headers: {
+          location: fallback,
+          // 短缓存：下载完成后下一次请求就能拿到本地对象，不会被旧 302 长期钉住
+          "cache-control": "public, max-age=60",
+          "x-content-type-options": "nosniff"
+        }
+      });
+    }
+    return c.json({ error: "not found" }, 404);
+  }
 
   const headers = new Headers();
   object.writeHttpMetadata(headers);
@@ -126,6 +144,23 @@ async function scheduledHandler(_event: any, env: Bindings, _ctx: any) {
     "cron sync:",
     res.ok ? `apify run ${res.runId}` : `failed: ${res.error}`
   );
+
+  // 图片队列兜底：cron 打开时即使没有新正文入库，也会继续消化积压的下载任务。
+  // ingest 后的 waitUntil 只跑小批量，长积压靠这里与 POST /ingest/image-batch 清空。
+  const bucket = env.BUCKET;
+  if (bucket) {
+    try {
+      const images = await dbContext.run(env.DB, () => processImageBatch(bucket, IMAGE_TASK_BATCH_MAX_LIMIT));
+      if (images.claimed > 0) {
+        console.log(
+          `cron images: claimed=${images.claimed} done=${images.done} failed=${images.failed} retry=${images.retry}`
+        );
+      }
+    } catch (err) {
+      // 图片队列异常不能把 cron 调用打成失败（同步任务本身已经完成）
+      console.warn("[cron] image batch failed:", err instanceof Error ? err.message : err);
+    }
+  }
 }
 
 export default {

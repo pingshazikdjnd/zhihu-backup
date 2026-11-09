@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import {
   IngestCollectionSnapshotSchema,
   IngestCommentsByRootSchema,
@@ -9,7 +10,15 @@ import { upsertContent } from "../services/contents.js";
 import { replaceComments, replaceCommentsByRoot } from "../services/comments.js";
 import { upsertCollectionSnapshot } from "../services/collections.js";
 import { upsertUpvote } from "../services/upvotes.js";
-import { processContentImages } from "../services/images.js";
+import { prepareContentImages, type PreparedImageTask } from "../services/images.js";
+import {
+  enqueueImageTasks,
+  kickImageDrain,
+  processImageBatch,
+  IMAGE_TASK_BATCH_DEFAULT_LIMIT,
+  IMAGE_TASK_BATCH_MAX_LIMIT,
+  IMAGE_TASK_INGEST_KICK_LIMIT
+} from "../services/image-tasks.js";
 import {
   getFollowedUsersMap,
   updateFollowedUserProgress,
@@ -18,7 +27,7 @@ import {
 import { getSyncConfig, getExternalTargetsRaw, resolveActiveOffloadTarget, ensureRemoteCommentSchema, putOffloadedContentHtml, supportsSyncOffload, type ExternalSyncScope } from "./auth.js";
 import { acquireSyncLock, releaseSyncLock, renewSyncLock } from "./sync.js";
 import { requireSecret } from "../middleware/require-secret.js";
-import { db } from "../db.js";
+import { db, dbContext } from "../db.js";
 import type { Bindings } from "../types.js";
 
 export const ingestRoutes = new Hono<{ Bindings: Bindings }>();
@@ -184,6 +193,27 @@ function triggerExternalForward(c: any, scope: ExternalSyncScope, eventPath: str
   }
 }
 
+/**
+ * 正文已经返回后，在后台顺手消化一小批图片任务。
+ * waitUntil 的回调可能不在请求的 AsyncLocalStorage 作用域里执行，而任务服务依赖
+ * db() 从上下文取 D1，所以这里显式 dbContext.run 绑定一次。
+ */
+function triggerImageDrain(c: Context<{ Bindings: Bindings }>): void {
+  const bucket = c.env.BUCKET;
+  if (!bucket) return;
+  const promise = dbContext
+    .run(c.env.DB, () => kickImageDrain(bucket, IMAGE_TASK_INGEST_KICK_LIMIT))
+    .catch(err => {
+      console.warn("[ingest] image drain failed:", err instanceof Error ? err.message : err);
+      return null;
+    });
+  try {
+    c.executionCtx?.waitUntil(promise);
+  } catch {
+    void promise;
+  }
+}
+
 // 写接口统一鉴权（fail-closed），详见 middleware/require-secret.ts
 ingestRoutes.use("*", requireSecret);
 
@@ -223,14 +253,15 @@ ingestRoutes.post("/content", async c => {
     return c.json({ error: "R2 bucket not bound; refusing to drop content" }, 503);
   }
 
-  // 先把正文里的知乎图床图片下载进 R2，并把 <img src> 改写成 /api/images/{hash}.{ext}。
-  // 重写后的 HTML 同时用于 D1 的 content_hash 与 R2 的 html/ 对象，两者必须同源，
-  // 否则详情页拿到的 hash 会指向 R2 里不存在的对象。
-  // 每轮都调用是刻意的：已下载的图片会被 bucket.head 命中，不会重复下载，
-  // 只有「正文已存在但图片还没备份」的历史数据会在下一次入库时补齐。
-  const storedHtml = htmlToStore && bucket
-    ? await processContentImages(htmlToStore, bucket)
-    : htmlToStore;
+  // P1：图片下载不再发生在 ingest 请求里。这里只做纯 CPU 的确定性改写：
+  // 按图片身份（URL pathname 的 sha256）算出本地对象名并立刻改写 <img src>，
+  // 把下载任务写进 image_tasks 队列，网络下载交给 /ingest/image-batch 后台批量执行。
+  // 改写结果与旧版「下载成功后的 HTML」逐字节一致，因此 content_hash 语义不变：
+  // 旧内容（已带 /api/images/ 路径）不会被再次匹配，重同步也不会重复入队。
+  const prepared = htmlToStore && bucket
+    ? await prepareContentImages(htmlToStore)
+    : { html: htmlToStore, tasks: [] as PreparedImageTask[] };
+  const storedHtml = prepared.html;
 
   // 先写库（幂等），成功后再写 R2，避免「R2 已是新正文、D1 还是旧 hash」
   const result = await upsertContent(
@@ -283,9 +314,40 @@ ingestRoutes.post("/content", async c => {
     }
   }
 
+  // 图片任务入队放在 upsert 之后（image_tasks 有 contents 外键）。
+  // 队列写失败只影响图片备份，绝不能让正文入库失败：吞掉异常并记一行日志。
+  if (bucket && prepared.tasks.length) {
+    try {
+      await enqueueImageTasks(pk, prepared.tasks);
+    } catch (err) {
+      console.warn("[ingest] enqueue image tasks failed:", err instanceof Error ? err.message : err);
+    }
+    // 正文响应已在返回路上，这里只是把下载挪到 waitUntil 的后台生命周期
+    triggerImageDrain(c);
+  }
+
   triggerExternalForward(c, "contents", "/content", parsed.data, pk);
 
   return c.json({ ...result, offloadedTo: htmlOffloadedTo ?? undefined });
+});
+
+/**
+ * 图片任务批量消费（P1）：每次领取一批 pending 任务，下载并写入 R2。
+ * ingest 响应后的 waitUntil 会自动触发一次；cron / 手动补采也可以直接调用。
+ * body 可选 { limit }，缺省 IMAGE_TASK_BATCH_DEFAULT_LIMIT，上限 IMAGE_TASK_BATCH_MAX_LIMIT。
+ */
+ingestRoutes.post("/image-batch", async c => {
+  const bucket = c.env.BUCKET;
+  if (!bucket) return c.json({ error: "R2 bucket not bound" }, 503);
+
+  const body = await c.req.json().catch(() => null) as { limit?: unknown } | null;
+  const rawLimit = Number(body?.limit);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0
+    ? Math.min(Math.trunc(rawLimit), IMAGE_TASK_BATCH_MAX_LIMIT)
+    : IMAGE_TASK_BATCH_DEFAULT_LIMIT;
+
+  const result = await processImageBatch(bucket, limit);
+  return c.json(result);
 });
 
 ingestRoutes.post("/comments", async c => {

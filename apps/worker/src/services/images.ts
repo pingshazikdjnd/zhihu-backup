@@ -16,8 +16,14 @@ import {
  * 设计要点：
  * - 幂等：对象 key 由图片 URL 归一化身份串（pathname）的 sha256 决定，
  *   写入前先 HEAD，命中就不再下载；
- * - 单图失败只回退该图的外链，绝不影响正文入库；
- * - 单篇最多处理 MAX_IMAGES_PER_CONTENT 张，超出的保留外链，避免超长正文拖垮入库请求；
+ * - 入库与下载解耦（P1）：/ingest/content 只做纯 CPU 的确定性改写——按图片身份
+ *   算出本地对象名、立刻改写 <img src>、把下载任务写入 image_tasks；真正的网络
+ *   下载由 /ingest/image-batch 后台批量执行，正文入库不再被图片 IO 拖住；
+ * - 改写是确定性的：同一篇正文每次算出的 <img src> 与 content_hash 完全一致，
+ *   单张图下载失败也不会让哈希在「外链/本地路径」之间来回跳变；
+ * - 本地对象缺失时（任务还没跑完或已失败），/api/images/* 会 302 回退到任务表里
+ *   记录的原始外链，可见行为等同于旧版「下载失败保留外链」；
+ * - 单篇最多处理 MAX_IMAGES_PER_CONTENT 张，超出的保留外链；
  * - 全局并发闸门：整个 isolate 同一时刻最多处理 IMAGE_FETCH_CONCURRENCY 张图，
  *   爬虫批量 POST 多篇正文时共享槽位；响应带 content-length 时直接把 body 流式
  *   写进 R2，图片字节不经过 JS 堆，峰值只剩流缓冲区块；
@@ -29,21 +35,21 @@ import {
 export const IMAGE_KEY_PREFIX = "images/";
 // 浏览器侧访问路径：Pages 的 _worker.js 会把 /api/* 反代到 Worker
 const IMAGE_API_PREFIX = "/api/images/";
-// 单篇正文最多本地化多少张图
+// 单篇正文最多本地化多少张图：入库改写与异步任务入队共用同一个上限
 const MAX_IMAGES_PER_CONTENT = 50;
 // 单张图片下载超时
 const IMAGE_FETCH_TIMEOUT_MS = 10_000;
-// 单张图片体积上限：5MB 覆盖知乎图床 _1440w 版本的常见体积，更大的原图保留外链。
+// 单张图片体积上限：10MB 覆盖知乎图床原图/4K 截图，更大的响应直接拒绝。
 // 流式写 R2 时用它拒绝超限响应；响应缺 content-length 时才退回「读进堆再 put」的
 // 兜底路径，这条路径的堆占用同样被这个上限卡死。
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 // 图片并发数：既是单篇正文的分批大小，也是整个 isolate 的全局并发上限。
-// 流式路径下图片字节不进堆；最坏情况（响应缺 content-length）是
-// 2 × 5MB 的兜底 buffer 上界。
-const IMAGE_FETCH_CONCURRENCY = 2;
+// 流式路径下图片字节不进堆，并发可以放大到 4；最坏情况（响应缺 content-length）
+// 是 4 × 10MB 的兜底 buffer 上界，仍在 Worker 128MB 内存限额之内。
+export const IMAGE_FETCH_CONCURRENCY = 4;
 
 // 进程内（isolate 内）全局槽位：爬虫批量 POST 时会有多篇内容同时入库，
-// 若只按「每篇 2 并发」计算，N 个请求叠加仍会打爆 miniflare 的 V8 堆。
+// 若只按「每篇 IMAGE_FETCH_CONCURRENCY 并发」计算，N 个请求叠加仍会打爆 miniflare 的 V8 堆。
 // 这里让所有请求共享 IMAGE_FETCH_CONCURRENCY 个槽位，超出部分排队等待。
 let activeImageSlots = 0;
 
@@ -169,6 +175,23 @@ export function contentTypeForImageName(name: string): string {
 }
 
 /**
+ * 是否知乎图床域名（zhimg.com 及其子域）。
+ * 入库改写与 /api/images/* 失败回退共用：只备份/重定向知乎图床，
+ * 任意 URL 都 fetch 会让入库接口变成 SSRF 跳板，任意 URL 都 302 则可能变成开放重定向。
+ */
+export function isZhihuImageUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+  const host = parsed.hostname.toLowerCase();
+  return host === "zhimg.com" || host.endsWith(".zhimg.com");
+}
+
+/**
  * 把 <img src> 归一成可抓取的绝对 URL。
  * - HTML 属性里的 &amp; 要先还原，否则签名 query 带进请求会 404；
  * - 协议相对地址（//picx.zhimg.com/...）补 https:；
@@ -181,18 +204,12 @@ function toFetchableUrl(src: string): string | null {
   const absolute = decoded.startsWith("//") ? `https:${decoded}` : decoded;
   if (!/^https?:\/\//i.test(absolute)) return null;
 
-  let parsed: URL;
   try {
-    parsed = new URL(absolute);
+    if (!isZhihuImageUrl(absolute)) return null;
+    return new URL(absolute).toString();
   } catch {
     return null;
   }
-
-  // 只备份知乎图床：任意 URL 都 fetch 会让入库接口变成 SSRF 跳板
-  const host = parsed.hostname.toLowerCase();
-  if (host !== "zhimg.com" && !host.endsWith(".zhimg.com")) return null;
-
-  return parsed.toString();
 }
 
 /**
@@ -490,10 +507,84 @@ async function localizeOne(
   return null;
 }
 
+/** 供图片任务队列调用：下载单张图片并返回站内路径；失败返回 null */
+export async function localizeImage(
+  sourceUrl: string,
+  bucket: R2Bucket,
+  qualityOverride?: ImageQuality
+): Promise<string | null> {
+  if (!isZhihuImageUrl(sourceUrl)) return null;
+  const quality = qualityOverride ?? (await getImageQualitySetting(bucket));
+  return localizeOne(sourceUrl, bucket, quality);
+}
+
 /** 待本地化的图片：src 是 HTML 里的原始属性值，url 是归一化后的可抓取地址 */
 interface ContentImageTarget {
   src: string;
   url: string;
+}
+
+/** 入库时生成的图片下载任务：路径已在改写阶段确定，批量消费只负责下载 */
+export interface PreparedImageTask {
+  /** HTML 里原始的 <img src>：下载失败时读取路由回退 302 的目标 */
+  imageUrl: string;
+  /** R2 对象名（含 images/ 前缀）：入库时即确定，任务表据此去重 */
+  objectKey: string;
+}
+
+export interface PreparedContentImages {
+  /** 已把可本地化的 <img src> 换成站内路径的 HTML（其余标签原样保留） */
+  html: string;
+  /** 需要异步下载的图片任务（按 objectKey 去重） */
+  tasks: PreparedImageTask[];
+}
+
+/**
+ * 入库阶段的图片预处理（P1）：只做纯 CPU 的确定性改写 + 生成下载任务，不发任何网络请求。
+ *
+ * 本地路径 = sha256(图片身份串) + URL 扩展名，和 localizeOne 的落盘 key 完全一致，
+ * 所以 HTML 可以「先假设下载会成功」直接改写；下载失败时由 /api/images/* 回退到外链。
+ * 这样 ingest 请求的内存与耗时恒定，也不会因为单图成败让 content_hash 抖动。
+ *
+ * URL 里识别不出扩展名时保持外链：扩展名是对象名的一部分，要下载后看 Content-Type
+ * 才能确定，而异步回写 HTML 会连带改变 content_hash，得不偿失（这类 URL 极少）。
+ */
+export async function prepareContentImages(html: string): Promise<PreparedContentImages> {
+  if (!html || !/<img\b/i.test(html)) return { html, tasks: [] };
+
+  try {
+    const sources = extractImgSources(html);
+    if (!sources.length) return { html, tasks: [] };
+
+    const targets: ContentImageTarget[] = sources
+      .map(src => ({ src, url: toFetchableUrl(src) }))
+      .filter((item): item is ContentImageTarget => item.url !== null)
+      .slice(0, MAX_IMAGES_PER_CONTENT);
+    if (!targets.length) return { html, tasks: [] };
+
+    const mapping = new Map<string, string>();
+    const tasks = new Map<string, PreparedImageTask>();
+    for (const target of targets) {
+      const urlExt = extensionFromUrl(target.url);
+      if (!urlExt) continue;
+      const hash = await sha256(imageIdentity(target.url));
+      mapping.set(target.src, `${IMAGE_API_PREFIX}${hash}.${urlExt}`);
+      const objectKey = `${IMAGE_KEY_PREFIX}${hash}.${urlExt}`;
+      if (!tasks.has(objectKey)) {
+        tasks.set(objectKey, { imageUrl: target.url, objectKey });
+      }
+    }
+    if (!mapping.size) return { html, tasks: [] };
+
+    return {
+      html: rewriteImgSources(html, mapping),
+      tasks: Array.from(tasks.values())
+    };
+  } catch (err) {
+    // 图片备份是增值能力：预处理异常绝不能阻塞正文入库
+    warnImage("prepareContentImages skipped", err);
+    return { html, tasks: [] };
+  }
 }
 
 /**
@@ -510,7 +601,7 @@ async function downloadImages(
 ): Promise<Map<string, string>> {
   const mapping = new Map<string, string>();
   // 分批并发：Promise.all 保证同批失败会等到全部 settle 后再进入下一批。
-  // 每张图还要先抢全局槽位（跨请求共享），保证同一时刻最多 2 张图在下载。
+  // 每张图还要先抢全局槽位（跨请求共享），保证同一时刻最多 IMAGE_FETCH_CONCURRENCY 张图在下载。
   for (let i = 0; i < targets.length; i += IMAGE_FETCH_CONCURRENCY) {
     const chunk = targets.slice(i, i + IMAGE_FETCH_CONCURRENCY);
     await Promise.all(
@@ -539,8 +630,9 @@ async function downloadImages(
 }
 
 /**
- * 把正文 HTML 里的知乎图片下载进 R2，并重写为站内路径。
- * 任何异常都返回原始 HTML：图片备份是增值能力，不能阻塞正文入库。
+ * 同步版图片本地化：下载成功才改写 <img src>，失败保留外链。
+ * /ingest/content 已改为「确定性改写 + 任务队列」（见 prepareContentImages），
+ * 常规入库不再调用本函数；保留它给一次性补采/脚本复用。
  * 第三个参数供调用方显式指定质量（测试/批量补采）；缺省时读设置页保存的 imageQuality。
  * 第四个参数是可选取消信号：请求取消时停止排队与下载，已排队的槽位等待者会立即出队。
  */
