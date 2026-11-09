@@ -1,4 +1,10 @@
 import { sha256 } from "../utils/hash.js";
+import {
+  DEFAULT_IMAGE_QUALITY,
+  getSyncConfig,
+  normalizeImageQuality,
+  type ImageQuality
+} from "../routes/auth.js";
 
 /**
  * 正文图片本地化：把知乎图床（*.zhimg.com）的 <img src> 下载进 R2，
@@ -11,7 +17,9 @@ import { sha256 } from "../utils/hash.js";
  * - 幂等：对象 key 由图片 URL 归一化身份串（pathname）的 sha256 决定，
  *   写入前先 HEAD，命中就不再下载；
  * - 单图失败只回退该图的外链，绝不影响正文入库；
- * - 单篇最多处理 MAX_IMAGES_PER_CONTENT 张，超出的保留外链，避免超长正文拖垮入库请求。
+ * - 单篇最多处理 MAX_IMAGES_PER_CONTENT 张，超出的保留外链，避免超长正文拖垮入库请求；
+ * - 图片质量按设置页的 imageQuality 决定：high/compressed 优先抓知乎图床官方
+ *   _1440w / _720w 尺寸版本（Workers 无 Canvas，重新编码不可行），失败自动回退原图。
  */
 
 // 图片对象在 R2 里的前缀，读取路由拼 key 时共用同一常量（避免两处写死）
@@ -27,6 +35,27 @@ const IMAGE_FETCH_TIMEOUT_MS = 10_000;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 // 并发下载数：太高容易被图床限流，太低 50 张图会把入库请求拖长
 const IMAGE_FETCH_CONCURRENCY = 4;
+
+// 图片质量设置在 isolate 内缓存 60 秒：每篇正文入库都读一次 R2/D1 是无意义的读放大。
+// 设置页保存后最迟 1 分钟对新下载的图片生效；已备份对象按 key 命中，不会重复下载。
+const IMAGE_QUALITY_CACHE_TTL_MS = 60_000;
+let cachedImageQuality: { at: number; quality: ImageQuality } | null = null;
+
+/** 读取设置页保存的图片备份质量；任何异常都退回原图，绝不阻塞正文入库 */
+export async function getImageQualitySetting(bucket: R2Bucket): Promise<ImageQuality> {
+  if (cachedImageQuality && Date.now() - cachedImageQuality.at < IMAGE_QUALITY_CACHE_TTL_MS) {
+    return cachedImageQuality.quality;
+  }
+  let quality: ImageQuality = DEFAULT_IMAGE_QUALITY;
+  try {
+    const cfg = await getSyncConfig(bucket);
+    quality = normalizeImageQuality(cfg.imageQuality);
+  } catch {
+    quality = DEFAULT_IMAGE_QUALITY;
+  }
+  cachedImageQuality = { at: Date.now(), quality };
+  return quality;
+}
 
 /** 对象名（不含 images/ 前缀）：64 位 sha256 hex + 扩展名。读取路由据此挡住目录穿越 */
 export const IMAGE_OBJECT_NAME_RE = /^[a-f0-9]{64}\.[a-z0-9]{2,5}$/;
@@ -142,6 +171,45 @@ function extensionFromContentType(contentType: string): string | null {
   return EXT_BY_CONTENT_TYPE[base] ?? null;
 }
 
+// 知乎图床自带多档尺寸后缀（_720w / _1440w 等），直接取官方压缩版本比在 Worker 里
+// 重新编码更稳：Workers / miniflare 没有 Canvas 或原生图像 API，纯 JS 编解码会打爆 CPU 与内存。
+// 只对常见位图追加尺寸后缀；GIF/SVG 等格式保持原图，避免请求必然 404 的变体。
+const SIZE_VARIANT_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp"]);
+
+/**
+ * 把图片 URL 换成知乎图床的官方尺寸版本。
+ * - high       → _1440w（最长边约 1440px，视觉接近无损）
+ * - compressed → _720w（最长边约 720px，体积明显更省）
+ * 已经是目标尺寸、无法识别扩展名或非位图时原样返回，由调用方回退原图。
+ */
+function applySizeVariant(url: string, quality: ImageQuality): string {
+  if (quality === "original") return url;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return url;
+  }
+
+  const pathname = parsed.pathname;
+  // 先剥掉 URL 里已有的尺寸后缀，避免拼成 _720w_1440w 这种无效路径
+  const stripped = pathname.replace(/_\d+w(?=\.[^./]+$)/i, "");
+  const dot = stripped.lastIndexOf(".");
+  const slash = stripped.lastIndexOf("/");
+  if (dot <= slash) return url;
+
+  const ext = stripped.slice(dot + 1).toLowerCase();
+  if (!SIZE_VARIANT_EXTENSIONS.has(ext)) return url;
+
+  const suffix = quality === "high" ? "_1440w" : "_720w";
+  const nextPath = `${stripped.slice(0, dot)}${suffix}${stripped.slice(dot)}`;
+  if (nextPath === pathname) return url;
+
+  parsed.pathname = nextPath;
+  return parsed.toString();
+}
+
 /** 按文档顺序提取 <img src>，相同 URL 只保留一次 */
 function extractImgSources(html: string): string[] {
   const seen = new Set<string>();
@@ -225,7 +293,11 @@ async function fetchImage(url: string): Promise<{ body: ArrayBuffer; contentType
  * 单张图片：算 hash → 查 R2 → 未命中则下载并写入 → 返回站内路径。
  * 失败返回 null，由调用方保留原外链。
  */
-async function localizeOne(sourceUrl: string, bucket: R2Bucket): Promise<string | null> {
+async function localizeOne(
+  sourceUrl: string,
+  bucket: R2Bucket,
+  quality: ImageQuality
+): Promise<string | null> {
   // 哈希吃归一化后的身份串而不是完整 URL：图床子域/签名/尺寸抖动不能换来新 key
   const hash = await sha256(imageIdentity(sourceUrl));
   const urlExt = extensionFromUrl(sourceUrl);
@@ -236,7 +308,17 @@ async function localizeOne(sourceUrl: string, bucket: R2Bucket): Promise<string 
     if (await bucket.head(expectedKey)) return `${IMAGE_API_PREFIX}${hash}.${urlExt}`;
   }
 
-  const downloaded = await fetchImage(sourceUrl);
+  // 非原图模式优先抓知乎图床的官方尺寸版本；该版本不存在（404/非图片）时
+  // 回退原图，保证「压缩失败」永远不会变成「图片没备份」。
+  const variantUrl = applySizeVariant(sourceUrl, quality);
+  let downloaded: { body: ArrayBuffer; contentType: string } | null = null;
+  if (variantUrl !== sourceUrl) {
+    downloaded = await fetchImage(variantUrl);
+    if (!downloaded) warnImage(`variant ${variantUrl} unavailable, fallback to original`);
+  }
+  if (!downloaded) {
+    downloaded = await fetchImage(sourceUrl);
+  }
   if (!downloaded) return null;
 
   const ext = urlExt ?? extensionFromContentType(downloaded.contentType) ?? "jpg";
@@ -248,7 +330,7 @@ async function localizeOne(sourceUrl: string, bucket: R2Bucket): Promise<string 
     await bucket.put(key, downloaded.body, {
       httpMetadata: { contentType: downloaded.contentType },
       // 留个来源线索方便排查；R2 customMetadata 值过长会写入失败，截断到 900 字符
-      customMetadata: { kind: "image", sourceUrl: sourceUrl.slice(0, 900) }
+      customMetadata: { kind: "image", quality, sourceUrl: sourceUrl.slice(0, 900) }
     });
   }
 
@@ -258,13 +340,20 @@ async function localizeOne(sourceUrl: string, bucket: R2Bucket): Promise<string 
 /**
  * 把正文 HTML 里的知乎图片下载进 R2，并重写为站内路径。
  * 任何异常都返回原始 HTML：图片备份是增值能力，不能阻塞正文入库。
+ * 第三个参数供调用方显式指定质量（测试/批量补采）；缺省时读设置页保存的 imageQuality。
  */
-export async function processContentImages(html: string, bucket: R2Bucket): Promise<string> {
+export async function processContentImages(
+  html: string,
+  bucket: R2Bucket,
+  qualityOverride?: ImageQuality
+): Promise<string> {
   if (!html || !/<img\b/i.test(html)) return html;
 
   try {
     const sources = extractImgSources(html);
     if (!sources.length) return html;
+
+    const quality = qualityOverride ?? (await getImageQualitySetting(bucket));
 
     const targets = sources
       .map(src => ({ src, url: toFetchableUrl(src) }))
@@ -278,7 +367,7 @@ export async function processContentImages(html: string, bucket: R2Bucket): Prom
       await Promise.all(
         chunk.map(async target => {
           try {
-            const localPath = await localizeOne(target.url, bucket);
+            const localPath = await localizeOne(target.url, bucket, quality);
             if (localPath) mapping.set(target.src, localPath);
           } catch (err) {
             // 单图失败（HEAD/PUT 异常等）只保留原外链

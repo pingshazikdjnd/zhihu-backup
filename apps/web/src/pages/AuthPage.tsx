@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api.js";
 
 type CommentSyncMode = "full" | "hot" | "none";
+// 图片备份质量：original=原图，high=图床 1440w 官方尺寸，compressed=图床 720w 官方尺寸
+type ImageQuality = "original" | "high" | "compressed";
 
 type ExternalProviderType = "turso" | "cloudflare_d1" | "supabase" | "s3_r2" | "webhook";
 type ExternalSyncScope = "contents" | "comments" | "collections" | "upvotes";
@@ -36,6 +38,8 @@ type SyncConfig = {
   commentsFollowing: CommentSyncMode;
   followingSensitivity: "strict" | "standard" | "relaxed";
   preferredAiModel: string;
+  // 正文图片备份质量（Worker 端 processContentImages 读取）
+  imageQuality: ImageQuality;
   // Workers AI 额度耗尽/不可用时的替补引擎（OpenAI 兼容，反代 DeepSeek）
   fallbackAiBaseUrl?: string;
   fallbackAiModel?: string;
@@ -72,6 +76,7 @@ const DEFAULT_CFG: SyncConfig = {
   commentsFollowing: "hot",
   followingSensitivity: "standard",
   preferredAiModel: "@cf/qwen/qwen3-30b-a3b-fp8",
+  imageQuality: "original",
   fallbackAiBaseUrl: "",
   fallbackAiModel: "deepseek-v4.1-flash",
   hasFallbackAiKey: false
@@ -222,7 +227,7 @@ export default function AuthPage() {
       setFallbackKeyInput("");
       setClearFallbackKey(false);
       cfgDirtyRef.current = false;
-      setCfgMsg({ type: "ok", text: "同步与评论策略已保存生效！下次自动或手动同步将按新策略执行。" });
+      setCfgMsg({ type: "ok", text: "设置已保存生效！下次自动或手动同步将按新策略执行。" });
       load(false);
     } catch (e: any) {
       setCfgMsg({ type: "err", text: extractErrText(e, "保存设置失败") });
@@ -814,6 +819,46 @@ export default function AuthPage() {
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 18, flexWrap: "wrap" }}>
           <button className="btn-primary" onClick={saveConfig} disabled={savingCfg}>
             {savingCfg ? "保存中…" : "💾 保存同步与评论策略"}
+          </button>
+          {cfgMsg && (
+            <span style={{ fontSize: 13, color: cfgMsg.type === "ok" ? "#16a34a" : "#dc2626" }}>
+              {cfgMsg.text}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* 模块：图片备份质量设置 */}
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>🖼️ 图片备份质量</h3>
+        <div style={{ fontSize: 13, color: "var(--zhihu-meta)", lineHeight: 1.7, marginBottom: 16 }}>
+          正文配图在入库时会自动下载进 R2 备份。<strong>「高质量 / 省空间」</strong>会优先抓取知乎图床官方的
+          <code> _1440w </code>/<code> _720w </code>尺寸版本（即知乎自己生成的压缩图），显著节省 R2 空间；
+          图床没有对应尺寸版本时会自动回退原图，不会漏备份。该设置<strong>只影响之后新下载的图片</strong>，
+          已备份的图片按内容哈希命中，不会重复下载替换。
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 14 }}>图片备份质量</div>
+            <div style={{ fontSize: 12, color: "var(--zhihu-meta)" }}>
+              默认原图，备份完整度最高；空间紧张时可选省空间
+            </div>
+          </div>
+          <select
+            style={selectStyle}
+            value={cfg.imageQuality}
+            onChange={e => updateCfg({ imageQuality: e.target.value as ImageQuality })}
+          >
+            <option value="original">原图（不压缩，最大备份完整度，默认）</option>
+            <option value="high">高质量（图床 1440w，视觉接近无损）</option>
+            <option value="compressed">省空间（图床 720w，体积明显更小，轻微画质损失）</option>
+          </select>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 18, flexWrap: "wrap" }}>
+          <button className="btn-primary" onClick={saveConfig} disabled={savingCfg}>
+            {savingCfg ? "保存中…" : "💾 保存图片备份质量"}
           </button>
           {cfgMsg && (
             <span style={{ fontSize: 13, color: cfgMsg.type === "ok" ? "#16a34a" : "#dc2626" }}>

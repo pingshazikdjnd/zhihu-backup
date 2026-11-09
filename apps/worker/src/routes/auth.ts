@@ -597,6 +597,27 @@ export async function readOffloadedContentHtml(
 
 export type CommentSyncMode = "full" | "hot" | "none";
 
+/**
+ * 正文图片备份质量：
+ * - original   ：原图字节，最大备份完整度（默认）
+ * - high       ：抓知乎图床 _1440w 官方尺寸版本，视觉接近无损
+ * - compressed ：抓知乎图床 _720w 官方尺寸版本，体积明显更省
+ * 注意这是「取图床的官方压缩版本」，不是 Worker 内重新编码：
+ * Workers / miniflare 没有 Canvas 或原生图像 API，纯 JS 编解码会打爆 CPU 与内存。
+ */
+export type ImageQuality = "original" | "high" | "compressed";
+
+export const DEFAULT_IMAGE_QUALITY: ImageQuality = "original";
+const VALID_IMAGE_QUALITIES = new Set<ImageQuality>(["original", "high", "compressed"]);
+
+/** 归一化图片质量设置：非法/缺省值一律回退原图，避免脏配置让入库图片处理异常 */
+export function normalizeImageQuality(
+  value: unknown,
+  fallback: ImageQuality = DEFAULT_IMAGE_QUALITY
+): ImageQuality {
+  return VALID_IMAGE_QUALITIES.has(value as ImageQuality) ? (value as ImageQuality) : fallback;
+}
+
 export type SyncConfig = {
   commentsMyAnswers: CommentSyncMode;
   commentsCollections: CommentSyncMode;
@@ -604,6 +625,8 @@ export type SyncConfig = {
   commentsFollowing: CommentSyncMode;
   followingSensitivity: "strict" | "standard" | "relaxed";
   preferredAiModel: string;
+  /** 正文图片备份质量，默认 original（原图） */
+  imageQuality: ImageQuality;
   /** Workers AI 额度耗尽/不可用时的替补引擎 Base URL（OpenAI 兼容），空串=未配置 */
   fallbackAiBaseUrl?: string;
   /** 替补引擎模型名，默认 deepseek-v4.1-flash */
@@ -627,6 +650,7 @@ export const DEFAULT_SYNC_CONFIG: SyncConfig = {
   commentsFollowing: "hot",
   followingSensitivity: "standard",
   preferredAiModel: "@cf/qwen/qwen3-30b-a3b-fp8",
+  imageQuality: DEFAULT_IMAGE_QUALITY,
   fallbackAiBaseUrl: "",
   fallbackAiModel: DEFAULT_FALLBACK_AI_MODEL,
   hasFallbackAiKey: false,
@@ -701,6 +725,7 @@ export async function getSyncConfig(bucket: any): Promise<SyncConfig> {
     commentsFollowing: VALID_COMMENT_MODES.has(merged.commentsFollowing as CommentSyncMode) ? (merged.commentsFollowing as CommentSyncMode) : "hot",
     followingSensitivity: VALID_SENSITIVITY.has(merged.followingSensitivity) ? merged.followingSensitivity : "standard",
     preferredAiModel: VALID_AI_MODELS.has(merged.preferredAiModel) ? merged.preferredAiModel : "@cf/qwen/qwen3-30b-a3b-fp8",
+    imageQuality: normalizeImageQuality(merged.imageQuality),
     fallbackAiBaseUrl: normalizeFallbackBaseUrl(merged.fallbackAiBaseUrl, ""),
     fallbackAiModel: normalizeFallbackModel(merged.fallbackAiModel, DEFAULT_FALLBACK_AI_MODEL),
     // 只暴露布尔标记：明文 Key 只存在 app_settings.fallback_ai_api_key 与 env secret 中
@@ -755,6 +780,7 @@ export async function saveSyncConfig(bucket: any, patch: SyncConfigPatch): Promi
     commentsFollowing: VALID_COMMENT_MODES.has(patch.commentsFollowing as CommentSyncMode) ? (patch.commentsFollowing as CommentSyncMode) : current.commentsFollowing,
     followingSensitivity: VALID_SENSITIVITY.has(patch.followingSensitivity as string) ? (patch.followingSensitivity as any) : current.followingSensitivity,
     preferredAiModel: VALID_AI_MODELS.has(patch.preferredAiModel as string) ? (patch.preferredAiModel as string) : current.preferredAiModel,
+    imageQuality: normalizeImageQuality(patch.imageQuality, current.imageQuality),
     fallbackAiBaseUrl: normalizeFallbackBaseUrl(patch.fallbackAiBaseUrl, current.fallbackAiBaseUrl || ""),
     fallbackAiModel: normalizeFallbackModel(patch.fallbackAiModel, current.fallbackAiModel || DEFAULT_FALLBACK_AI_MODEL),
     updatedAt: now
