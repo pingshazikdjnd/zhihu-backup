@@ -9,6 +9,7 @@ import { upsertContent } from "../services/contents.js";
 import { replaceComments, replaceCommentsByRoot } from "../services/comments.js";
 import { upsertCollectionSnapshot } from "../services/collections.js";
 import { upsertUpvote } from "../services/upvotes.js";
+import { processContentImages } from "../services/images.js";
 import {
   getFollowedUsersMap,
   updateFollowedUserProgress,
@@ -212,7 +213,7 @@ ingestRoutes.post("/content", async c => {
 
   const pk = `${parsed.data.sourceType}:${parsed.data.sourceId}`;
 
-  // 提前取副本：service 层不保证不改动入参，R2 必须写原始正文。
+  // 提前取副本：service 层不保证不改动入参；图片重写与落库都基于这份副本。
   const htmlToStore = parsed.data.contentHtml || "";
   const mdToStore = parsed.data.contentMd || "";
 
@@ -222,19 +223,30 @@ ingestRoutes.post("/content", async c => {
     return c.json({ error: "R2 bucket not bound; refusing to drop content" }, 503);
   }
 
+  // 先把正文里的知乎图床图片下载进 R2，并把 <img src> 改写成 /api/images/{hash}.{ext}。
+  // 重写后的 HTML 同时用于 D1 的 content_hash 与 R2 的 html/ 对象，两者必须同源，
+  // 否则详情页拿到的 hash 会指向 R2 里不存在的对象。
+  // 每轮都调用是刻意的：已下载的图片会被 bucket.head 命中，不会重复下载，
+  // 只有「正文已存在但图片还没备份」的历史数据会在下一次入库时补齐。
+  const storedHtml = htmlToStore && bucket
+    ? await processContentImages(htmlToStore, bucket)
+    : htmlToStore;
+
   // 先写库（幂等），成功后再写 R2，避免「R2 已是新正文、D1 还是旧 hash」
-  const result = await upsertContent(parsed.data);
+  const result = await upsertContent(
+    storedHtml === htmlToStore ? parsed.data : { ...parsed.data, contentHtml: storedHtml }
+  );
 
   // 正文真分流：命中扩容目标时 HTML 只写外部库（content_blobs / S3 对象），
   // 主 R2 的 html/* 一次 PUT 都不发生（省空间 + 省 Class A 写入）。
   // 主 D1 仍保留轻量标题/摘要/计数元数据，全站列表、搜索、推荐照常工作。
   let htmlOffloadedTo: string | null = null;
-  if (htmlToStore) {
+  if (storedHtml) {
     const contentOffload = await resolveActiveOffloadTarget(c.env.BUCKET, "contents").catch(() => null);
     if (contentOffload) {
       try {
         await ensureRemoteCommentSchema(contentOffload);
-        await putOffloadedContentHtml(contentOffload, pk, result.hash, htmlToStore);
+        await putOffloadedContentHtml(contentOffload, pk, result.hash, storedHtml);
         htmlOffloadedTo = contentOffload.name;
       } catch (err) {
         // 外部库不可用时绝不能丢正文：降级回主 R2
@@ -262,9 +274,9 @@ ingestRoutes.post("/content", async c => {
     };
 
     // HTML 已成功分流到外部库时跳过主 R2；md/ 体积极小，仍留主 R2
-    if (htmlToStore && !htmlOffloadedTo) {
+    if (storedHtml && !htmlOffloadedTo) {
       // versions/ 前缀全仓库无任何读取，且与 html/ 同字节双写，已删除
-      await putIfAbsent(`html/${pk}/${result.hash}`, htmlToStore, "text/html; charset=utf-8", "html");
+      await putIfAbsent(`html/${pk}/${result.hash}`, storedHtml, "text/html; charset=utf-8", "html");
     }
     if (mdToStore) {
       await putIfAbsent(`md/${pk}/${result.hash}`, mdToStore, "text/plain; charset=utf-8", "md");

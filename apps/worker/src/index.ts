@@ -14,6 +14,7 @@ import { recommendRoutes } from "./routes/recommend.js";
 import { dbContext } from "./db.js";
 import { getActiveWriteToken } from "./routes/auth.js";
 import { runAndRecord } from "./routes/sync.js";
+import { IMAGE_KEY_PREFIX, IMAGE_OBJECT_NAME_RE, contentTypeForImageName } from "./services/images.js";
 import type { Bindings } from "./types.js";
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -61,6 +62,9 @@ app.use("/api/*", async (c, next) => {
 
   const path = new URL(c.req.url).pathname;
   if (path === "/api/health" || path === "/api/auth/zhihu-status") return next();
+  // 正文图片是公开静态资源（对象名自带内容哈希、不可变），<img> 标签无法携带
+  // Authorization 头，必须匿名可读，否则开启私有读模式后详情页图片全挂。
+  if (path.startsWith("/api/images/")) return next();
 
   const auth = c.req.header("authorization") || "";
   if (auth.startsWith("Bearer ")) {
@@ -72,6 +76,30 @@ app.use("/api/*", async (c, next) => {
 });
 
 app.get("/api/health", c => c.json({ ok: true }));
+
+// 正文图片读取：对象名形如 images/{sha256}.{ext}，key 自带内容哈希所以不可变，
+// 可以放心长缓存；数据由入库时的 processContentImages 写入。
+app.get("/api/images/*", async c => {
+  const bucket = c.env.BUCKET;
+  if (!bucket) return c.json({ error: "R2 bucket not bound" }, 503);
+
+  const pathname = new URL(c.req.url).pathname;
+  const name = pathname.slice("/api/images/".length);
+  // 严格校验对象名：只认 images/ 下的 sha256 文件，杜绝 ../ 之类穿越去读正文/评论对象
+  if (!IMAGE_OBJECT_NAME_RE.test(name)) return c.json({ error: "not found" }, 404);
+
+  const object = await bucket.get(`${IMAGE_KEY_PREFIX}${name}`);
+  if (!object) return c.json({ error: "not found" }, 404);
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  // 历史对象可能没有 httpMetadata，按扩展名兜底，避免浏览器把图片当二进制下载
+  if (!headers.has("content-type")) headers.set("content-type", contentTypeForImageName(name));
+  headers.set("etag", object.httpEtag);
+  headers.set("cache-control", "public, max-age=31536000, immutable");
+  headers.set("x-content-type-options", "nosniff");
+  return new Response(object.body, { headers });
+});
 
 app.route("/ingest", ingestRoutes);
 app.route("/api/contents", contentRoutes);
