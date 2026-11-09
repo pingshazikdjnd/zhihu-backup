@@ -18,6 +18,7 @@ export const allCollectionsStore = {
   items: [] as any[],
   itemsPage: 1,
   hasMoreItems: true,
+  sortBy: "time" as "time" | "vote",
   scrollPosition: 0
 };
 

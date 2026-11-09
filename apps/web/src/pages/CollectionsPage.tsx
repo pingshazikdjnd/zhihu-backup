@@ -12,9 +12,12 @@ export default function CollectionsPage() {
   const [items, setItems] = useState<any[]>(allCollectionsStore.items);
   const [itemsPage, setItemsPage] = useState(allCollectionsStore.itemsPage);
   const [hasMoreItems, setHasMoreItems] = useState(allCollectionsStore.hasMoreItems);
+  const [sortBy, setSortBy] = useState<"time" | "vote">(allCollectionsStore.sortBy);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
   const observer = useRef<IntersectionObserver | null>(null);
+  // 切换排序会让在途的旧排序分页请求过期，回包后不得再写入列表
+  const itemsSeqRef = useRef(0);
 
   // Scroll restoration
   useEffect(() => {
@@ -32,6 +35,10 @@ export default function CollectionsPage() {
     allCollectionsStore.activeTab = activeTab;
   }, [activeTab]);
 
+  useEffect(() => {
+    allCollectionsStore.sortBy = sortBy;
+  }, [sortBy]);
+
   const loadCollections = () => {
     api<{ data: any[] }>("/api/collections")
       .then(res => {
@@ -47,15 +54,20 @@ export default function CollectionsPage() {
     }
   }, []);
 
-  const fetchItems = async (page: number) => {
+  const fetchItems = async (page: number, sort: "time" | "vote" = sortBy) => {
+    const seq = ++itemsSeqRef.current;
     setIsLoading(true);
     setError("");
     try {
-      const res = await api<{ data: any[] }>(`/api/collections/items?page=${page}`);
+      const res = await api<{ data: any[] }>(`/api/collections/items?page=${page}&sort=${sort}`);
+      if (seq !== itemsSeqRef.current) return;
 
       if (res.data.length < 50) {
         setHasMoreItems(false);
         allCollectionsStore.hasMoreItems = false;
+      } else {
+        setHasMoreItems(true);
+        allCollectionsStore.hasMoreItems = true;
       }
 
       setItems(prev => {
@@ -66,10 +78,25 @@ export default function CollectionsPage() {
       setItemsPage(page);
       allCollectionsStore.itemsPage = page;
     } catch (e: any) {
-      setError(e?.message || "收藏条目加载失败");
+      if (seq === itemsSeqRef.current) setError(e?.message || "收藏条目加载失败");
     } finally {
-      setIsLoading(false);
+      if (seq === itemsSeqRef.current) setIsLoading(false);
     }
+  };
+
+  // 排序切换：旧排序的已加载分页全部作废，回到第 1 页重新请求
+  const handleSortChange = (nextSort: "time" | "vote") => {
+    if (nextSort === sortBy) return;
+    setSortBy(nextSort);
+    setItems([]);
+    allCollectionsStore.items = [];
+    setItemsPage(1);
+    allCollectionsStore.itemsPage = 1;
+    setHasMoreItems(true);
+    allCollectionsStore.hasMoreItems = true;
+    allCollectionsStore.scrollPosition = 0;
+    window.scrollTo(0, 0);
+    fetchItems(1, nextSort);
   };
 
   useEffect(() => {
@@ -131,6 +158,24 @@ export default function CollectionsPage() {
         >
           按内容
         </button>
+        {activeTab === "items" && (
+          <div className="tab-right">
+            <button
+              className={`sort-chip ${sortBy === "time" ? "active" : ""}`}
+              onClick={() => handleSortChange("time")}
+              aria-pressed={sortBy === "time"}
+            >
+              最新
+            </button>
+            <button
+              className={`sort-chip ${sortBy === "vote" ? "active" : ""}`}
+              onClick={() => handleSortChange("vote")}
+              aria-pressed={sortBy === "vote"}
+            >
+              赞数最多
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="cards">

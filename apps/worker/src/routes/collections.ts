@@ -9,7 +9,8 @@ collectionRoutes.get("/", async c => {
 
 collectionRoutes.get("/items", async c => {
   const page = parseInt(c.req.query("page") || "1");
-  return c.json({ data: await listAllCollectionItems({ page }) });
+  const sort = c.req.query("sort");
+  return c.json({ data: await listAllCollectionItems({ page, sort }) });
 });
 
 collectionRoutes.get("/:id", async c => {

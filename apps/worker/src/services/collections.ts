@@ -258,12 +258,16 @@ export async function listCollections() {
   `).all();
 }
 
-export async function listAllCollectionItems(params?: { page?: number }) {
+export async function listAllCollectionItems(params?: { page?: number; sort?: string }) {
   // page 钳制：超大值会让 OFFSET 超出 SQLite int64 直接 500
   const parsedPage = Number(params?.page ?? 1);
   const page = Number.isFinite(parsedPage) ? Math.min(Math.max(Math.trunc(parsedPage), 1), 100000) : 1;
   const limit = 50;
   const offset = (page - 1) * limit;
+  // 只接受固定枚举，SQL 片段不拼接任何外部输入
+  const orderBy = params?.sort === "vote"
+    ? "COALESCE(c.voteup_count, 0) DESC, ci.first_seen_at DESC"
+    : "ci.first_seen_at DESC";
 
   return await db.prepare(`
     SELECT ci.id, ci.collection_id, ci.source_type, ci.source_id, ci.title, ci.author_name, ci.source_url, ci.first_seen_at as created_time,
@@ -277,7 +281,7 @@ export async function listAllCollectionItems(params?: { page?: number }) {
     FROM collection_items ci
     LEFT JOIN contents c ON ci.content_pk = c.pk
     WHERE ci.is_removed = 0
-    ORDER BY ci.first_seen_at DESC
+    ORDER BY ${orderBy}
     LIMIT ${limit} OFFSET ${offset}
   `).all();
 }

@@ -16,6 +16,23 @@ const fmtNum = (n: any) => {
   return String(num);
 };
 
+type CollectionItem = {
+  id: number;
+  content_pk: string;
+  is_removed?: number;
+  voteup_count?: number | null;
+  last_seen_at?: string | null;
+  first_seen_at?: string | null;
+  author_name?: string | null;
+  author_avatar?: string | null;
+  title?: string | null;
+  excerpt?: string | null;
+  comment_count?: number | null;
+  favorite_count?: number | null;
+  visit_count?: number | null;
+  source_type?: string | null;
+};
+
 export default function CollectionDetailPage() {
   const { id = "" } = useParams();
   const cached = collectionsStore[id] || { data: null, scrollPosition: 0, visibleCount: 50 };
@@ -24,6 +41,33 @@ export default function CollectionDetailPage() {
   const [loadError, setLoadError] = useState("");
   const [retryKey, setRetryKey] = useState(0);
   const [visibleCount, setVisibleCount] = useState(cached.visibleCount);
+  const [sortBy, setSortBy] = useState<"time" | "vote">("time");
+
+  const timeValue = (item: CollectionItem): number => {
+    const raw = item.last_seen_at || item.first_seen_at || "";
+    const t = new Date(raw).getTime();
+    return Number.isNaN(t) ? 0 : t;
+  };
+
+  // 详情接口按 is_removed ASC, last_seen_at DESC 返回；排序只在前端同一份数据上做，
+  // 已移除条目始终沉底，组内再按时间或赞数降序
+  const rawItems: CollectionItem[] = Array.isArray(detail?.items) ? detail.items : [];
+  const sortedItems = [...rawItems].sort((a: CollectionItem, b: CollectionItem) => {
+    const removedDiff = (a.is_removed ? 1 : 0) - (b.is_removed ? 1 : 0);
+    if (removedDiff !== 0) return removedDiff;
+    if (sortBy === "vote") {
+      const voteDiff = (Number(b.voteup_count) || 0) - (Number(a.voteup_count) || 0);
+      if (voteDiff !== 0) return voteDiff;
+    }
+    return timeValue(b) - timeValue(a);
+  });
+
+  const handleSortChange = (nextSort: "time" | "vote") => {
+    if (nextSort === sortBy) return;
+    setSortBy(nextSort);
+    setVisibleCount(50);
+    if (collectionsStore[id]) collectionsStore[id].visibleCount = 50;
+  };
 
   useEffect(() => {
     if (!id) return;
@@ -93,10 +137,27 @@ export default function CollectionDetailPage() {
           共 {detail.items.filter((i: any) => !i.is_removed).length} 个条目在收藏夹中
           {detail.items.some((i: any) => i.is_removed) && ` · ${detail.items.filter((i: any) => i.is_removed).length} 条已被移除`}
         </p>
+        <div className="detail-sort-bar">
+          <span className="detail-sort-label">排序</span>
+          <button
+            className={`sort-chip ${sortBy === "time" ? "active" : ""}`}
+            onClick={() => handleSortChange("time")}
+            aria-pressed={sortBy === "time"}
+          >
+            最新
+          </button>
+          <button
+            className={`sort-chip ${sortBy === "vote" ? "active" : ""}`}
+            onClick={() => handleSortChange("vote")}
+            aria-pressed={sortBy === "vote"}
+          >
+            赞数最多
+          </button>
+        </div>
       </div>
 
       <div className="cards">
-        {detail.items.slice(0, visibleCount).map((item: any) => (
+        {sortedItems.slice(0, visibleCount).map((item: CollectionItem) => (
           <Link className="card" key={item.id} to={`/contents/${encodeURIComponent(item.content_pk)}`}>
             {item.author_name && (
               <div className="card-author">

@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api.js";
 import { contentsStore } from "../lib/store.js";
 
@@ -8,7 +8,13 @@ const stripHtml = (html: string) => html ? html.replace(/<[^>]+>/g, '').substrin
 export default function ContentsPage() {
   const [activeTab, setActiveTab] = useState<"answers" | "upvotes">(contentsStore.activeTab);
   const [sortBy, setSortBy] = useState<"time" | "vote">(contentsStore.sortBy);
-  
+
+  const [searchParams, setSearchParams] = useSearchParams();
+  const urlQ = searchParams.get("q") ?? "";
+  // 记录本页自己写进 URL 的关键词：只有外部（顶部搜索框/前进后退）带来的 ?q= 才回灌输入框，
+  // 否则用户输入中的空格会被 trim 后的 URL 值反向吞掉
+  const lastWrittenQRef = useRef<string | null>(null);
+
   // Data caching
   const [answersData, setAnswersData] = useState<any[]>(contentsStore.answersData);
   const [upvotesData, setUpvotesData] = useState<any[]>(contentsStore.upvotesData);
@@ -24,12 +30,34 @@ export default function ContentsPage() {
   const observer = useRef<IntersectionObserver | null>(null);
 
   // 全文搜索（命中标题/问题标题/正文纯文本）
-  const [keyword, setKeyword] = useState("");
+  const [keyword, setKeyword] = useState(urlQ);
   const [searchResults, setSearchResults] = useState<any[] | null>(null);
   const [searchTotal, setSearchTotal] = useState(0);
   const [searchError, setSearchError] = useState("");
   const [answersTotal, setAnswersTotal] = useState<number | null>(null);
   const searchSeqRef = useRef(0);
+
+  // 顶部搜索框提交 / 浏览器前进后退导致 ?q= 变化时，同步到页内 keyword 触发搜索。
+  // 本页自己回写的 URL 直接跳过，避免与输入框状态互相覆盖
+  useEffect(() => {
+    if (lastWrittenQRef.current === urlQ) return;
+    lastWrittenQRef.current = urlQ;
+    setKeyword(urlQ);
+  }, [urlQ]);
+
+  // 页内搜索框修改/清空时同步回写 URL（replace 不污染历史）。
+  // 直接写在输入回调里而不是 effect 里：否则外部 ?q= 导航时，
+  // 旧 keyword 的写回收尾 effect 会把刚导航来的新关键词又覆盖回去
+  const applyKeyword = useCallback((value: string) => {
+    setKeyword(value);
+    const next = value.trim();
+    if ((searchParams.get("q") ?? "") === next) return;
+    const params = new URLSearchParams(searchParams);
+    if (next) params.set("q", next);
+    else params.delete("q");
+    lastWrittenQRef.current = next;
+    setSearchParams(params, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   useEffect(() => {
     const kw = keyword.trim();
@@ -243,7 +271,7 @@ export default function ContentsPage() {
             type="search"
             className="search-input"
             value={keyword}
-            onChange={e => setKeyword(e.target.value)}
+            onChange={e => applyKeyword(e.target.value)}
             placeholder="全文搜索标题与正文…"
           />
         </div>

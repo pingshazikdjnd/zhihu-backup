@@ -49,7 +49,7 @@ button { font-family: inherit; }
   padding: 0 16px;
   display: flex;
   align-items: center;
-  gap: 28px;
+  gap: 18px;
 }
 .zhihu-logo {
   color: var(--zhihu-blue);
@@ -60,10 +60,11 @@ button { font-family: inherit; }
   white-space: nowrap;
   cursor: default;
   user-select: none;
+  flex-shrink: 0;
 }
 .zhihu-logo span { color: var(--zhihu-text); font-weight: 400; font-size: 14px; margin-left: 6px; letter-spacing: 0; }
 
-.zhihu-nav { display: flex; gap: 20px; height: 52px; align-items: center; flex: 1; }
+.zhihu-nav { display: flex; gap: 12px; height: 52px; align-items: center; flex: 1; min-width: 0; }
 .zhihu-nav a {
   color: var(--zhihu-meta);
   font-size: 15px;
@@ -86,7 +87,57 @@ button { font-family: inherit; }
   background: var(--zhihu-blue);
 }
 
-.header-actions { display: flex; gap: 10px; align-items: center; }
+.header-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+.header-actions .btn-primary, .header-actions .btn-secondary { padding: 8px 12px; font-size: 13px; }
+
+/* 顶部全局搜索框（仿知乎 AppHeader：胶囊浅灰底 + 蓝色放大镜按钮） */
+.header-search {
+  display: flex;
+  align-items: center;
+  flex: 0 1 220px;
+  min-width: 130px;
+  height: 34px;
+  background: var(--zhihu-bg);
+  border: 1px solid var(--zhihu-border);
+  border-radius: 999px;
+  overflow: hidden;
+  transition: border-color 0.15s, background-color 0.15s, box-shadow 0.15s;
+}
+.header-search:focus-within {
+  border-color: var(--zhihu-blue);
+  background: #fff;
+  box-shadow: 0 0 0 3px var(--zhihu-blue-bg);
+}
+.header-search-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  border: none;
+  outline: none;
+  background: transparent;
+  padding: 0 4px 0 14px;
+  font-size: 14px;
+  color: var(--zhihu-text);
+  font-family: inherit;
+}
+.header-search-input::placeholder { color: var(--zhihu-meta); }
+.header-search-input::-webkit-search-cancel-button { cursor: pointer; }
+.header-search-btn {
+  flex-shrink: 0;
+  width: 40px;
+  height: 100%;
+  border: none;
+  padding: 0;
+  background: var(--zhihu-blue);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+.header-search-btn:hover { background: var(--zhihu-blue-hover); }
+.header-search-btn:focus-visible { outline: 2px solid #fff; outline-offset: -3px; }
 
 /* ===== 按钮 ===== */
 .btn-primary {
@@ -268,6 +319,20 @@ button { font-family: inherit; }
   font-weight: 600;
   /* 内描边 + 加粗，让当前排序一眼可辨 */
   box-shadow: inset 0 0 0 1px var(--zhihu-blue);
+}
+
+/* 收藏夹详情页排序条 */
+.detail-sort-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.detail-sort-label {
+  font-size: 13px;
+  color: var(--zhihu-meta);
+  margin-right: 2px;
 }
 
 /* 搜索框 */
@@ -589,21 +654,90 @@ button { font-family: inherit; }
 /* 响应式 */
 @media (max-width: 1040px) {
   .zhihu-header-inner, .zhihu-content-wrapper { width: 100%; }
+  /* 901~1040px 放不下完整桌面顶部栏：收紧间距并让导航可横向滑动 */
+  .zhihu-header-inner { gap: 14px; }
+  .zhihu-nav {
+    gap: 14px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .zhihu-nav::-webkit-scrollbar { display: none; }
+  .zhihu-nav a { flex-shrink: 0; white-space: nowrap; }
+  .header-search { flex: 0 1 210px; min-width: 110px; }
+  .header-actions { gap: 8px; }
+  .header-actions .btn-primary, .header-actions .btn-secondary { padding: 8px 10px; font-size: 13px; }
   .back-fab { left: 12px; top: 66px; padding: 7px 14px; }
 }
-@media (max-width: 640px) {
-  /* 6 个导航项在 375px 放不下会撑出溢出：改为可横向滚动的紧凑条 */
+@media (max-width: 900px) {
+  /* 平板：顶部栏允许换行（logo/搜索/同步一行，导航独占一行），高度自适应 */
+  .zhihu-header { height: auto; min-height: 52px; padding: 6px 0; }
+  .zhihu-header-inner { flex-wrap: wrap; gap: 8px 14px; padding: 0 12px; }
+  .zhihu-logo { font-size: 20px; }
+  .header-search { order: 2; flex: 1 1 200px; min-width: 0; max-width: none; }
+  .header-actions { order: 3; }
   .zhihu-nav {
-    gap: 12px;
+    order: 4;
+    flex: 1 1 100%;
+    height: 40px;
+    gap: 16px;
     overflow-x: auto;
     scrollbar-width: none;
     -webkit-overflow-scrolling: touch;
   }
   .zhihu-nav::-webkit-scrollbar { display: none; }
   .zhihu-nav a { font-size: 14px; white-space: nowrap; flex-shrink: 0; }
+
+  /* 平板宽度下 tab 栏 + 排序 + 页内搜索放不进一行：允许换行，搜索框可收缩 */
+  .tab-bar { flex-wrap: wrap; height: auto; min-height: 48px; padding: 8px 16px; gap: 8px 20px; }
+  .tab-bar .tab { min-height: 40px; white-space: nowrap; }
+  .tab-bar .tab-right { flex-wrap: wrap; }
+  .search-input { min-width: 0; flex: 1 1 200px; }
+
+  .zhihu-main { padding: 10px 12px 36px; }
+  .card { padding: 15px 18px; }
+  .card h2, .card h3 { font-size: 17px; }
+  .question-title { font-size: 20px; }
+  .action-bar { flex-wrap: wrap; gap: 10px 16px; }
+  .stat-grid { grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; }
+  .stat-card { padding: 14px 10px; }
+  .stat-card .num { font-size: 23px; }
+  .back-fab { top: 104px; }
+}
+@media (max-width: 640px) {
+  body { font-size: 14px; }
+  /* 手机：logo 与搜索框同排自适应，导航横向滑动，不撑出横向滚动条 */
+  .zhihu-header { height: auto; min-height: 52px; padding: 6px 0; }
+  .zhihu-header-inner { flex-wrap: wrap; gap: 8px 10px; padding: 0 10px; }
+  .zhihu-logo { font-size: 19px; }
+  .header-search { order: 2; flex: 1 1 140px; min-width: 0; max-width: none; height: 38px; }
+  .header-search-input { font-size: 16px; padding: 0 4px 0 14px; }
   .header-actions { display: none; }
+
+  /* 8 个导航项在 375px 放不下会撑出溢出：改为可横向滚动的紧凑条 */
+  .zhihu-nav {
+    order: 3;
+    flex: 1 1 100%;
+    height: 40px;
+    gap: 14px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .zhihu-nav::-webkit-scrollbar { display: none; }
+  .zhihu-nav a { font-size: 14px; white-space: nowrap; flex-shrink: 0; }
+
+  .zhihu-main { padding: 8px 8px 32px; }
   .back-fab { position: static; margin-bottom: 10px; }
-  .card { padding: 14px 16px; }
+  .card { padding: 14px 14px; }
+  .card h2, .card h3 { font-size: 16px; }
+  .question-title { font-size: 18px; }
+  .action-bar { flex-wrap: wrap; gap: 8px 12px; font-size: 13px; }
+  .stat-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .stat-card { padding: 13px 8px; }
+  .stat-card .num { font-size: 21px; }
+  .stat-card .label { font-size: 12px; }
+  .toast { max-width: calc(100vw - 32px); text-align: center; }
 }
 
 /* ===== 窄屏适配（实测 375/390px）：

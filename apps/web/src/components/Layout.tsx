@@ -1,9 +1,26 @@
-import { Link, NavLink } from "react-router-dom";
+import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import type { ReactNode } from "react";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, type FormEvent } from "react";
 
 export default function Layout({ children }: { children: ReactNode }) {
   const [toast, setToast] = useState("");
+  const [searchKw, setSearchKw] = useState("");
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  // 顶部搜索框跟随内容页 URL：内容页内搜索回写 ?q= 时这里同步显示，
+  // 浏览器前进/后退切换关键词时输入框也不会残留旧值
+  useEffect(() => {
+    if (location.pathname === "/contents") {
+      setSearchKw(new URLSearchParams(location.search).get("q") || "");
+    }
+  }, [location.pathname, location.search]);
+
+  const submitSearch = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const kw = searchKw.trim();
+    navigate(kw ? `/contents?q=${encodeURIComponent(kw)}` : "/contents");
+  };
 
   const notify = useCallback((msg: string) => {
     setToast(msg);
@@ -34,6 +51,22 @@ export default function Layout({ children }: { children: ReactNode }) {
             <NavLink to="/changes" className={({ isActive }) => isActive ? "active" : ""}>变更</NavLink>
             <NavLink to="/settings" className={({ isActive }) => isActive ? "active" : ""}>设置</NavLink>
           </nav>
+          <form className="header-search" role="search" onSubmit={submitSearch}>
+            <input
+              type="search"
+              className="header-search-input"
+              value={searchKw}
+              onChange={e => setSearchKw(e.target.value)}
+              placeholder="搜索知乎内容"
+              aria-label="全站搜索"
+            />
+            <button type="submit" className="header-search-btn" aria-label="搜索">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" />
+                <path d="M21 21l-4.3-4.3" />
+              </svg>
+            </button>
+          </form>
           <div className="header-actions">
             <div className="sync-dropdown">
               <button className="btn-secondary">⚡ 快速同步 ▾</button>
