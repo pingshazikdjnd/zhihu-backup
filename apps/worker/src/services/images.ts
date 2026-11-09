@@ -491,6 +491,28 @@ async function localizeOne(
   if (urlExt) {
     const expectedKey = `${IMAGE_KEY_PREFIX}${hash}.${urlExt}`;
     if (await bucket.head(expectedKey)) return `${IMAGE_API_PREFIX}${hash}.${urlExt}`;
+
+    // 历史对象兼容：P0 之前用 sha256(完整 URL) 做 key，现在改用归一化 pathname。
+    // 同一图片的旧 key 若已存在，直接复用避免重复下载（旧对象成孤儿可后续清理）。
+    const legacyHash = await sha256(sourceUrl);
+    if (legacyHash !== hash) {
+      const legacyKey = `${IMAGE_KEY_PREFIX}${legacyHash}.${urlExt}`;
+      if (await bucket.head(legacyKey)) {
+        // 把旧对象复制到新 key，让新旧路径都能访问；复制失败不影响本次复用
+        try {
+          const obj = await bucket.get(legacyKey);
+          if (obj) {
+            await bucket.put(expectedKey, obj.body, {
+              httpMetadata: { contentType: obj.httpMetadata?.contentType || "image/jpeg" },
+              customMetadata: obj.customMetadata || {}
+            });
+          }
+        } catch {
+          // 复制失败仍返回旧路径，图片可访问
+        }
+        return `${IMAGE_API_PREFIX}${legacyHash}.${urlExt}`;
+      }
+    }
   }
 
   // 非原图模式优先抓知乎图床的官方尺寸版本；该版本不存在（404/非图片）时
