@@ -19,7 +19,8 @@ import {
  * - 单图失败只回退该图的外链，绝不影响正文入库；
  * - 单篇最多处理 MAX_IMAGES_PER_CONTENT 张，超出的保留外链，避免超长正文拖垮入库请求；
  * - 全局并发闸门：整个 isolate 同一时刻最多处理 IMAGE_FETCH_CONCURRENCY 张图，
- *   爬虫批量 POST 多篇正文时共享槽位，图片 buffer 峰值有硬上限；
+ *   爬虫批量 POST 多篇正文时共享槽位；响应带 content-length 时直接把 body 流式
+ *   写进 R2，图片字节不经过 JS 堆，峰值只剩流缓冲区块；
  * - 图片质量按设置页的 imageQuality 决定：high/compressed 优先抓知乎图床官方
  *   _1440w / _720w 尺寸版本（Workers 无 Canvas，重新编码不可行），失败自动回退原图。
  */
@@ -32,28 +33,55 @@ const IMAGE_API_PREFIX = "/api/images/";
 const MAX_IMAGES_PER_CONTENT = 50;
 // 单张图片下载超时
 const IMAGE_FETCH_TIMEOUT_MS = 10_000;
-// 单张图片体积上限：miniflare / Workers 单次请求的堆内存有限。
-// 5MB 覆盖知乎图床 _1440w 版本的常见体积；更大的原图保留外链，
-// 避免一张超大图就把 isolate 堆推高。
+// 单张图片体积上限：5MB 覆盖知乎图床 _1440w 版本的常见体积，更大的原图保留外链。
+// 流式写 R2 时用它拒绝超限响应；响应缺 content-length 时才退回「读进堆再 put」的
+// 兜底路径，这条路径的堆占用同样被这个上限卡死。
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 // 图片并发数：既是单篇正文的分批大小，也是整个 isolate 的全局并发上限。
-// 2 并发 × 5MB = 10MB 是图片下载可同时驻留的内存上界。
+// 流式路径下图片字节不进堆；最坏情况（响应缺 content-length）是
+// 2 × 5MB 的兜底 buffer 上界。
 const IMAGE_FETCH_CONCURRENCY = 2;
 
 // 进程内（isolate 内）全局槽位：爬虫批量 POST 时会有多篇内容同时入库，
 // 若只按「每篇 2 并发」计算，N 个请求叠加仍会打爆 miniflare 的 V8 堆。
 // 这里让所有请求共享 IMAGE_FETCH_CONCURRENCY 个槽位，超出部分排队等待。
 let activeImageSlots = 0;
-const imageSlotWaiters: Array<() => void> = [];
 
-/** 占用一个全局图片槽位；返回的 Promise 在拿到槽位后 resolve */
-function acquireImageSlot(): Promise<void> {
+/** 排队中的槽位等待者：grant 在槽位移交时调用，abort 时整项从队列移除 */
+interface ImageSlotWaiter {
+  grant: () => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+}
+
+const imageSlotWaiters: ImageSlotWaiter[] = [];
+
+/**
+ * 占用一个全局图片槽位；拿到槽位时 resolve(true)。
+ * 传入 signal 时，等待期间被取消会把自己从队列里摘掉并 resolve(false)，
+ * 避免 resolver 和它背后的图片闭包永久挂在队列里。
+ */
+function acquireImageSlot(signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
   if (activeImageSlots < IMAGE_FETCH_CONCURRENCY) {
     activeImageSlots += 1;
-    return Promise.resolve();
+    return Promise.resolve(true);
   }
-  return new Promise<void>(resolve => {
-    imageSlotWaiters.push(resolve);
+  return new Promise<boolean>(resolve => {
+    const waiter: ImageSlotWaiter = { grant: () => resolve(true) };
+    if (signal) {
+      const onAbort = () => {
+        const index = imageSlotWaiters.indexOf(waiter);
+        // 已经不在队列里说明槽位刚好移交，不能再按取消处理
+        if (index < 0) return;
+        imageSlotWaiters.splice(index, 1);
+        resolve(false);
+      };
+      waiter.signal = signal;
+      waiter.onAbort = onAbort;
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    imageSlotWaiters.push(waiter);
   });
 }
 
@@ -61,7 +89,10 @@ function acquireImageSlot(): Promise<void> {
 function releaseImageSlot(): void {
   const next = imageSlotWaiters.shift();
   if (next) {
-    next();
+    if (next.signal && next.onAbort) {
+      next.signal.removeEventListener("abort", next.onAbort);
+    }
+    next.grant();
     return;
   }
   activeImageSlots -= 1;
@@ -274,17 +305,94 @@ function rewriteImgSources(html: string, mapping: Map<string, string>): string {
   );
 }
 
-/** 下载单张图片：10 秒超时，体积超限或非图片响应都按失败处理 */
-async function fetchImage(url: string): Promise<{ body: ArrayBuffer; contentType: string } | null> {
+/** 提前放弃响应：显式 cancel 未消费的 body，避免 workerd 的 pending read 钉住 Promise 与闭包 */
+async function cancelResponseBody(res: Response): Promise<void> {
+  try {
+    await res.body?.cancel();
+  } catch {
+    // body 已被读取或已关闭时 cancel 会抛，忽略即可
+  }
+}
+
+/** 解析 content-length；缺失或非法时返回 0，表示长度未知 */
+function declaredContentLength(res: Response): number {
+  const raw = res.headers.get("content-length");
+  if (!raw) return 0;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+/**
+ * 缺 content-length 时的兜底：按块读取响应体，累计超过上限立即 cancel 并放弃。
+ * 这条路径会把图片读进 JS 堆，但峰值被 MAX_IMAGE_BYTES 硬限制住。
+ * 返回 null 表示空 body、超限或读取失败。
+ */
+async function readBodyWithLimit(body: ReadableStream, maxBytes: number): Promise<Uint8Array | null> {
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch (err) {
+    warnImage("read image body failed", err);
+    await reader.cancel().catch(() => {});
+    return null;
+  } finally {
+    reader.releaseLock();
+  }
+  if (total === 0) return null;
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged;
+}
+
+/**
+ * 下载单张图片并直接写入 R2：10 秒超时，体积超限或非图片响应都按失败处理。
+ * 响应带 content-length 时把 res.body 交给 bucket.put 流式落盘，图片字节不经过
+ * isolate 的 JS 堆；缺长度时才退回带 MAX_IMAGE_BYTES 上限的读入堆兜底。
+ * 所有放弃路径都显式 cancel body；返回落盘用的扩展名。
+ */
+async function fetchImage(
+  url: string,
+  bucket: R2Bucket,
+  hash: string,
+  urlExt: string | null,
+  quality: ImageQuality,
+  sourceUrl: string,
+  signal?: AbortSignal
+): Promise<{ ext: string } | null> {
+  if (signal?.aborted) return null;
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), IMAGE_FETCH_TIMEOUT_MS);
+  // 外部请求取消（客户端断开）时一并中断下载与写盘
+  const abortFromOuter = () => controller.abort();
+  signal?.addEventListener("abort", abortFromOuter, { once: true });
+
+  let res: Response | null = null;
   try {
-    const res = await fetch(url, {
+    res = await fetch(url, {
       signal: controller.signal,
       headers: { accept: "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5" }
     });
     if (!res.ok) {
       warnImage(`download ${url} failed with HTTP ${res.status}`);
+      await cancelResponseBody(res);
       return null;
     }
 
@@ -292,31 +400,59 @@ async function fetchImage(url: string): Promise<{ body: ArrayBuffer; contentType
     // 图床签名失效时经常回一段 HTML 错误页，不能当图片存进 R2
     if (contentType && !contentType.startsWith("image/") && contentType !== "application/octet-stream") {
       warnImage(`download ${url} returned non-image content-type: ${contentType}`);
+      await cancelResponseBody(res);
       return null;
     }
 
-    const declaredLength = Number(res.headers.get("content-length") || "0");
+    const declaredLength = declaredContentLength(res);
     if (declaredLength > MAX_IMAGE_BYTES) {
       warnImage(`download ${url} skipped: content-length ${declaredLength} exceeds limit`);
+      await cancelResponseBody(res);
       return null;
     }
 
-    const body = await res.arrayBuffer();
-    if (body.byteLength === 0) {
+    const body = res.body;
+    if (!body) {
       warnImage(`download ${url} returned empty body`);
       return null;
     }
-    if (body.byteLength > MAX_IMAGE_BYTES) {
-      warnImage(`download ${url} skipped: body ${body.byteLength} exceeds limit`);
-      return null;
+
+    const ext = urlExt ?? extensionFromContentType(contentType) ?? "jpg";
+    const key = `${IMAGE_KEY_PREFIX}${hash}.${ext}`;
+
+    // urlExt 存在时调用方已 HEAD 过；无扩展名时这里补一次，命中就不必再消费响应体
+    if (!urlExt && (await bucket.head(key))) {
+      await cancelResponseBody(res);
+      return { ext };
     }
 
-    return { body, contentType: contentType || "application/octet-stream" };
+    const putOptions = {
+      httpMetadata: { contentType: contentType || "application/octet-stream" },
+      // 留个来源线索方便排查；R2 customMetadata 值过长会写入失败，截断到 900 字符
+      customMetadata: { kind: "image", quality, sourceUrl: sourceUrl.slice(0, 900) }
+    };
+
+    if (declaredLength > 0) {
+      // 已知长度：直接把网络流交给 R2，图片字节不进入 JS 堆
+      await bucket.put(key, body, putOptions);
+      return { ext };
+    }
+
+    // 缺 content-length（chunked）时无法用 FixedLengthStream，只能退回流式读入堆再 put
+    const buffered = await readBodyWithLimit(body, MAX_IMAGE_BYTES);
+    if (!buffered) {
+      warnImage(`download ${url} skipped: body empty or exceeds ${MAX_IMAGE_BYTES} bytes`);
+      return null;
+    }
+    await bucket.put(key, buffered, putOptions);
+    return { ext };
   } catch (err) {
     warnImage(`download ${url} failed`, err);
+    if (res) await cancelResponseBody(res);
     return null;
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener("abort", abortFromOuter);
   }
 }
 
@@ -327,7 +463,8 @@ async function fetchImage(url: string): Promise<{ body: ArrayBuffer; contentType
 async function localizeOne(
   sourceUrl: string,
   bucket: R2Bucket,
-  quality: ImageQuality
+  quality: ImageQuality,
+  signal?: AbortSignal
 ): Promise<string | null> {
   // 哈希吃归一化后的身份串而不是完整 URL：图床子域/签名/尺寸抖动不能换来新 key
   const hash = await sha256(imageIdentity(sourceUrl));
@@ -342,45 +479,76 @@ async function localizeOne(
   // 非原图模式优先抓知乎图床的官方尺寸版本；该版本不存在（404/非图片）时
   // 回退原图，保证「压缩失败」永远不会变成「图片没备份」。
   const variantUrl = applySizeVariant(sourceUrl, quality);
-  let downloaded: { body: ArrayBuffer; contentType: string } | null = null;
-  if (variantUrl !== sourceUrl) {
-    downloaded = await fetchImage(variantUrl);
-    if (!downloaded) warnImage(`variant ${variantUrl} unavailable, fallback to original`);
+  const candidates = variantUrl === sourceUrl ? [sourceUrl] : [variantUrl, sourceUrl];
+  for (const candidate of candidates) {
+    // 请求已取消就别再发起下一次尝试（变体失败后的原图回退也一并跳过）
+    if (signal?.aborted) return null;
+    const stored = await fetchImage(candidate, bucket, hash, urlExt, quality, sourceUrl, signal);
+    if (stored) return `${IMAGE_API_PREFIX}${hash}.${stored.ext}`;
+    if (candidate !== sourceUrl) warnImage(`variant ${candidate} unavailable, fallback to original`);
   }
-  if (!downloaded) {
-    downloaded = await fetchImage(sourceUrl);
+  return null;
+}
+
+/** 待本地化的图片：src 是 HTML 里的原始属性值，url 是归一化后的可抓取地址 */
+interface ContentImageTarget {
+  src: string;
+  url: string;
+}
+
+/**
+ * 下载一批目标图片，返回 src → 站内路径映射。
+ *
+ * 单独成函数是刻意的：并发 promise 只捕获这里的 targets / bucket / quality / signal，
+ * 不再把整篇正文 html 挂进每个图片闭包；长正文 × 多图时少一份整篇 HTML 的驻留。
+ */
+async function downloadImages(
+  targets: ContentImageTarget[],
+  bucket: R2Bucket,
+  quality: ImageQuality,
+  signal?: AbortSignal
+): Promise<Map<string, string>> {
+  const mapping = new Map<string, string>();
+  // 分批并发：Promise.all 保证同批失败会等到全部 settle 后再进入下一批。
+  // 每张图还要先抢全局槽位（跨请求共享），保证同一时刻最多 2 张图在下载。
+  for (let i = 0; i < targets.length; i += IMAGE_FETCH_CONCURRENCY) {
+    const chunk = targets.slice(i, i + IMAGE_FETCH_CONCURRENCY);
+    await Promise.all(
+      chunk.map(async target => {
+        if (signal?.aborted) return;
+        try {
+          const acquired = await acquireImageSlot(signal);
+          // 排队期间请求被取消：槽位没拿到，放弃这张图
+          if (!acquired) return;
+          try {
+            const localPath = await localizeOne(target.url, bucket, quality, signal);
+            if (localPath) mapping.set(target.src, localPath);
+          } finally {
+            // 无论成功/失败/超时都归还槽位，否则一次异常会让后续图片永久排队
+            releaseImageSlot();
+          }
+        } catch (err) {
+          // 单图失败（HEAD/PUT 异常等）只保留原外链
+          warnImage(`localize ${target.url} failed`, err);
+        }
+      })
+    );
+    if (signal?.aborted) break;
   }
-  if (!downloaded) return null;
-
-  const ext = urlExt ?? extensionFromContentType(downloaded.contentType) ?? "jpg";
-  const key = `${IMAGE_KEY_PREFIX}${hash}.${ext}`;
-
-  // urlExt 存在时上面已经 HEAD 过且 miss；只有「URL 无扩展名」才需要补一次 HEAD
-  const stored = urlExt ? false : Boolean(await bucket.head(key));
-  if (!stored) {
-    await bucket.put(key, downloaded.body, {
-      httpMetadata: { contentType: downloaded.contentType },
-      // 留个来源线索方便排查；R2 customMetadata 值过长会写入失败，截断到 900 字符
-      customMetadata: { kind: "image", quality, sourceUrl: sourceUrl.slice(0, 900) }
-    });
-  }
-
-  // 显式断开大 buffer 引用：put 返回后它已无用途，尽早交给 GC，
-  // 避免下一张图下载时旧 buffer 还挂在当前作用域里抬高峰值。
-  downloaded = null;
-
-  return `${IMAGE_API_PREFIX}${hash}.${ext}`;
+  return mapping;
 }
 
 /**
  * 把正文 HTML 里的知乎图片下载进 R2，并重写为站内路径。
  * 任何异常都返回原始 HTML：图片备份是增值能力，不能阻塞正文入库。
  * 第三个参数供调用方显式指定质量（测试/批量补采）；缺省时读设置页保存的 imageQuality。
+ * 第四个参数是可选取消信号：请求取消时停止排队与下载，已排队的槽位等待者会立即出队。
  */
 export async function processContentImages(
   html: string,
   bucket: R2Bucket,
-  qualityOverride?: ImageQuality
+  qualityOverride?: ImageQuality,
+  signal?: AbortSignal
 ): Promise<string> {
   if (!html || !/<img\b/i.test(html)) return html;
 
@@ -390,35 +558,12 @@ export async function processContentImages(
 
     const quality = qualityOverride ?? (await getImageQualitySetting(bucket));
 
-    const targets = sources
+    const targets: ContentImageTarget[] = sources
       .map(src => ({ src, url: toFetchableUrl(src) }))
-      .filter((item): item is { src: string; url: string } => item.url !== null)
+      .filter((item): item is ContentImageTarget => item.url !== null)
       .slice(0, MAX_IMAGES_PER_CONTENT);
 
-    const mapping = new Map<string, string>();
-    // 分批并发：Promise.all 保证同批失败会等到全部 settle 后再进入下一批。
-    // 每张图还要先抢全局槽位（跨请求共享），保证同一时刻最多 2 张大 buffer 驻留。
-    for (let i = 0; i < targets.length; i += IMAGE_FETCH_CONCURRENCY) {
-      const chunk = targets.slice(i, i + IMAGE_FETCH_CONCURRENCY);
-      await Promise.all(
-        chunk.map(async target => {
-          try {
-            await acquireImageSlot();
-            try {
-              const localPath = await localizeOne(target.url, bucket, quality);
-              if (localPath) mapping.set(target.src, localPath);
-            } finally {
-              // 无论成功/失败/超时都归还槽位，否则一次异常会让后续图片永久排队
-              releaseImageSlot();
-            }
-          } catch (err) {
-            // 单图失败（HEAD/PUT 异常等）只保留原外链
-            warnImage(`localize ${target.url} failed`, err);
-          }
-        })
-      );
-    }
-
+    const mapping = await downloadImages(targets, bucket, quality, signal);
     if (!mapping.size) return html;
     return rewriteImgSources(html, mapping);
   } catch (err) {
