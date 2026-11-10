@@ -965,7 +965,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
         cOffset += 20;
         if (!cIsEnd) {
           // comment_v5 的 offset 是游标字符串（如 1380238650_151692731_0），不能按数字步进；
-          // 优先跟随 paging.next，相对路径按知乎域名补全，next 缺失时才退回数字 offset 兜底
+          // 优先跟随 paging.next，相对路径按知乎域名补全
           const pagingNext = typeof cJson.paging?.next === "string" ? cJson.paging.next : "";
           let resolvedNext = "";
           if (pagingNext) {
@@ -978,7 +978,11 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           if (resolvedNext && resolvedNext !== cNextUrl) {
             cNextUrl = resolvedNext;
           } else {
-            cNextUrl = buildRootCommentsUrl(cOffset);
+            // 游标链断裂（paging.next 缺失或指向当前页）：数字 offset 只会重复拉第一页
+            // 空转到页数上限，或拿空页误判翻完。立即结束本回答翻页并标记 partial。
+            console.warn(`⚠️ 回答 ${task.answerId} 根评论游标链断裂（paging.next 缺失/重复），本轮标记 partial`);
+            cIncomplete = true;
+            break;
           }
         }
         await jitterSleep(1100, 2000);
@@ -1396,8 +1400,11 @@ export async function syncHotCommentsForContent(
         if (resolvedNext && resolvedNext !== nextUrl) {
           nextUrl = resolvedNext;
         } else {
-          cOffset += 20;
-          nextUrl = buildUrl(cOffset);
+          // 游标链断裂（paging.next 缺失或指向当前页）：数字 offset 只会重复拉第一页空转；
+          // 立即结束翻页并标记不完整，绝不能按残缺根列表做删除对账。
+          console.warn(`⚠️ ${sourceType} ${sourceId} 评论游标链断裂（paging.next 缺失/重复），本轮标记 partial`);
+          cIncomplete = true;
+          break;
         }
       }
       if (!cIsEnd && pagesFetched < maxPages) {
@@ -2368,6 +2375,10 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
     );
 
     let completedAllPlans = true;
+    // 已注销/不可见账号（HTTP 410）：标记后跳过该答主后续的文章扫描，但仍按终态上报 historyDone
+    let userGone410 = false;
+    // voteups 首页异常空页时是否已追加 created 回退计划（防止重复追加、并在回退仍空时判定未完成）
+    let fallbackCreatedTop60 = false;
 
     if (u.answerCount > 0 && !stats.circuitBroken && !stats.riskExhausted) {
       const plans: Array<{ sortBy: "created" | "voteups"; startOffset: number; maxScan: number; earlyStop: number; trackResume: boolean }> =
@@ -2390,7 +2401,11 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
           : [{ sortBy: "voteups", startOffset: 0, maxScan: 60, earlyStop: 999999, trackResume: false }];
 
       let savedForUser = 0;
-      for (const plan of plans) {
+      // plans 是可变队列：voteups 首页异常空页时会向队尾追加 created 回退计划。
+      // 用下标 while 而非 for-of，保证追加的计划一定会被消费。
+      let planIndex = 0;
+      while (planIndex < plans.length) {
+        const plan = plans[planIndex++];
         if (stats.circuitBroken || stats.riskExhausted) { completedAllPlans = false; break; }
         let aOffset = plan.startOffset;
         let aIsEnd = false;
@@ -2414,12 +2429,48 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               }
             )).json;
           } catch (e: any) {
+            // 已注销/不可见账号（AccountDestroyError）稳定返回 HTTP 410，重试无意义：
+            // 必须当作终态收敛，否则每轮重跑都会重复打一次 410 且永远无法标记 historyDone。
+            const status = e instanceof ZhihuRequestError ? e.status : Number(e?.status);
+            if (status === 410) {
+              console.warn(`⏭️ [${u.name}] 账号已注销或不可见 (HTTP 410)，标记为已完成不再重试`);
+              userGone410 = true;
+              break;
+            }
             // 401/403/429/5xx/风控空页已在 zhihuJson 内重试并计入终态统计
             console.error(`❌ [${u.name}] 获取回答列表失败: ${sanitizeErrorForLog(e)}`);
             completedAllPlans = false;
             break;
           }
           if (!aJson.data || aJson.data.length === 0) {
+            // 首次摸底 voteups 首页就空：有回答的答主不可能是真的没内容，
+            // 多半是知乎对该列表静默过滤或滑窗风控。直接 break 会被误判为扫完并永久标记
+            // historyDone，导致高产答主 0 篇入库即被跳过；回退按 created 扫前 60 篇兜底。
+            if (
+              plan.sortBy === "voteups" &&
+              aOffset === 0 &&
+              u.answerCount > 0 &&
+              !onlyIncrementalNow &&
+              !isUserFull
+            ) {
+              if (!fallbackCreatedTop60) {
+                fallbackCreatedTop60 = true;
+                console.warn(
+                  `⚠️ [${u.name}] voteups 首页为空（共 ${u.answerCount} 回答），回退按 created 扫描前 60 篇以防漏采`
+                );
+                plans.push({ sortBy: "created", startOffset: 0, maxScan: 60, earlyStop: 999999, trackResume: false });
+              }
+              break;
+            }
+            // 回退到 created 首页仍为空：answerCount > 0 却 0 篇扫到属异常空页，
+            // 绝不能标记 historyDone，留待下轮重试。
+            if (fallbackCreatedTop60 && plan.sortBy === "created" && aOffset === 0 && u.answerCount > 0) {
+              console.warn(
+                `⚠️ [${u.name}] created 回退首页仍为空（共 ${u.answerCount} 回答），本轮不标记已完成，下轮重试`
+              );
+              completedAllPlans = false;
+              break;
+            }
             // 风控空页已在 zhihuJson 内重试并计数；voteups 排序的合法空页已由调用处
             // allowEmptyPage 放行，其余接口能到这里的是 is_end 的合法空页。
             // 但没有 paging 字段就无法证明「真的扫到底了」，不能据此上报历史摸底完成
@@ -2448,8 +2499,9 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             }
 
             const cleanedHtml = cleanHtml(item.content);
-            // 首次历史摸底：voteups 前 60 篇无条件保存（不计入 60 篇之外才走规则/AI）
-            const forceSave = forceSaveTop60 && plan.sortBy === "voteups" && top60Seen < 60;
+            // 首次历史摸底：voteups 前 60 篇无条件保存（不计入 60 篇之外才走规则/AI）；
+            // voteups 首页异常空页时回退的 created 前 60 篇同样享受首次摸底保护
+            const forceSave = forceSaveTop60 && (plan.sortBy === "voteups" || fallbackCreatedTop60) && top60Seen < 60;
             if (forceSave) top60Seen++;
             const evalRes = isUserFull || forceSave ? null : evaluateForAutoBackup(item, cleanedHtml);
             if (forceSave) {
@@ -2609,7 +2661,8 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
     }
 
     // 2. 抓取专栏文章（全量模式下抓全部文章；智能模式下扫描最新 40 篇文章并只自动备份高危/高质文章）
-    if (u.articlesCount > 0 && !stats.circuitBroken && !stats.riskExhausted) {
+    // 回答列表已 410（账号注销/不可见）时直接跳过文章扫描，避免再白打一次必然失败的请求
+    if (u.articlesCount > 0 && !userGone410 && !stats.circuitBroken && !stats.riskExhausted) {
       let artOffset = 0;
       let artIsEnd = false;
       let unchanged = 0;
@@ -2628,6 +2681,13 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             { label: `[${u.name}] 文章列表` }
           )).json;
         } catch (e: any) {
+          // 已注销/不可见账号（HTTP 410）可直接收敛，不把 completedAllPlans 打折
+          const status = e instanceof ZhihuRequestError ? e.status : Number(e?.status);
+          if (status === 410) {
+            console.warn(`⏭️ [${u.name}] 账号已注销或不可见 (HTTP 410)，标记为已完成不再重试`);
+            userGone410 = true;
+            break;
+          }
           // 401/403/429/5xx/风控空页已在 zhihuJson 内重试并计入终态统计
           console.error(`❌ [${u.name}] 获取文章列表失败: ${sanitizeErrorForLog(e)}`);
           completedAllPlans = false;
@@ -2798,6 +2858,20 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
 // 失败必须让 run 状态可见。之前所有异常都被吞掉后正常 exit，
 // cookie 失效后 run 依然 SUCCEEDED，Worker /auth 页据此误报"一切正常"。
 try {
+  // runType 是外部输入：未知取值不能被 else 分支静默吞掉，必须显式失败让调用方感知
+  const knownRunTypes: ReadonlySet<string> = new Set([
+    "all",
+    "answers",
+    "articles",
+    "collections",
+    "upvotes",
+    "following",
+    "following-list",
+    "repair-comments"
+  ]);
+  if (!knownRunTypes.has(String(runType))) {
+    throw new Error(`Unknown runType: ${String(runType)}`);
+  }
   if (runType === "repair-comments") {
     // 存量评论补采：独立通道，只重抓 repairTargets 里的评论，不枚举答主、不受 history_done 影响
     await runCommentRepairScraper();

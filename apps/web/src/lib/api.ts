@@ -1,15 +1,25 @@
 // 生产环境：默认走同源空 base（由 Pages _worker.js 通过 Service Binding 内部直连 Worker，
 // 无论部署在 *.pages.dev 还是 Pages 自定义域名，均彻底绕开国内对 *.workers.dev 的 DNS 污染且免去 CORS 预检）；
 // 除非显式设置了 VITE_API_BASE（例如独立部署在其他 CDN/静态托管需直连 Worker 时）。
-// 开发环境默认回退到本地 127.0.0.1:3001。
+// 开发环境：默认返回空 base，让 /api/* 与 <img src="/api/images/..."> 统一走 vite.config.ts
+// 配置的 /api 同源代理（转发到 127.0.0.1:18787）；仅有显式配置的其它地址才原样使用。
 function resolveApiBase(): string {
-  if (import.meta.env.VITE_API_BASE) {
-    return import.meta.env.VITE_API_BASE;
+  const raw = import.meta.env.VITE_API_BASE || "";
+  if (import.meta.env.DEV) {
+    // 根 .env 遗留的 VITE_API_BASE=http://localhost:3001 已无服务监听，
+    // 必须忽略并回退同源代理，避免默认启动 vite 时所有请求打向 3001。
+    if (!raw || /^https?:\/\/(localhost|127\.0\.0\.1):3001\/?$/i.test(raw)) {
+      return "";
+    }
+    return raw;
+  }
+  if (raw) {
+    return raw;
   }
   if (import.meta.env.PROD) {
     return "";
   }
-  return import.meta.env.DEV ? "http://127.0.0.1:3001" : "";
+  return "";
 }
 
 const API_BASE = resolveApiBase();

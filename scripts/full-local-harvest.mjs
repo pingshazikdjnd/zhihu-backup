@@ -1421,7 +1421,11 @@ async function main() {
     progress = readProgress();
   }
 
-  // 2. 等本地 Worker 就绪（migrations / 重启后由主流程负责拉起）
+  // 2. 日常启动幂等补齐本地 D1 迁移：wrangler 对已应用过的迁移 0 副作用（约 1 秒），
+  // 确保已有本地库在拉取新代码（如 0005_image_tasks.sql）后无需 --init-fresh 也会自动补表
+  await applyLocalMigrations();
+
+  // 3. 等本地 Worker 就绪（migrations / 重启后由主流程负责拉起）
   if (opts.initFresh && !(await localHealthy())) {
     // --init-fresh 允许在 Worker 停机状态下独立完成：初始化已落地，启动 Worker 后重跑即可继续
     log("🎯 初始化已完成；本地 Worker 尚未启动，本次仅完成初始化。");
