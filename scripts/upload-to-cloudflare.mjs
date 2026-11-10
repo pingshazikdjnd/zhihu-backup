@@ -76,6 +76,7 @@ const D1_FREE_DB_LIMIT = 500 * 1024 ** 2; // D1 免费计划单库上限 500 MB
 // 导出顺序：严格按外键依赖从父到子
 const EXPORT_TABLES = [
   "contents",
+  "image_tasks",
   "content_versions",
   "comments",
   "comment_versions",
@@ -103,13 +104,34 @@ const WIPE_ORDER = [
   "upvotes",
   "followed_users",
   "sync_runs",
+  "image_tasks",
   "contents"
 ];
 
-// 线上登录凭据 / 密钥类配置：清空 app_settings 时保留，导出时绝不带上本地值
-const APP_SETTINGS_PRESERVE_ON_WIPE = ["zhihu_cookie", "fallback_ai_api_key", "cookie_write_token"];
-const APP_SETTINGS_SKIP_EXPORT =
-  /(cookie|secret|token|api[_-]?key|password|passwd|credential|lock|upvotes_cursor)/i;
+// app_settings 采用明确白名单（不是黑名单）：本地导出只允许带 sync_config 这一项运行态配置。
+// external_storage_targets / apify_last_run / upvotes_cursor / 各种锁以及未来新增的任何密钥，
+// 都不会因为「没想到要过滤」而进入 bundle；本地旧值也就无从覆盖线上运行态。
+const APP_SETTINGS_EXPORT_KEYS = ["sync_config"];
+
+// 清空线上 app_settings 时必须保留的键：线上登录凭据、上传口令、外部存储目标、
+// 同步策略、断点游标、Apify 运行态、AI 每日预算与分布式同步锁。
+// 这些都属于「远端运行态」，清空后不能回填本地值，否则线上会立即失去登录态或锁状态。
+const APP_SETTINGS_PRESERVE_ON_WIPE = [
+  "zhihu_cookie",
+  "fallback_ai_api_key",
+  "cookie_write_token",
+  "external_storage_targets",
+  "sync_config",
+  "upvotes_cursor",
+  "apify_last_run",
+  "ai_daily_neuron_budget",
+  "sync_lock"
+];
+
+/** 仅导出白名单内的 app_settings 键（纯函数：供回归测试隔离执行） */
+function shouldExportAppSetting(key) {
+  return APP_SETTINGS_EXPORT_KEYS.includes(String(key));
+}
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -648,7 +670,7 @@ if (opts.exportOnly) {
       const rows = d1.prepare(`SELECT * FROM ${quoteIdent(table)} ORDER BY rowid`).iterate();
       let skippedSettings = 0;
       for (const row of rows) {
-        if (table === "app_settings" && APP_SETTINGS_SKIP_EXPORT.test(String(row.key))) {
+        if (table === "app_settings" && !shouldExportAppSetting(row.key)) {
           skippedSettings += 1;
           continue;
         }
@@ -657,7 +679,7 @@ if (opts.exportOnly) {
       }
       writer.finish();
       if (table === "app_settings" && skippedSettings) {
-        console.log(`  app_settings：已跳过 ${skippedSettings} 个敏感/运行态键（不打印键值）`);
+        console.log(`  app_settings：已跳过 ${skippedSettings} 个非白名单键（不打印键值）`);
       }
     }
     d1.exec("COMMIT");
@@ -676,7 +698,7 @@ if (opts.exportOnly) {
   // 清空线上表数据（保留表结构、d1_migrations 与线上凭据）
   const wipeLines = [];
   wipeLines.push("-- 清空线上 D1 业务数据：按外键逆序 DELETE，保留表结构与 d1_migrations");
-  wipeLines.push("-- app_settings 仅保留线上登录凭据，避免上传后 Worker 立即失去知乎 cookie");
+  wipeLines.push("-- app_settings 仅保留线上凭据与运行态白名单键，避免上传后 Worker 失去登录态或锁状态");
   wipeLines.push("-- 本文件由 scripts/upload-to-cloudflare.mjs 生成，仅允许人工确认后 --remote 执行");
   wipeLines.push("");
   for (const table of WIPE_ORDER) {
@@ -685,7 +707,7 @@ if (opts.exportOnly) {
   }
   if (tableExists(d1, "app_settings")) {
     wipeLines.push("");
-    wipeLines.push(`-- 保留线上凭据：${APP_SETTINGS_PRESERVE_ON_WIPE.join(", ")}`);
+    wipeLines.push(`-- 保留线上凭据/运行态：${APP_SETTINGS_PRESERVE_ON_WIPE.join(", ")}`);
     wipeLines.push(
       `DELETE FROM app_settings WHERE key NOT IN (${APP_SETTINGS_PRESERVE_ON_WIPE.map((k) => `'${k.replace(/'/g, "''")}'`).join(", ")});`
     );
@@ -914,6 +936,64 @@ function encodeObjectKey(key) {
     .join("/");
 }
 
+/** 去掉 ETag 外层双引号（纯函数：供回归测试隔离执行） */
+function normalizeR2Etag(value) {
+  if (typeof value !== "string") return "";
+  return value.trim().replace(/^"+|"+$/g, "");
+}
+
+/**
+ * R2 续传身份：manifest 的 key + 内容 etag，二者缺一不可。
+ * - 只有裸 key 不足以证明内容未变（同名 childcomments 可能已被重抓覆盖），返回空串；
+ * - 用换行分隔：key 可能含空格/中文/冒号，但不会含换行；etag 也不含换行。
+ */
+function r2ProgressIdentity(rec) {
+  if (!rec || typeof rec !== "object") return "";
+  const key = typeof rec.key === "string" ? rec.key : "";
+  const etag = normalizeR2Etag(rec.etag);
+  if (!key || !etag) return "";
+  return `${key}\n${etag}`;
+}
+
+/** 本地进度能否证明该 manifest 记录已完成：只认 key+etag 完全一致，裸 key/无 etag 一律不认 */
+function isR2DoneForManifest(rec, doneIdentities) {
+  const identity = r2ProgressIdentity(rec);
+  if (!identity || !doneIdentities) return false;
+  if (typeof doneIdentities.has === "function") return doneIdentities.has(identity);
+  if (Array.isArray(doneIdentities)) return doneIdentities.includes(identity);
+  return false;
+}
+
+/** R2_DONE_LOG 新格式（JSON Lines）：只有能构成 key+etag 身份的记录才写入 */
+function formatR2DoneLogLine(rec) {
+  const identity = r2ProgressIdentity(rec);
+  if (!identity) return "";
+  return JSON.stringify({ key: String(rec.key), etag: normalizeR2Etag(rec.etag) });
+}
+
+/** 解析 R2_DONE_LOG 一行：新格式返回身份；旧纯 key 行/无 etag 行返回空串（按无身份处理） */
+function parseR2DoneLogLine(line) {
+  const text = String(line || "").trim();
+  if (!text || text[0] !== "{") return "";
+  try {
+    return r2ProgressIdentity(JSON.parse(text));
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * R2 断点续传跳过判定：只有 manifest 与线上对象都有非空 etag、且去引号后完全一致才可跳过。
+ * 仅 size 相同不能证明内容一致（同名 childcomments 可能已被重抓覆盖），
+ * etag 缺失/不同都必须重传，绝不据此把内容不同的对象标记为已完成。
+ */
+function isR2ObjectResumable(manifestRec, remoteObj) {
+  const local = normalizeR2Etag(manifestRec && manifestRec.etag);
+  const remote = normalizeR2Etag(remoteObj && remoteObj.etag);
+  if (!local || !remote) return false;
+  return local === remote;
+}
+
 async function listRemoteObjects(prefix = "") {
   const objects = [];
   let cursor = "";
@@ -979,12 +1059,21 @@ function loadProgress() {
 }
 
 const progress = loadProgress();
-const r2Done = new Set(progress.r2.doneKeys);
+// 旧版 progress 的 doneKeys 是裸 key：原样保留用于 anyImported/计数兼容，
+// 但只有 key+etag 身份才会被 isR2DoneForManifest 认可（裸 key 无法证明内容未变）。
+const r2Done = new Set(progress.r2.doneKeys.filter((entry) => typeof entry === "string"));
 try {
   if (fs.existsSync(R2_DONE_LOG)) {
     for (const line of fs.readFileSync(R2_DONE_LOG, "utf8").split("\n")) {
-      const key = line.trim();
-      if (key) r2Done.add(key);
+      const identity = parseR2DoneLogLine(line);
+      if (identity) {
+        r2Done.add(identity);
+        continue;
+      }
+      const legacyKey = line.trim();
+      // 旧日志是纯 key 行：保留用于“已有进度”判断，但绝不参与 manifest 身份匹配。
+      // 以 { 开头但解析失败的行按损坏的新格式处理，不当成 key 使用。
+      if (legacyKey && legacyKey[0] !== "{") r2Done.add(legacyKey);
     }
   }
 } catch {
@@ -1005,16 +1094,31 @@ function saveProgress(force = false) {
   lastProgressSave = now;
 }
 
-function markR2Done(key, bytes) {
-  if (r2Done.has(key)) return;
-  r2Done.add(key);
-  progress.r2.uploadedBytes += bytes;
-  progressDirty = true;
-  try {
-    fs.appendFileSync(R2_DONE_LOG, `${key}\n`);
-  } catch {
-    /* 日志写失败不影响进度 JSON（会周期性落盘） */
+function markR2Done(key, bytes, etag) {
+  const identity = r2ProgressIdentity({ key, etag });
+  if (!identity) {
+    // 没有 etag 就没有可验证的内容身份：宁可不记，下次重传，绝不把旧对象当新对象完成
+    return false;
   }
+  if (r2Done.has(identity)) {
+    // 旧版可能同时存过同一个 key 的裸 key 记录，已有 etag 身份后清掉，避免计数重复
+    r2Done.delete(key);
+    return false;
+  }
+  r2Done.add(identity);
+  r2Done.delete(key);
+  const addedBytes = Number(bytes);
+  progress.r2.uploadedBytes += Number.isFinite(addedBytes) ? addedBytes : 0;
+  progressDirty = true;
+  const logLine = formatR2DoneLogLine({ key, etag });
+  if (logLine) {
+    try {
+      fs.appendFileSync(R2_DONE_LOG, `${logLine}\n`);
+    } catch {
+      /* 日志写失败不影响进度 JSON（会周期性落盘） */
+    }
+  }
+  return true;
 }
 
 let interrupted = false;
@@ -1135,8 +1239,8 @@ if (shouldWipe) {
     saveProgress(true);
   } else {
     console.log("  A2. 已指定 --skip-r2-wipe：跳过清空线上 R2（旧对象可能残留）");
-    // 不能把“跳过清空”当成“线上已干净”：否则续传时按 size 比对会把内容已变的
-    // 同名 childcomments 对象误判为已完成。
+    // 不能把“跳过清空”当成“线上已干净”：否则续传时会把内容已变的同名对象误判为已完成。
+    // 续传判定本身也已收紧为 etag 严格一致，但跳过标志仍保持 false，绝不假设线上可信。
     progress.wipe.r2Done = false;
     progress.wipe.r2Skipped = true;
     saveProgress(true);
@@ -1206,7 +1310,8 @@ console.log(`  D1 完成：新导入 ${fmtInt(importedChunks)} 片，跳过 ${fm
 console.log("");
 console.log("[步骤 C] 上传 R2 对象（断点续传）");
 
-// 若线上已清空且使用 API，先列出线上已有对象，size 一致的直接视为已完成（进度文件丢失也能续传）
+// 若线上已清空且使用 API，先列出线上已有对象；仅 etag 严格一致的对象视为已完成
+//（进度文件丢失也能续传，但绝不因 size 相同而跳过内容已变的同名对象）
 if (HAS_API && progress.wipe.r2Done && !progress.wipe.r2Skipped) {
   try {
     console.log("  读取线上对象清单用于续传比对 ...");
@@ -1214,20 +1319,26 @@ if (HAS_API && progress.wipe.r2Done && !progress.wipe.r2Skipped) {
     let matched = 0;
     for (const obj of remote) {
       const m = manifestByKey.get(obj.key);
-      if (m && Number(obj.size) === Number(m.size)) {
-        r2Done.add(obj.key);
+      if (m && isR2ObjectResumable(m, obj)) {
+        const identity = r2ProgressIdentity(m);
+        if (!identity) continue;
+        // 只有远端 list 返回的 etag 与 manifest 严格一致，才登记 key+etag 身份；
+        // 同时清掉旧版裸 key 记录，避免完成计数重复。
+        r2Done.add(identity);
+        r2Done.delete(m.key);
         matched += 1;
       }
     }
     progressDirty = true;
-    console.log(`  线上已有 ${fmtInt(remote.length)} 个对象，其中 ${fmtInt(matched)} 个与清单一致，将跳过。`);
+    console.log(`  线上已有 ${fmtInt(remote.length)} 个对象，其中 ${fmtInt(matched)} 个 etag 与清单一致，将跳过。`);
   } catch (err) {
     console.warn(`  [WARN] 线上对象清单读取失败，改为只信任本地进度文件：${shortErr(err)}`);
   }
 }
 
-const todo = manifest.filter((m) => !r2Done.has(m.key));
-console.log(`  待上传 ${fmtInt(todo.length)} 个（已完成 ${fmtInt(r2Done.size)} 个）`);
+const todo = manifest.filter((m) => !isR2DoneForManifest(m, r2Done));
+const doneForManifest = manifest.length - todo.length;
+console.log(`  待上传 ${fmtInt(todo.length)} 个（已完成 ${fmtInt(doneForManifest)} 个）`);
 let uploadedCount = 0;
 let uploadedBytes = 0;
 let lastLog = Date.now();
@@ -1261,7 +1372,7 @@ async function uploadOne(rec) {
     );
     if (r.code !== 0) throw new Error(`wrangler 退出码 ${r.code}：${(r.stderr || r.stdout).slice(-500)}`);
   }
-  markR2Done(rec.key, rec.size);
+  markR2Done(rec.key, rec.size, rec.etag);
   uploadedCount += 1;
   uploadedBytes += rec.size;
   if (Date.now() - lastLog > 3000) {

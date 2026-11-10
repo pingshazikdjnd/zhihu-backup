@@ -24,19 +24,100 @@ function resolveApiBase(): string {
 
 const API_BASE = resolveApiBase();
 
-// AbortSignal.timeout 需要 Chrome 103+ / Safari 16+，老浏览器没有这个方法，
-// 直接调用会 TypeError 让整个 api() 挂掉，这里做降级。
-function timeoutSignal(): AbortSignal | undefined {
-  const anySignal = AbortSignal as any;
-  if (typeof anySignal?.timeout === "function") {
-    return anySignal.timeout(30_000);
+const REQUEST_TIMEOUT_MS = 30_000;
+
+// 部分老浏览器没有 AbortSignal.timeout / AbortSignal.any，统一通过这个带可选方法的类型访问，
+// 避免直接调用不存在的方法导致整个 api() 抛 TypeError。
+type AbortSignalStatics = typeof AbortSignal & {
+  timeout?: (ms: number) => AbortSignal;
+  any?: (signals: AbortSignal[]) => AbortSignal;
+};
+
+const ABORT_SIGNAL_STATICS = AbortSignal as AbortSignalStatics;
+
+type RequestAbort = {
+  signal: AbortSignal | undefined;
+  cleanup: () => void;
+};
+
+// 保持历史拼接语义（API_BASE 与 path 直接相连），只去掉两者交界处的重复斜杠，
+// 避免 API_BASE 末尾带 / 时生成 //api/... 被浏览器当成协议相对 URL。
+function joinApiBase(base: string, path: string): string {
+  if (base && path && base.endsWith("/") && path.startsWith("/")) {
+    return `${base.slice(0, -1)}${path}`;
+  }
+  return `${base}${path}`;
+}
+
+// 目标 URL 统一交给 new URL 解析：相对 path 以页面 origin 为基准，绝对/相对 API_BASE 都能正确合并，
+// 查询参数与末尾斜杠原样保留。没有 window（Node/SSR）时退回历史字符串拼接。
+function resolveRequestUrl(path: string, base: string, origin?: string): string {
+  const combined = joinApiBase(base, path);
+  if (!origin) return combined;
+  try {
+    return new URL(combined, origin).href;
+  } catch {
+    return combined;
+  }
+}
+
+// 自动附带本地口令前必须确认最终请求目标与页面同源。
+// 显式配置了跨源 API_BASE、或 origin 不可解析（file:// 等）时一律不自动发口令，
+// 调用方显式传入的 Authorization 不受影响（由 api() 里 headers.has 的判断保留）。
+function isSameOriginRequest(path: string, base: string, origin: string): boolean {
+  try {
+    const target = new URL(joinApiBase(base, path), origin);
+    return target.origin === new URL(origin).origin;
+  } catch {
+    return false;
+  }
+}
+
+// AbortSignal.timeout 需要 Chrome 103+ / Safari 16+；缺失时用 AbortController + setTimeout 降级。
+// 降级路径返回 cleanup，确保请求结束后清掉定时器，不让 30 秒计时器留在后台。
+function createTimeoutAbort(): RequestAbort {
+  if (typeof ABORT_SIGNAL_STATICS.timeout === "function") {
+    return { signal: ABORT_SIGNAL_STATICS.timeout(REQUEST_TIMEOUT_MS), cleanup: () => {} };
   }
   if (typeof AbortController !== "undefined") {
     const ctrl = new AbortController();
-    setTimeout(() => ctrl.abort(), 30_000);
-    return ctrl.signal;
+    const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+    return { signal: ctrl.signal, cleanup: () => clearTimeout(timer) };
   }
-  return undefined;
+  return { signal: undefined, cleanup: () => {} };
+}
+
+// 组合调用方 signal 与超时 signal：优先 AbortSignal.any；不支持时用控制器 + once 监听器，
+// cleanup 同时清定时器并移除两个监听器，避免长页面里反复请求造成监听器泄漏。
+function createRequestAbort(external?: AbortSignal | null): RequestAbort {
+  const timeout = createTimeoutAbort();
+  if (!external) return timeout;
+  if (typeof ABORT_SIGNAL_STATICS.any === "function" && timeout.signal) {
+    return {
+      signal: ABORT_SIGNAL_STATICS.any([external, timeout.signal]),
+      cleanup: timeout.cleanup
+    };
+  }
+  if (typeof AbortController === "undefined") {
+    return { signal: external, cleanup: timeout.cleanup };
+  }
+  const ctrl = new AbortController();
+  const timeoutSignal = timeout.signal;
+  const onAbort = () => ctrl.abort();
+  if (external.aborted || (timeoutSignal && timeoutSignal.aborted)) {
+    ctrl.abort();
+  } else {
+    external.addEventListener("abort", onAbort, { once: true });
+    if (timeoutSignal) timeoutSignal.addEventListener("abort", onAbort, { once: true });
+  }
+  return {
+    signal: ctrl.signal,
+    cleanup: () => {
+      timeout.cleanup();
+      external.removeEventListener("abort", onAbort);
+      if (timeoutSignal) timeoutSignal.removeEventListener("abort", onAbort);
+    }
+  };
 }
 
 /**
@@ -66,27 +147,39 @@ export async function api<T>(path: string, options?: RequestInit): Promise<T> {
     throw new Error("API base is empty and window is undefined (cannot make relative origin requests)");
   }
 
+  const requestOrigin = typeof window !== "undefined" ? window.location.origin : undefined;
   const headers = new Headers(options?.headers);
-  // 调用方显式传了 Authorization 就尊重调用方；否则自动带设置页保存的操作口令，
-  // 这样 AI 鉴定、私有读模式等所有 API 请求都无需逐个页面手写凭据。
-  if (!headers.has("authorization")) {
+  // 调用方显式传了 Authorization 就尊重调用方；否则只对同源目标自动带设置页保存的操作口令。
+  // API_BASE 显式指向其他源时绝不自动外发口令，避免第三方域名拿到本地管理凭据。
+  if (
+    !headers.has("authorization") &&
+    requestOrigin &&
+    isSameOriginRequest(path, API_BASE, requestOrigin)
+  ) {
     const token = resolveWriteToken();
     if (token) headers.set("authorization", `Bearer ${token}`);
   }
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers,
-    // 没设超时的话，后端挂起会让页面永久转圈
-    signal: options?.signal ?? timeoutSignal()
-  });
+  const abort = createRequestAbort(options?.signal);
+  try {
+    const res = await fetch(resolveRequestUrl(path, API_BASE, requestOrigin), {
+      ...options,
+      headers,
+      // 调用方 signal 与 30 秒超时信号都要生效，任一触发都会中止请求
+      signal: abort.signal
+    });
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`${res.status} ${text.slice(0, 200)}`);
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`${res.status} ${text.slice(0, 200)}`);
+    }
+
+    // await 让 finally 等到响应体真正读完再清超时定时器，body 卡住时同样能中止
+    return await res.json();
+  } finally {
+    // 请求（含响应体读取）结束后清理降级定时器与监听器
+    abort.cleanup();
   }
-
-  return res.json();
 }
 
 export async function fetchRootComments(contentPk: string, opts?: { limit?: number; offset?: number }) {
@@ -100,4 +193,3 @@ export async function fetchChildComments(contentPk: string, rootId: string) {
     `/api/contents/${encodeURIComponent(contentPk)}/comments/${encodeURIComponent(rootId)}/children`
   );
 }
-

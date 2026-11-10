@@ -1574,7 +1574,10 @@ export async function getChildComments(
 ): Promise<ChildCommentRecord[]> {
   if (bucket) {
     const stored = await readStoredChildThread(bucket, rootId);
-    if (stored.status === "ok" && stored.children.length > 0) {
+    // complete=true 是原站确认的权威快照：即使 children 为空也必须直接返回 []，
+    // 不能回退 D1 里的历史子评论（那些行可能早已在原站删除）。
+    // 不完整对象只在确实读到子评论时返回，空的不完整对象仍走旧回退。
+    if (stored.status === "ok" && (stored.complete || stored.children.length > 0)) {
       // 历史 R2 对象可能只有 img 没有 img_url：两个字段都补齐，前端读任一都能取到图
       return stored.children.map(child => ({
         ...child,

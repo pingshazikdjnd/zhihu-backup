@@ -147,6 +147,54 @@ function sampleArray(arr, n) {
   return out;
 }
 
+/**
+ * 汇总所有「已检查」条目的落盘异常（纯函数，无 IO；由安全回归测试提取后隔离执行）。
+ *
+ * 只统计真正检查过的对象：
+ *   - html：missing / zeroSize / blobMissing / sizeMismatch
+ *   - threads：missing / zeroSize / blobMissing / parseFailures / childCountMismatch
+ *   - childJsonSample：missingBlob / parseFailures
+ * 未抓完的线程（child_count=0、thread_hash 为空、尚未进入 threadRows）不在检查范围，
+ * 不能被当作损坏统计；missing 中可能混有刚写入、R2 PUT 尚未完成的在途对象，
+ * 仅作为 inFlightHint 提示，统计上仍然算异常，不能据此宣称 100% 落盘。
+ */
+function summarizeReconAnomalies(recon) {
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const h = (recon && recon.html) || {};
+  const t = (recon && recon.threads) || {};
+  const c = (recon && recon.childJsonSample) || {};
+  const html = {
+    missing: num(h.missing),
+    zeroSize: num(h.zeroSize),
+    blobMissing: num(h.blobMissing),
+    sizeMismatch: num(h.sizeMismatch)
+  };
+  html.total = html.missing + html.zeroSize + html.blobMissing + html.sizeMismatch;
+  const threads = {
+    missing: num(t.missing),
+    zeroSize: num(t.zeroSize),
+    blobMissing: num(t.blobMissing),
+    parseFailures: num(t.parseFailures),
+    childCountMismatch: num(t.childCountMismatch)
+  };
+  threads.total =
+    threads.missing + threads.zeroSize + threads.blobMissing + threads.parseFailures + threads.childCountMismatch;
+  const childJsonSample = {
+    missingBlob: num(c.missingBlob),
+    parseFailures: num(c.parseFailures)
+  };
+  childJsonSample.total = childJsonSample.missingBlob + childJsonSample.parseFailures;
+  const total = html.total + threads.total + childJsonSample.total;
+  return {
+    total,
+    damaged: total > 0,
+    inFlightHint: num(h.missingLikelyInFlight) + num(t.missingLikelyInFlight),
+    html,
+    threads,
+    childJsonSample
+  };
+}
+
 function readWranglerUsername() {
   try {
     const p = path.join(WORKER_DIR, "wrangler.toml");
@@ -301,6 +349,7 @@ const changeEventsTotal = has("change_events")
 // 全量导入到线上 D1 需要写入的总行数（用于对照免费计划每日 10 万行写入额度）
 const IMPORT_ROW_TABLES = [
   "contents",
+  "image_tasks",
   "content_versions",
   "comments",
   "comment_versions",
@@ -606,6 +655,13 @@ const orphanBlobBytes = Math.max(0, diskBlobBytes - r2ActiveBytes);
 const classAUploadOnly = r2ActiveCount;
 const classAWorstCase = r2ActiveCount * 2;
 
+// 已检查项异常汇总：只有 total=0 才能声称 100% 落盘 / 具备上云条件
+const reconSummary = summarizeReconAnomalies({
+  html: htmlRecon,
+  threads: threadRecon,
+  childJsonSample
+});
+
 // ---------------------------------------------------------------------------
 // 报告
 // ---------------------------------------------------------------------------
@@ -651,6 +707,7 @@ const report = {
     followedMeta
   },
   reconciliation: {
+    summary: reconSummary,
     html: htmlRecon,
     threads: threadRecon,
     childJsonSample,
@@ -835,13 +892,18 @@ item(
 );
 item("R2 meta 对象", `${fmtInt(metaCount)} 个`, fmtBytes(metaBytes));
 
-const reconCritical = htmlRecon.missing + threadRecon.missing;
+const reconCritical = reconSummary.total;
 console.log("");
 if (reconCritical === 0) {
-  console.log("  对账结论：正文与楼中楼在本地 R2 均 100% 落盘，可安全进入打包上云阶段。");
+  console.log("  对账结论：已检查的正文与楼中楼对象全部落盘通过，可安全进入打包上云阶段。");
 } else {
-  console.log(`  对账结论：发现 ${fmtInt(reconCritical)} 个当前未落盘对象；若均标注“疑似在途”，`);
-  console.log("            说明后台扒取仍在写入，等全量跑完后复查一次归零即可。");
+  console.log(`  对账结论：发现 ${fmtInt(reconCritical)} 个已检查异常（缺失 / 0 字节 / blob 缺失 / 尺寸不符 / 解析失败 / child_count 不一致），`);
+  console.log("            属于损坏或数据不一致，当前状态不可用于打包上云。");
+  if (reconSummary.inFlightHint > 0) {
+    console.log(
+      `            其中 ${fmtInt(reconSummary.inFlightHint)} 个缺失标注为疑似在途；仍需等扒取结束后复查，不能全部归因于在途。`
+    );
+  }
 }
 
 section("三、Cloudflare 免费额度容量实算");
@@ -912,9 +974,9 @@ console.log(`  2. R2 当前 ${fmtInt(r2ActiveCount)} 个活跃对象 / ${fmtByte
 console.log(`  3. 上云一次全量 PUT 约 ${fmtInt(classAUploadOnly)} 次 Class A，仅占每月 100 万次的 ${(classAUploadOnly / 10_000).toFixed(2)}%。`);
 console.log(`  4. 全量导入约 ${fmtInt(importRowsTotal)} 行；D1 免费计划每日写入 10 万行，单日导入会受限，需升级 Workers Paid 或分两天续传。`);
 if (reconCritical === 0) {
-  console.log("  5. 正文 / 楼中楼对账 100% 通过，本地库具备上云条件（仍需等扒取全部结束并人工确认）。");
+  console.log("  5. 已检查的正文 / 楼中楼对象对账全部通过，本地库具备上云条件（仍需等扒取全部结束并人工确认）。");
 } else {
-  console.log(`  5. 仍有 ${fmtInt(reconCritical)} 个对象在途未落盘，建议等全量结束后重跑本脚本复查。`);
+  console.log(`  5. 发现 ${fmtInt(reconCritical)} 个已检查异常（损坏 / 数据不一致），不满足上云条件；请修复后重跑本脚本复查。`);
 }
 console.log("");
 console.log("提示：本脚本全程只读，未写入任何 SQLite / 文件，未发起任何网络请求。");

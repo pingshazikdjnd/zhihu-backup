@@ -3,13 +3,15 @@ import { db } from "../db.js";
 
 export const statsRoutes = new Hono();
 
-// 7 条 COUNT(*) 全表扫描，每次页面刷新都跑一遍会放大 D1 读取；
-// 60 秒内的重复请求直接返回缓存（统计数字对分钟级延迟不敏感）
+// 8 条 COUNT(*) 全表扫描，每次页面刷新都跑一遍会放大 D1 读取；
+// 60 秒内的重复请求直接返回缓存（统计数字对分钟级延迟不敏感）。
+// 采集编排需要看到「本轮刚写完」的数字时显式带 ?fresh=1 绕过缓存，响应字段保持不变。
 const STATS_CACHE_MS = 60_000;
 let cachedStats: { at: number; data: any } | null = null;
 
 statsRoutes.get("/", async c => {
-  if (cachedStats) {
+  const fresh = c.req.query("fresh") === "1";
+  if (!fresh && cachedStats) {
     const age = Date.now() - cachedStats.at;
     if (age >= 0 && age < STATS_CACHE_MS) {
       return c.json(cachedStats.data);
@@ -23,6 +25,7 @@ statsRoutes.get("/", async c => {
   const commentsCount = await db.prepare(`SELECT count(*) as c FROM comments WHERE is_deleted = 0`).get() as { c: number };
   const collectionsCount = await db.prepare(`SELECT count(*) as c FROM collections`).get() as { c: number };
   const collectionItemsCount = await db.prepare(`SELECT count(*) as c FROM collection_items WHERE is_removed = 0`).get() as { c: number };
+  const followedUsersCount = await db.prepare(`SELECT count(*) as c FROM followed_users`).get() as { c: number };
 
   const data = {
     total_contents: contentsCount.c,
@@ -31,7 +34,9 @@ statsRoutes.get("/", async c => {
     total_upvotes: upvotesCount.c,
     total_comments: commentsCount.c,
     total_collections: collectionsCount.c,
-    total_collection_items: collectionItemsCount.c
+    total_collection_items: collectionItemsCount.c,
+    // 附加字段：本地采集编排据此判断关注答主阶段是否有新增
+    total_followed_users: followedUsersCount.c
   };
   cachedStats = { at: Date.now(), data };
   return c.json(data);

@@ -35,6 +35,12 @@ type CollectionItem = {
 
 export default function CollectionDetailPage() {
   const { id = "" } = useParams();
+  // 用 key 让 id 变化时整页状态重建：A 收藏夹的 detail 不会短暂出现在 B 的 URL 下，
+  // 也不会因内部 detail 非空而跳过 B 的请求。
+  return <CollectionDetail key={id} id={id} />;
+}
+
+function CollectionDetail({ id }: { id: string }) {
   const cached = collectionsStore[id] || { data: null, scrollPosition: 0, visibleCount: 50 };
   
   const [detail, setDetail] = useState<any>(cached.data);
@@ -71,22 +77,34 @@ export default function CollectionDetailPage() {
 
   useEffect(() => {
     if (!id) return;
-    if (!detail) {
-      api<{ collection: any; items: any[]; snapshots: any[] }>(`/api/collections/${id}`).then(data => {
-        // Worker 对未知 id 返回 { collection: null, ...}：与网络错误区分开
-        if (!data?.collection) {
-          setLoadError("收藏夹不存在或已被删除");
-          return;
-        }
-        setDetail(data);
-        setLoadError("");
-        setVisibleCount(50);
-        collectionsStore[id] = { data, scrollPosition: 0, visibleCount: 50 };
-      }).catch((e: any) => {
-        setLoadError(e?.message || "收藏夹加载失败");
-      });
+    const entry = collectionsStore[id];
+    setVisibleCount(entry?.visibleCount ?? 50);
+    if (entry?.data) {
+      setDetail(entry.data);
+      setLoadError("");
+      return;
     }
-  }, [id, detail, retryKey]);
+    let alive = true;
+    setDetail(null);
+    setLoadError("");
+    api<{ collection: any; items: any[]; snapshots: any[] }>(`/api/collections/${id}`).then(data => {
+      if (!alive) return;
+      // Worker 对未知 id 返回 { collection: null, ...}：与网络错误区分开
+      if (!data?.collection) {
+        setLoadError("收藏夹不存在或已被删除");
+        return;
+      }
+      setDetail(data);
+      setLoadError("");
+      setVisibleCount(50);
+      // 只写闭包里的这个 id，旧请求回包不能写进当前 URL 对应的收藏夹
+      collectionsStore[id] = { data, scrollPosition: 0, visibleCount: 50 };
+    }).catch((e: any) => {
+      if (!alive) return;
+      setLoadError(e?.message || "收藏夹加载失败");
+    });
+    return () => { alive = false; };
+  }, [id, retryKey]);
 
   useEffect(() => {
     if (cached.scrollPosition > 0 && detail) {

@@ -15,7 +15,7 @@ import { dbContext } from "./db.js";
 import { getActiveWriteToken } from "./routes/auth.js";
 import { runAndRecord } from "./routes/sync.js";
 import { IMAGE_KEY_PREFIX, IMAGE_OBJECT_NAME_RE, contentTypeForImageName, isZhihuImageUrl } from "./services/images.js";
-import { findImageFallbackUrl, processImageBatch, IMAGE_TASK_BATCH_MAX_LIMIT } from "./services/image-tasks.js";
+import { findImageFallbackUrl, processImageBatch, IMAGE_TASK_BATCH_DEFAULT_LIMIT } from "./services/image-tasks.js";
 import type { Bindings } from "./types.js";
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -116,6 +116,12 @@ app.get("/api/images/*", async c => {
   headers.set("etag", object.httpEtag);
   headers.set("cache-control", "public, max-age=31536000, immutable");
   headers.set("x-content-type-options", "nosniff");
+  // SVG 可以内嵌脚本：直接内联打开会执行同源脚本。只对 .svg 强制下载 +
+  // 完全禁用子资源加载，其他图片保持原行为，不影响既有数据访问。
+  if (name.toLowerCase().endsWith(".svg")) {
+    headers.set("content-disposition", "attachment");
+    headers.set("content-security-policy", "default-src 'none'; sandbox");
+  }
   return new Response(object.body, { headers });
 });
 
@@ -150,7 +156,9 @@ async function scheduledHandler(_event: any, env: Bindings, _ctx: any) {
   const bucket = env.BUCKET;
   if (bucket) {
     try {
-      const images = await dbContext.run(env.DB, () => processImageBatch(bucket, IMAGE_TASK_BATCH_MAX_LIMIT));
+      // cron 用默认小批量：Free 计划单次 invocation 的子请求有限，
+      // 一次拉满 100 条图片任务容易把整次 cron 拖超限。
+      const images = await dbContext.run(env.DB, () => processImageBatch(bucket, IMAGE_TASK_BATCH_DEFAULT_LIMIT));
       if (images.claimed > 0) {
         console.log(
           `cron images: claimed=${images.claimed} done=${images.done} failed=${images.failed} retry=${images.retry}`

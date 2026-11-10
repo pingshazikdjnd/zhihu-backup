@@ -178,6 +178,7 @@ export function contentTypeForImageName(name: string): string {
  * 是否知乎图床域名（zhimg.com 及其子域）。
  * 入库改写与 /api/images/* 失败回退共用：只备份/重定向知乎图床，
  * 任意 URL 都 fetch 会让入库接口变成 SSRF 跳板，任意 URL 都 302 则可能变成开放重定向。
+ * 只接受 https：http 图片会降级为明文传输，且容易被中间人替换成任意字节。
  */
 export function isZhihuImageUrl(url: string): boolean {
   let parsed: URL;
@@ -186,7 +187,7 @@ export function isZhihuImageUrl(url: string): boolean {
   } catch {
     return false;
   }
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+  if (parsed.protocol !== "https:") return false;
   const host = parsed.hostname.toLowerCase();
   return host === "zhimg.com" || host.endsWith(".zhimg.com");
 }
@@ -405,8 +406,16 @@ async function fetchImage(
   try {
     res = await fetch(url, {
       signal: controller.signal,
+      // 不跟随重定向：知乎图床不应 3xx，跟随会放大 SSRF/开放重定向面。
+      // 3xx 一律按失败处理并显式 cancel body。
+      redirect: "manual",
       headers: { accept: "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5" }
     });
+    if (res.status >= 300 && res.status < 400) {
+      warnImage(`download ${url} rejected redirect with HTTP ${res.status}`);
+      await cancelResponseBody(res);
+      return null;
+    }
     if (!res.ok) {
       warnImage(`download ${url} failed with HTTP ${res.status}`);
       await cancelResponseBody(res);

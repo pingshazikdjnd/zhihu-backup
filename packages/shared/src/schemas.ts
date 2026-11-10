@@ -6,9 +6,19 @@ export const ContentTypeSchema = z.enum(["answer", "article", "pin"]);
 // sourceUrl 会被读接口原样返回给前端渲染，非 http(s) 协议就是存储型 XSS 载荷
 const HttpUrl = z.string().url().refine(
   (u) => {
-    try { const p = new URL(u).protocol; return p === "https:" || p === "http:"; } catch { return false; }
+    try {
+      const parsed = new URL(u);
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+      // 抓取端缺字段时会拼出 /question/undefined/、/answer/null 这类占位 URL。
+      // 只拒绝整段恰为 undefined/null 的路径段，普通单词（如 nullable）照常通过。
+      return !parsed.pathname
+        .split("/")
+        .some(segment => segment === "undefined" || segment === "null");
+    } catch {
+      return false;
+    }
   },
-  { message: "sourceUrl must be an http(s) URL" }
+  { message: "sourceUrl must be an http(s) URL without undefined/null path segments" }
 );
 
 export const IngestContentSchema = z.object({

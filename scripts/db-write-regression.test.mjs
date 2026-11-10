@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
@@ -129,6 +129,8 @@ class MemoryD1 {
   constructor(sqlite) {
     this.sqlite = sqlite;
     this.writes = [];
+    // 每个 batch 的语句清单：原子性回归用例据此刻画「几条语句同批提交」
+    this.batches = [];
   }
 
   prepare(sql) {
@@ -140,6 +142,10 @@ class MemoryD1 {
   }
 
   batch(statements) {
+    this.batches.push(statements.map(statement => ({
+      sql: statement.sql.replace(/\s+/g, " ").trim(),
+      params: [...statement.params]
+    })));
     const runAll = this.sqlite.transaction(() => statements.map(statement => {
       this.record(statement.sql, statement.params);
       const info = statement.execute();
@@ -149,25 +155,17 @@ class MemoryD1 {
   }
 }
 
-const schemaSql = readFileSync(
-  path.join(repoRoot, "apps", "worker", "migrations", "0000_schema.sql"),
-  "utf8"
-);
-const commentThreadsMigrationSql = readFileSync(
-  path.join(repoRoot, "apps", "worker", "migrations", "0004_comment_threads.sql"),
-  "utf8"
-);
-const appSettingsMigrationSql = readFileSync(
-  path.join(repoRoot, "apps", "worker", "migrations", "0001_app_settings.sql"),
-  "utf8"
-);
+// 按顺序加载 migrations 目录全部 0000~0005（node:fs 同步只读，绝不访问 .wrangler）
+const migrationsDir = path.join(repoRoot, "apps", "worker", "migrations");
+const migrationSql = readdirSync(migrationsDir)
+  .filter(name => /^000[0-5]_.*\.sql$/.test(name))
+  .sort()
+  .map(name => readFileSync(path.join(migrationsDir, name), "utf8"));
 
 function createMemoryDb() {
   const sqlite = new Database(":memory:");
   sqlite.pragma("foreign_keys = ON");
-  sqlite.exec(schemaSql);
-  sqlite.exec(appSettingsMigrationSql);
-  sqlite.exec(commentThreadsMigrationSql);
+  for (const sql of migrationSql) sqlite.exec(sql);
   return { sqlite, d1: new MemoryD1(sqlite) };
 }
 
@@ -212,6 +210,7 @@ const workerModules = await (async () => {
   const hash = await loadTs(path.join(workerSrc, "utils", "hash.ts"));
   const changes = await loadTs(path.join(workerSrc, "services", "changes.ts"));
   const comments = await loadTs(path.join(workerSrc, "services", "comments.ts"), honoOverrides);
+  const imageTasks = await loadTs(path.join(workerSrc, "services", "image-tasks.ts"), honoOverrides);
   const auth = await loadTs(path.join(workerSrc, "routes", "auth.ts"), honoOverrides);
   const collections = await loadTs(path.join(workerSrc, "services", "collections.ts"));
   const sharedIndexUrl = await moduleUrlFor(sharedIndexPath);
@@ -220,10 +219,10 @@ const workerModules = await (async () => {
     new Map([["shared", sharedIndexUrl]])
   );
   const schemas = await loadTs(sharedSchemasPath);
-  return { db, hash, changes, comments, auth, collections, contents, schemas };
+  return { db, hash, changes, comments, imageTasks, auth, collections, contents, schemas };
 })();
 
-const { db: dbModule, hash: hashModule, changes: changesModule, comments: commentsModule, collections: collectionsModule, contents: contentsModule } = workerModules;
+const { db: dbModule, hash: hashModule, changes: changesModule, comments: commentsModule, imageTasks: imageTasksModule, collections: collectionsModule, contents: contentsModule } = workerModules;
 
 const CONTENT_PK = "answer:1";
 const NOW_ISO = "2024-01-01T00:00:00.000Z";
@@ -587,6 +586,57 @@ test("单根楼中楼删光：R2 与 comment_threads 同步清空，不再显示
   assert.equal(thread.preview_json, "[]");
 });
 
+test("R2 楼中楼 complete=true 且 children 为空时返回 []，不回退 D1 历史子评论", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  sqlite.prepare(`
+    INSERT INTO comments (
+      id, content_pk, parent_comment_id, author_name, content_md, img_url,
+      time_text, location, likes, comment_hash, first_seen_at, last_seen_at, is_deleted
+    ) VALUES ('legacy-child', ?, 'r1', 'Old', 'legacy reply', '', '', '', 1, 'h', ?, ?, 0)
+  `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+
+  workerModules.auth.invalidateExternalTargetsCache();
+  const bucket = {
+    async get(key) {
+      if (key !== "childcomments/r1.json") return null;
+      return { async text() { return JSON.stringify({ children: [], complete: true }); } };
+    }
+  };
+
+  const children = await runWithDb(d1, () => commentsModule.getChildComments(bucket, "r1", d1));
+  assert.deepEqual(children, [], "complete 快照为空时必须以 R2 为准，不得回退 D1 旧子评论");
+  assert.equal(
+    sqlite.prepare(`SELECT COUNT(*) AS n FROM comments WHERE id = 'legacy-child'`).get().n,
+    1,
+    "读取路径不得删除任何 D1 历史子评论"
+  );
+});
+
+test("R2 楼中楼读取失败时 getChildComments 仍回退 D1 历史子评论", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  sqlite.prepare(`
+    INSERT INTO comments (
+      id, content_pk, parent_comment_id, author_name, content_md, img_url,
+      time_text, location, likes, comment_hash, first_seen_at, last_seen_at, is_deleted
+    ) VALUES ('legacy-child', ?, 'r1', 'Old', 'legacy reply', '', '', '', 1, 'h', ?, ?, 0)
+  `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+
+  workerModules.auth.invalidateExternalTargetsCache();
+  const bucket = {
+    async get() {
+      throw new Error("r2 read boom");
+    }
+  };
+
+  const children = await quietly(() =>
+    runWithDb(d1, () => commentsModule.getChildComments(bucket, "r1", d1))
+  );
+  assert.deepEqual(children.map(child => child.id), ["legacy-child"]);
+  assert.equal(children[0].content, "legacy reply");
+});
+
 test("完整载荷的评论数 0 如实落库，弱载荷（无正文）仍保护旧值", async () => {
   const { sqlite, d1 } = createMemoryDb();
 
@@ -659,6 +709,269 @@ test("弱数据源未传 isCollapsed/isLabeled 时保留原值，不产生伪变
     versionsBefore,
     "未传字段不应追加快照版本"
   );
+});
+
+test("新建正文：contents、版本快照与 content.created 事件在同一个 batch 原子提交", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  const result = await runWithDb(d1, () => contentsModule.upsertContent(contentInput()));
+
+  assert.equal(result.created, true);
+  assert.equal(d1.batches.length, 1, `新建正文必须只提交 1 个 batch，实际 ${d1.batches.length} 个`);
+  const sqls = d1.batches[0].map(item => item.sql);
+  assert.equal(sqls.length, 3, `期望 3 条语句同批，实际：${sqls.join(" | ")}`);
+  assert.match(sqls[0], /^INSERT INTO contents/i);
+  assert.match(sqls[1], /^INSERT INTO content_versions/i);
+  assert.match(sqls[2], /^INSERT INTO change_events/i);
+  assert.equal(
+    sqlite.prepare(`SELECT COUNT(*) AS n FROM content_versions WHERE content_pk = ?`).get(CONTENT_PK).n,
+    1
+  );
+  assert.equal(
+    sqlite.prepare(`SELECT event_type FROM change_events`).get().event_type,
+    "content.created"
+  );
+});
+
+test("无正文新建：只提交 contents + content.created 两条语句，仍为单 batch", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  await runWithDb(d1, () =>
+    contentsModule.upsertContent(contentInput({ contentHtml: "", contentMd: "" }))
+  );
+
+  assert.equal(d1.batches.length, 1);
+  assert.equal(d1.batches[0].length, 2, `期望 2 条语句同批，实际：${d1.batches[0].map(s => s.sql).join(" | ")}`);
+  assert.match(d1.batches[0][0].sql, /^INSERT INTO contents/i);
+  assert.match(d1.batches[0][1].sql, /^INSERT INTO change_events/i);
+  assert.equal(
+    sqlite.prepare(`SELECT COUNT(*) AS n FROM content_versions WHERE content_pk = ?`).get(CONTENT_PK).n,
+    0
+  );
+});
+
+test("正文更新：content.updated 事件与正文、版本快照同批提交，无 batch 外事件写入", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  await runWithDb(d1, () => contentsModule.upsertContent(contentInput()));
+  d1.writes.length = 0;
+  d1.batches.length = 0;
+
+  const result = await runWithDb(d1, () =>
+    contentsModule.upsertContent(contentInput({ contentMd: "body changed", voteupCount: 6 }))
+  );
+
+  assert.equal(result.changed, true);
+  assert.equal(d1.batches.length, 1, "更新必须只提交 1 个 batch");
+  const sqls = d1.batches[0].map(item => item.sql);
+  assert.equal(sqls.length, 3, `期望 UPDATE + 版本 + 事件同批，实际：${sqls.join(" | ")}`);
+  assert.match(sqls[0], /^UPDATE contents/i);
+  assert.match(sqls[1], /^INSERT INTO content_versions/i);
+  assert.match(sqls[2], /^INSERT INTO change_events/i);
+  assert.equal(d1.writes.length, 3, "所有写入都必须来自批次，不得在 batch 外单独 emitChange");
+  assert.equal(
+    sqlite.prepare(`SELECT COUNT(*) AS n FROM change_events WHERE event_type = 'content.updated'`).get().n,
+    1
+  );
+});
+
+test("HttpUrl：拒绝路径段恰为 undefined/null 的占位 URL，nullable 等普通单词照常通过", () => {
+  const { schemas } = workerModules;
+  const base = { sourceType: "answer", sourceId: "1" };
+
+  assert.doesNotThrow(() => schemas.IngestContentSchema.parse({
+    ...base,
+    sourceUrl: "https://www.zhihu.com/question/123/answer/456"
+  }));
+  assert.doesNotThrow(() => schemas.IngestContentSchema.parse({
+    ...base,
+    sourceUrl: "https://www.zhihu.com/answer/nullable"
+  }));
+  assert.throws(() => schemas.IngestContentSchema.parse({
+    ...base,
+    sourceUrl: "https://www.zhihu.com/question/undefined/answer/1"
+  }), "路径段 undefined 必须拒绝");
+  assert.throws(() => schemas.IngestContentSchema.parse({
+    ...base,
+    sourceUrl: "https://www.zhihu.com/question/null/answer/1"
+  }), "路径段 null 必须拒绝");
+});
+
+test("更新载荷带 undefined/null 占位 URL 时保留库里已有的正确 source_url", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  await runWithDb(d1, () => contentsModule.upsertContent(contentInput()));
+  const original = sqlite.prepare(`SELECT source_url FROM contents WHERE pk = ?`).get(CONTENT_PK).source_url;
+  assert.equal(original, "https://www.zhihu.com/answer/1");
+
+  await runWithDb(d1, () => contentsModule.upsertContent(contentInput({
+    sourceUrl: "https://www.zhihu.com/question/undefined/answer/1",
+    voteupCount: 6
+  })));
+  assert.equal(
+    sqlite.prepare(`SELECT source_url FROM contents WHERE pk = ?`).get(CONTENT_PK).source_url,
+    original,
+    "undefined 占位 URL 不得覆盖已有正确 URL"
+  );
+
+  await runWithDb(d1, () => contentsModule.upsertContent(contentInput({
+    sourceUrl: "https://www.zhihu.com/question/null/answer/1",
+    voteupCount: 7
+  })));
+  assert.equal(
+    sqlite.prepare(`SELECT source_url FROM contents WHERE pk = ?`).get(CONTENT_PK).source_url,
+    original,
+    "null 占位 URL 不得覆盖已有正确 URL"
+  );
+});
+
+function seedImageTask(sqlite, { imageUrl, objectKey, status, attempts, updatedAt }) {
+  const info = sqlite.prepare(`
+    INSERT INTO image_tasks (content_pk, image_url, object_key, status, attempts, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(CONTENT_PK, imageUrl, objectKey, status, attempts, updatedAt, updatedAt);
+  return Number(info.lastInsertRowid);
+}
+
+const HOUR_MS = 60 * 60 * 1000;
+
+test("图片任务：failed 冷却 6 小时后才重排，attempts 归零并刷新签名 URL，其他状态不动", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  const old = new Date(Date.now() - 7 * HOUR_MS).toISOString();
+  const recent = new Date(Date.now() - 1 * HOUR_MS).toISOString();
+  const keys = {
+    old: `images/${"a".repeat(64)}.jpg`,
+    recent: `images/${"b".repeat(64)}.jpg`,
+    done: `images/${"c".repeat(64)}.jpg`,
+    pending: `images/${"d".repeat(64)}.jpg`,
+    processing: `images/${"e".repeat(64)}.jpg`
+  };
+  seedImageTask(sqlite, { imageUrl: "https://picx.zhimg.com/old.jpg?sign=1", objectKey: keys.old, status: "failed", attempts: 3, updatedAt: old });
+  seedImageTask(sqlite, { imageUrl: "https://picx.zhimg.com/recent.jpg?sign=1", objectKey: keys.recent, status: "failed", attempts: 3, updatedAt: recent });
+  seedImageTask(sqlite, { imageUrl: "https://picx.zhimg.com/done.jpg?sign=1", objectKey: keys.done, status: "done", attempts: 1, updatedAt: old });
+  seedImageTask(sqlite, { imageUrl: "https://picx.zhimg.com/pending.jpg?sign=1", objectKey: keys.pending, status: "pending", attempts: 0, updatedAt: old });
+  seedImageTask(sqlite, { imageUrl: "https://picx.zhimg.com/proc.jpg?sign=1", objectKey: keys.processing, status: "processing", attempts: 1, updatedAt: recent });
+
+  const tasks = Object.entries(keys).map(([name, objectKey]) => ({
+    objectKey,
+    imageUrl: `https://picx.zhimg.com/${name}.jpg?sign=2`
+  }));
+  const inserted = await runWithDb(d1, () => imageTasksModule.enqueueImageTasks(CONTENT_PK, tasks));
+  assert.equal(inserted, 0);
+
+  const getRow = objectKey =>
+    sqlite.prepare(`SELECT status, attempts, image_url FROM image_tasks WHERE object_key = ?`).get(objectKey);
+
+  const oldRow = getRow(keys.old);
+  assert.equal(oldRow.status, "pending", "冷却期满的 failed 行必须重排");
+  assert.equal(oldRow.attempts, 0, "重排必须重置 attempts");
+  assert.equal(oldRow.image_url, "https://picx.zhimg.com/old.jpg?sign=2", "重排必须刷新为本次签名 URL");
+
+  const recentRow = getRow(keys.recent);
+  assert.equal(recentRow.status, "failed", "冷却期内的 failed 行不得重排");
+  assert.equal(recentRow.attempts, 3);
+  assert.equal(recentRow.image_url, "https://picx.zhimg.com/recent.jpg?sign=1");
+
+  assert.deepEqual(
+    { status: getRow(keys.done).status, attempts: getRow(keys.done).attempts, image_url: getRow(keys.done).image_url },
+    { status: "done", attempts: 1, image_url: "https://picx.zhimg.com/done.jpg?sign=1" }
+  );
+  assert.deepEqual(
+    { status: getRow(keys.pending).status, attempts: getRow(keys.pending).attempts, image_url: getRow(keys.pending).image_url },
+    { status: "pending", attempts: 0, image_url: "https://picx.zhimg.com/pending.jpg?sign=1" }
+  );
+  assert.deepEqual(
+    { status: getRow(keys.processing).status, attempts: getRow(keys.processing).attempts, image_url: getRow(keys.processing).image_url },
+    { status: "processing", attempts: 1, image_url: "https://picx.zhimg.com/proc.jpg?sign=1" }
+  );
+});
+
+test("图片任务重排按数据库当前 status='failed' 做 CAS，过期预读不会复活 done 行", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  const key = `images/${"f".repeat(64)}.jpg`;
+  const old = new Date(Date.now() - 7 * HOUR_MS).toISOString();
+  const storedUrl = "https://picx.zhimg.com/done.jpg?sign=old";
+  seedImageTask(sqlite, { imageUrl: storedUrl, objectKey: key, status: "done", attempts: 1, updatedAt: old });
+
+  // 模拟「SELECT 之后、UPDATE 之前」该行被其他消费者改成 done：预读结果仍声称 failed
+  const staleD1 = {
+    prepare(sql) {
+      if (/^SELECT object_key, status, attempts FROM image_tasks/i.test(sql.trim())) {
+        const stale = {
+          bind: () => stale,
+          all: async () => ({ results: [{ object_key: key, status: "failed", attempts: 3 }] })
+        };
+        return stale;
+      }
+      return d1.prepare(sql);
+    },
+    batch: statements => d1.batch(statements)
+  };
+
+  const inserted = await runWithDb(staleD1, () => imageTasksModule.enqueueImageTasks(
+    CONTENT_PK,
+    [{ objectKey: key, imageUrl: "https://picx.zhimg.com/done.jpg?sign=new" }]
+  ));
+  assert.equal(inserted, 0);
+
+  const row = sqlite.prepare(
+    `SELECT status, attempts, image_url FROM image_tasks WHERE object_key = ?`
+  ).get(key);
+  assert.equal(row.status, "done", "CAS 必须挡住已经变成 done 的行");
+  assert.equal(row.attempts, 1);
+  assert.equal(row.image_url, storedUrl);
+  assert.ok(
+    d1.batches.some(batch => batch.some(statement =>
+      /AND status = 'failed' AND updated_at </i.test(statement.sql)
+    )),
+    "重排队 SQL 必须带 status='failed' 与冷却阈值的 CAS 条件"
+  );
+});
+
+test("图片任务领取：候选条件 UPDATE 合并为单个 batch，按各自 meta.changes 只取成功者", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  const stale = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const fresh = new Date().toISOString();
+  const imageUrl = "https://not-zhihu.example/image.jpg";
+  const ids = [
+    seedImageTask(sqlite, { imageUrl, objectKey: `images/${"1".repeat(64)}.jpg`, status: "pending", attempts: 0, updatedAt: stale }),
+    seedImageTask(sqlite, { imageUrl, objectKey: `images/${"2".repeat(64)}.jpg`, status: "pending", attempts: 0, updatedAt: stale }),
+    seedImageTask(sqlite, { imageUrl, objectKey: `images/${"3".repeat(64)}.jpg`, status: "processing", attempts: 1, updatedAt: stale }),
+    seedImageTask(sqlite, { imageUrl, objectKey: `images/${"4".repeat(64)}.jpg`, status: "processing", attempts: 1, updatedAt: fresh })
+  ];
+
+  let batchCalls = 0;
+  const batchSizes = [];
+  const countingD1 = {
+    prepare: sql => d1.prepare(sql),
+    batch: statements => {
+      batchCalls++;
+      batchSizes.push(statements.length);
+      if (batchCalls === 1) {
+        // 模拟并发消费者在 batch 提交前抢先领走第 2 条候选
+        sqlite.prepare(`
+          UPDATE image_tasks
+          SET status = 'processing', attempts = attempts + 1, updated_at = ?
+          WHERE id = ?
+        `).run(new Date(Date.now() - 5 * 60 * 1000).toISOString(), ids[1]);
+      }
+      return d1.batch(statements);
+    }
+  };
+
+  const bucket = {
+    async get() { return null; },
+    async head() { return null; },
+    async put() {},
+    async delete() {}
+  };
+
+  const result = await runWithDb(countingD1, () =>
+    imageTasksModule.processImageBatch(bucket, 10)
+  );
+
+  assert.equal(batchCalls, 1, "领取阶段必须只发 1 个 D1 batch");
+  assert.equal(batchSizes[0], 3, "候选只能包含 2 条 pending + 1 条超时 processing");
+  assert.equal(result.claimed, 2, "被并发抢走的任务必须按各自 meta.changes 剔除");
 });
 
 test("评论事件即使调用方传入完整评论对象也只保留引用字段", async () => {

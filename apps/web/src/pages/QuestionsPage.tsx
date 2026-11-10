@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../lib/api.js";
 import { questionsStore } from "../lib/store.js";
@@ -56,6 +56,17 @@ function QuestionList() {
   const [activeQ, setActiveQ] = useState(questionsStore.q);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
+  // 列表请求序号：搜索/清除/翻页/卸载都会作废旧请求，旧回包不得再写 rows/page/total/store
+  const reqIdRef = useRef(0);
+  const aliveRef = useRef(true);
+
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      reqIdRef.current++;
+    };
+  }, []);
 
   useEffect(() => {
     window.scrollTo(0, questionsStore.scrollPosition);
@@ -67,13 +78,16 @@ function QuestionList() {
   }, []);
 
   const fetchPage = async (p: number, queryStr = activeQ) => {
+    const seq = ++reqIdRef.current;
     setIsLoading(true);
     setError("");
     try {
       const qs = new URLSearchParams({ page: String(p) });
       if (queryStr.trim()) qs.set("q", queryStr.trim());
       const res = await api<{ data: QuestionRow[]; total?: number }>(`/api/questions?${qs.toString()}`);
+      if (!aliveRef.current || seq !== reqIdRef.current) return;
       setRows(prev => {
+        if (!aliveRef.current || seq !== reqIdRef.current) return prev;
         const next = p === 1 ? res.data : [...prev, ...res.data];
         questionsStore.list = next;
         return next;
@@ -85,9 +99,10 @@ function QuestionList() {
         questionsStore.total = res.total;
       }
     } catch (e: any) {
+      if (!aliveRef.current || seq !== reqIdRef.current) return;
       setError(e?.message || "问题列表加载失败");
     } finally {
-      setIsLoading(false);
+      if (aliveRef.current && seq === reqIdRef.current) setIsLoading(false);
     }
   };
 

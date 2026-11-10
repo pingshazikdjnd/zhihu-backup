@@ -6,7 +6,7 @@
  * 1. 读取项目根目录 .env.local（或环境变量）中的 WORKER_URL、API_SECRET 与代理配置
  * 2. 自动探测 HTTPS_PROXY 端口是否存活：存活则自动携带 --use-env-proxy 使 Node fetch
  *    访问 *.workers.dev 走代理（Playwright 抓知乎仍走国内直连防风控）；未启动则自动回退直连
- * 3. 单实例 PID 文件锁（防止后台计划任务与手动运行并发冲突）
+ * 3. 单实例原子文件锁（wx 占位，先于 INPUT 清理 / 代理探测 / 网络 / 编译）
  * 4. 请求线上 Worker 的 GET /ingest/sync-state，自动获取：
  *    - D1 中最新的 zhihu_cookie（网页端扫码/更新后自动生效）
  *    - 当前赞同断点游标 upvotes_cursor（从上次中断处继续向旧历史翻页）
@@ -32,6 +32,12 @@ const INPUT_JSON_PATH = path.join(KV_DEFAULT_DIR, "INPUT.json");
 // 云端租约应急释放句柄：main() 抢锁成功后注册，底部 catch 兜底调用，
 // 保证未进入主 try 之前的异常/提前返回也不会把锁白占 15 分钟。
 let emergencyReleaseCloudLock = null;
+// 本地文件锁状态：只有本进程真正用 wx 原子写入的锁才允许释放。
+// token 用于释放前校验，避免 PID 复用或误删其他进程刚接管的锁。
+let lockWritten = false;
+let localLockToken = null;
+// 代理自重启时：父进程是否持有本地锁由它传给子进程
+let ownsLocalLock = false;
 // 锁最多信任 12 小时：PID 被系统复用、或断电后残留的锁文件，
 // 会让后续所有定时同步都被判成「已在运行」而永久跳过。
 const LOCK_TTL_MS = 12 * 60 * 60 * 1000;
@@ -64,6 +70,84 @@ function isPidAlive(pid) {
   }
 }
 
+/** 读取锁文件（损坏/不存在返回 null）；只读 pid/startedAt/token，不含任何凭据 */
+function readLocalLock() {
+  try {
+    const data = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
+    return data && typeof data === "object" ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 只释放本进程写入的锁：PID + token 双重校验。
+ * 若锁已被其他进程接管/替换，直接放弃 unlink，绝不误删别人的锁。
+ */
+function releaseLocalLock() {
+  if (!lockWritten) return;
+  lockWritten = false;
+  const token = localLockToken;
+  localLockToken = null;
+  try {
+    const data = readLocalLock();
+    if (!data || data.pid !== process.pid || !token || data.token !== token) return;
+    fs.unlinkSync(LOCK_FILE);
+  } catch {
+    /* 锁文件已不存在或不可读：忽略 */
+  }
+}
+
+/** 用 wx 原子占位；返回 false 表示锁已被其他进程持有（EEXIST） */
+function tryCreateLocalLock() {
+  const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  try {
+    fs.writeFileSync(
+      LOCK_FILE,
+      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), token }),
+      { encoding: "utf8", flag: "wx" }
+    );
+    localLockToken = token;
+    lockWritten = true;
+    return true;
+  } catch (err) {
+    if (err?.code === "EEXIST") return false;
+    throw err;
+  }
+}
+
+/**
+ * 原子抢占本地文件锁。必须先于 INPUT 清理 / 代理自重启 / 网络请求 / tsc 编译执行。
+ * EEXIST 时保留陈旧锁清理逻辑（PID 已死或超过 TTL）：删除后重试一次，
+ * 仍抢不到就友好跳过。返回 { ok, owned }；owned=false 表示父进程已持锁、本进程仅继承。
+ */
+function acquireLocalLock() {
+  if (process.env.__LOCAL_SYNC_LOCK_INHERITED === "1") {
+    // 代理自重启的子进程：锁由父进程在 spawn 前持有，子进程不得重复创建/释放
+    return { ok: true, owned: false };
+  }
+  if (tryCreateLocalLock()) return { ok: true, owned: true };
+
+  const lockData = readLocalLock();
+  const startedAtMs = Date.parse(lockData?.startedAt || "");
+  const fresh = Number.isFinite(startedAtMs) && Date.now() - startedAtMs < LOCK_TTL_MS;
+  if (lockData && isPidAlive(lockData.pid) && fresh) {
+    console.log(`⏭️ 已有本地同步任务正在运行 (PID: ${lockData.pid}, 启动于 ${lockData.startedAt})，本次跳过。`);
+    return { ok: false, owned: false };
+  }
+  console.log(
+    `⚠️ 检测到陈旧锁文件 (PID: ${lockData?.pid ?? "未知"}, 启动于 ${lockData?.startedAt ?? "未知"})，自动接管。`
+  );
+  try {
+    fs.unlinkSync(LOCK_FILE);
+  } catch {
+    /* 可能已被其他进程清理 */
+  }
+  if (tryCreateLocalLock()) return { ok: true, owned: true };
+  console.log("⏭️ 本地同步锁刚被其他进程接管，本次跳过。");
+  return { ok: false, owned: false };
+}
+
 async function isProxyReachable(proxyUrl) {
   try {
     const u = new URL(proxyUrl);
@@ -90,7 +174,7 @@ async function isProxyReachable(proxyUrl) {
   }
 }
 
-async function main() {
+async function runMain() {
   // 0. 启动前清理磁盘上任何历史残留的 INPUT.json（上一轮断电/强杀可能留下明文
   //    apiSecret 与 cookieString）。只删不读，杜绝凭据进入日志或任何处理路径。
   fs.rmSync(INPUT_JSON_PATH, { force: true });
@@ -109,7 +193,8 @@ async function main() {
             env: {
               ...process.env,
               NODE_USE_ENV_PROXY: "1",
-              __LOCAL_SYNC_PROXY_BOOTSTRAPPED: "1"
+              __LOCAL_SYNC_PROXY_BOOTSTRAPPED: "1",
+              ...(ownsLocalLock ? { __LOCAL_SYNC_LOCK_INHERITED: "1" } : {})
             }
           }
         );
@@ -149,21 +234,7 @@ async function main() {
     return;
   }
 
-  // 3. 单实例文件锁检查（防止计划任务与手动运行并发冲突）
-  if (!dryRun && fs.existsSync(LOCK_FILE)) {
-    try {
-      const lockData = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
-      const startedAtMs = Date.parse(lockData.startedAt);
-      const fresh = Number.isFinite(startedAtMs) && Date.now() - startedAtMs < LOCK_TTL_MS;
-      if (isPidAlive(lockData.pid) && fresh) {
-        console.log(`⏭️ 已有本地同步任务正在运行 (PID: ${lockData.pid}, 启动于 ${lockData.startedAt})，本次跳过。`);
-        return;
-      }
-      console.log(
-        `⚠️ 检测到陈旧锁文件 (PID: ${lockData.pid ?? "未知"}, 启动于 ${lockData.startedAt ?? "未知"})，自动接管。`
-      );
-    } catch { /* ignore broken lock */ }
-  }
+  // 3. 本地锁已在 main() 入口、任何 INPUT 清理 / 代理探测 / 网络 / 编译之前原子持有
 
   const apiUrl = (process.env.WORKER_URL || "").replace(/\/$/, "");
   const apiSecret = process.env.API_SECRET || "";
@@ -310,7 +381,6 @@ async function main() {
     // INPUT.json 里是 apiSecret / cookieString 明文，只在「编译 → 启动爬虫」期间存在。
     // 内层 try/finally 覆盖所有出口（正常结束 / --dry-run / 编译失败 / 异常中断），
     // 保证运行结束后磁盘上不残留凭据。
-    let lockWritten = false;
     try {
       fs.writeFileSync(
         INPUT_JSON_PATH,
@@ -337,9 +407,7 @@ async function main() {
         return;
       }
 
-      // 写入单实例锁
-      fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }), "utf8");
-      lockWritten = true;
+      // 单实例锁已在 main() 入口、任何网络/编译/INPUT 操作之前用 wx 原子持有
 
       // 6. 启动本地爬虫（dist/main.js）
       console.log("🚀 开始本地同步（Playwright 直连知乎 + 自动写入云端 D1/R2，零 Apify 额度消耗）...\n");
@@ -371,14 +439,27 @@ async function main() {
     } finally {
       // 明文凭据清理放在 finally：任何 return / throw 都会走到
       fs.rmSync(INPUT_JSON_PATH, { force: true });
-      if (lockWritten) {
-        try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ }
-      }
     }
   } finally {
     // 主动释放云端租约：不释放就要等 15 分钟自然过期，期间所有同步都会被 409 拒绝。
     // 放在最外层 finally，保证 sync-state 网络错误 / JSON 解析异常也一定会释放。
     await releaseCloudLock();
+  }
+}
+
+/**
+ * 入口：在任何 INPUT 清理 / 代理自重启 / 网络请求 / 编译之前原子抢占本地文件锁。
+ * dryRun 只读预检不占锁；runMain 内所有 return/throw 都由这里的 finally 只清理本进程锁。
+ */
+async function main() {
+  const earlyDryRun = process.argv.slice(2).includes("--dry-run");
+  const lockState = earlyDryRun ? { ok: true, owned: false } : acquireLocalLock();
+  if (!lockState.ok) return;
+  ownsLocalLock = lockState.owned;
+  try {
+    await runMain();
+  } finally {
+    if (lockState.owned) releaseLocalLock();
   }
 }
 

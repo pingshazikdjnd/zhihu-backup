@@ -25,9 +25,17 @@ export default function ContentsPage() {
   const [hasMoreAnswers, setHasMoreAnswers] = useState(contentsStore.hasMoreAnswers);
   const [hasMoreUpvotes, setHasMoreUpvotes] = useState(contentsStore.hasMoreUpvotes);
   
-  const [isLoading, setIsLoading] = useState(false);
+  // 列表与搜索各自独立的 loading：搜索请求结束不能把列表的“加载更多”状态提前清掉
+  const [listLoading, setListLoading] = useState(false);
+  const [searchLoading, setSearchLoading] = useState(false);
   const [error, setError] = useState("");
   const observer = useRef<IntersectionObserver | null>(null);
+  // answers/upvotes 各自独立序号；所有异步回包先校验序号与当前 tab，旧排序/旧分页不得追加进新列表
+  const answersReqRef = useRef(0);
+  const upvotesReqRef = useRef(0);
+  const activeTabRef = useRef<"answers" | "upvotes">(activeTab);
+  // 记录在途的列表页 key（tab:page:sort），防止 IntersectionObserver 在 React 重渲染前重复发起同一页
+  const inFlightRef = useRef<string | null>(null);
 
   // 全文搜索（命中标题/问题标题/正文纯文本）
   const [keyword, setKeyword] = useState(urlQ);
@@ -66,12 +74,12 @@ export default function ContentsPage() {
     setSearchError("");
     if (!kw) {
       setSearchResults(null);
-      // 清空关键字会作废在途请求，它回包后不会再清 loading，这里主动收尾
-      setIsLoading(false);
+      // 清空关键字会作废在途请求，它回包后不会再清搜索 loading，这里主动收尾
+      setSearchLoading(false);
       return;
     }
     const timer = setTimeout(async () => {
-      setIsLoading(true);
+      setSearchLoading(true);
       try {
         const res = await api<{ data: any[]; total?: number }>(`/api/contents?q=${encodeURIComponent(kw)}`);
         if (seq !== searchSeqRef.current) return;
@@ -82,8 +90,10 @@ export default function ContentsPage() {
           setSearchError(e?.message || "搜索请求失败");
           setSearchResults(null);
         }
+      } finally {
+        // 只结束自己这一轮搜索，绝不触碰列表 loading
+        if (seq === searchSeqRef.current) setSearchLoading(false);
       }
-      if (seq === searchSeqRef.current) setIsLoading(false);
     }, 300);
     return () => clearTimeout(timer);
   }, [keyword]);
@@ -101,6 +111,7 @@ export default function ContentsPage() {
   }, []);
 
   useEffect(() => {
+    activeTabRef.current = activeTab;
     contentsStore.activeTab = activeTab;
   }, [activeTab]);
 
@@ -108,8 +119,17 @@ export default function ContentsPage() {
     contentsStore.sortBy = sortBy;
   }, [sortBy]);
 
+  const requestKey = (tab: "answers" | "upvotes", page: number, sort: "time" | "vote") =>
+    `${tab}:${page}:${sort}`;
+
+  // 回包是否仍属于当前 tab 的这一轮请求：序号被更新的请求或切 tab 作废时返回 false
+  const isCurrentRequest = (seq: number, ref: { current: number }, tab: "answers" | "upvotes") =>
+    seq === ref.current && activeTabRef.current === tab;
+
   const fetchAnswers = async (page: number, sort = sortBy) => {
-    setIsLoading(true);
+    const seq = ++answersReqRef.current;
+    inFlightRef.current = requestKey("answers", page, sort);
+    setListLoading(true);
     setError("");
     try {
       // 直接由服务端按 Worker 的 ZHIHU_USERNAME 精准过滤本人创作（回答 + 专栏文章），
@@ -117,6 +137,7 @@ export default function ContentsPage() {
       const envAuthor = (import.meta.env.VITE_ZHIHU_USERNAME as string | undefined) || "";
       const authorQuery = envAuthor ? `&author=${encodeURIComponent(envAuthor)}` : "&mine=1";
       const res = await api<{ data: any[]; total?: number }>(`/api/contents?page=${page}${authorQuery}&sort=${sort}`);
+      if (!isCurrentRequest(seq, answersReqRef, "answers")) return;
       const myAnswers = res.data;
 
       if (typeof res.total === "number") setAnswersTotal(res.total);
@@ -130,6 +151,7 @@ export default function ContentsPage() {
       }
 
       setAnswersData(prev => {
+        if (!isCurrentRequest(seq, answersReqRef, "answers")) return prev;
         const next = page === 1 ? myAnswers : [...prev, ...myAnswers];
         contentsStore.answersData = next;
         return next;
@@ -138,17 +160,24 @@ export default function ContentsPage() {
       setAnswersPage(page);
       contentsStore.answersPage = page;
     } catch (e: any) {
+      if (!isCurrentRequest(seq, answersReqRef, "answers")) return;
       setError(e?.message || "内容列表加载失败");
     } finally {
-      setIsLoading(false);
+      if (isCurrentRequest(seq, answersReqRef, "answers")) {
+        inFlightRef.current = null;
+        setListLoading(false);
+      }
     }
   };
 
   const fetchUpvotes = async (page: number, sort = sortBy) => {
-    setIsLoading(true);
+    const seq = ++upvotesReqRef.current;
+    inFlightRef.current = requestKey("upvotes", page, sort);
+    setListLoading(true);
     setError("");
     try {
       const res = await api<{ data: any[] }>(`/api/upvotes?page=${page}&sort=${sort}`);
+      if (!isCurrentRequest(seq, upvotesReqRef, "upvotes")) return;
 
       if (res.data.length < 50) {
         setHasMoreUpvotes(false);
@@ -159,6 +188,7 @@ export default function ContentsPage() {
       }
 
       setUpvotesData(prev => {
+        if (!isCurrentRequest(seq, upvotesReqRef, "upvotes")) return prev;
         const next = page === 1 ? res.data : [...prev, ...res.data];
         contentsStore.upvotesData = next;
         return next;
@@ -167,17 +197,53 @@ export default function ContentsPage() {
       setUpvotesPage(page);
       contentsStore.upvotesPage = page;
     } catch (e: any) {
+      if (!isCurrentRequest(seq, upvotesReqRef, "upvotes")) return;
       setError(e?.message || "赞同列表加载失败");
     } finally {
-      setIsLoading(false);
+      if (isCurrentRequest(seq, upvotesReqRef, "upvotes")) {
+        inFlightRef.current = null;
+        setListLoading(false);
+      }
     }
+  };
+
+  // 切 tab 时作废旧 tab 在途请求，并复位列表 loading，避免旧请求的 finally 永远清不到新 tab
+  const handleTabChange = (nextTab: "answers" | "upvotes") => {
+    if (nextTab === activeTab) return;
+    answersReqRef.current++;
+    upvotesReqRef.current++;
+    inFlightRef.current = null;
+    setListLoading(false);
+    setError("");
+    activeTabRef.current = nextTab;
+    setActiveTab(nextTab);
+    contentsStore.activeTab = nextTab;
   };
 
   const handleSortChange = (nextSort: "time" | "vote") => {
     if (nextSort === sortBy) return;
     setSortBy(nextSort);
+    contentsStore.sortBy = nextSort;
     contentsStore.scrollPosition = 0;
     window.scrollTo(0, 0);
+    // 两个 tab 的旧排序缓存一起作废并复位，切回另一 tab 时它也会按新排序重新拉第一页
+    answersReqRef.current++;
+    upvotesReqRef.current++;
+    inFlightRef.current = null;
+    setAnswersData([]);
+    setUpvotesData([]);
+    setAnswersPage(1);
+    setUpvotesPage(1);
+    setHasMoreAnswers(true);
+    setHasMoreUpvotes(true);
+    contentsStore.answersData = [];
+    contentsStore.upvotesData = [];
+    contentsStore.answersPage = 1;
+    contentsStore.upvotesPage = 1;
+    contentsStore.hasMoreAnswers = true;
+    contentsStore.hasMoreUpvotes = true;
+    setListLoading(false);
+    setError("");
     if (activeTab === "answers") {
       fetchAnswers(1, nextSort);
     } else {
@@ -185,36 +251,46 @@ export default function ContentsPage() {
     }
   };
 
-  // Initial load
+  // Initial load（只在切 tab 时触发；搜索输入变化不会误触列表请求）
   useEffect(() => {
     if (activeTab === "answers" && answersData.length === 0) fetchAnswers(1);
     if (activeTab === "upvotes" && upvotesData.length === 0) fetchUpvotes(1);
   }, [activeTab]);
 
   // Load more trigger
-  const lastElementRef = useCallback((node: HTMLAnchorElement) => {
+  const lastElementRef = useCallback((node: HTMLAnchorElement | null) => {
+    // 节点卸载/切 tab 时断开观察器，避免旧哨兵继续触发请求
+    if (!node) {
+      observer.current?.disconnect();
+      observer.current = null;
+      return;
+    }
     // 上一次请求失败时不能再挂 observer：否则哨兵元素持续可见，
     // 失败 -> 重挂 -> 再失败，形成无限请求风暴
-    if (isLoading || error) return;
+    if (listLoading || searchLoading || error || keyword.trim()) return;
     if (observer.current) observer.current.disconnect();
     observer.current = new IntersectionObserver(entries => {
-      if (entries[0].isIntersecting && !isLoading && !error) {
-        // 页码只在请求成功后由 fetchAnswers/fetchUpvotes 提交。
-        // 之前在 setState updater 里 +1 并顺带 fetch：updater 同步执行而
-        // 页码回滚只在成功时——一次网络失败就永久跳过那一页（50 条无感丢失），
-        // StrictMode 下 updater 双调用还会同页抓两次
-        if (activeTab === "answers" && hasMoreAnswers) {
-          fetchAnswers(answersPage + 1);
-        } else if (activeTab === "upvotes" && hasMoreUpvotes) {
-          fetchUpvotes(upvotesPage + 1);
-        }
+      if (!entries[0]?.isIntersecting || listLoading || searchLoading || error || keyword.trim()) return;
+      // 页码只在请求成功后由 fetchAnswers/fetchUpvotes 提交。
+      // 之前在 setState updater 里 +1 并顺带 fetch：updater 同步执行而
+      // 页码回滚只在成功时——一次网络失败就永久跳过那一页（50 条无感丢失），
+      // StrictMode 下 updater 双调用还会同页抓两次
+      if (activeTab === "answers" && hasMoreAnswers) {
+        const nextPage = answersPage + 1;
+        if (inFlightRef.current === requestKey("answers", nextPage, sortBy)) return;
+        fetchAnswers(nextPage);
+      } else if (activeTab === "upvotes" && hasMoreUpvotes) {
+        const nextPage = upvotesPage + 1;
+        if (inFlightRef.current === requestKey("upvotes", nextPage, sortBy)) return;
+        fetchUpvotes(nextPage);
       }
     });
     if (node) observer.current.observe(node);
-  }, [isLoading, error, hasMoreAnswers, hasMoreUpvotes, activeTab, answersPage, upvotesPage]);
+  }, [listLoading, searchLoading, error, keyword, hasMoreAnswers, hasMoreUpvotes, activeTab, answersPage, upvotesPage, sortBy]);
 
   const currentItems = searchResults !== null ? searchResults : (activeTab === "answers" ? answersData : upvotesData);
   const sortedItems = currentItems;
+  const loadingVisible = searchResults !== null ? searchLoading : listLoading;
 
   const parseDateStr = (val: any) => {
     if (!val) return "";
@@ -256,10 +332,10 @@ export default function ContentsPage() {
       )}
       <div className="tab-bar" style={{ justifyContent: "space-between" }}>
         <div style={{ display: "flex", gap: 24, height: "100%" }}>
-          <button className={`tab ${activeTab === "answers" ? "active" : ""}`} onClick={() => setActiveTab("answers")}>
+          <button className={`tab ${activeTab === "answers" ? "active" : ""}`} onClick={() => handleTabChange("answers")}>
             我回答的内容{answersTotal !== null && <span style={{ marginLeft: 6, fontSize: 13, color: "var(--zhihu-meta)", fontWeight: 400 }}>{answersTotal}</span>}
           </button>
-          <button className={`tab ${activeTab === "upvotes" ? "active" : ""}`} onClick={() => setActiveTab("upvotes")}>我赞同的内容</button>
+          <button className={`tab ${activeTab === "upvotes" ? "active" : ""}`} onClick={() => handleTabChange("upvotes")}>我赞同的内容</button>
         </div>
         <div className="tab-right" style={{ display: "flex", gap: 8, alignItems: "center" }}>
           {searchResults !== null && (
@@ -322,8 +398,8 @@ export default function ContentsPage() {
             </Link>
           );
         })}
-        {isLoading && <p className="loading-state">加载中...</p>}
-        {!isLoading && sortedItems.length === 0 && !searchError && (
+        {loadingVisible && <p className="loading-state">加载中...</p>}
+        {!loadingVisible && sortedItems.length === 0 && !searchError && (
           <p className="empty-state">
             {searchResults !== null ? `没有找到匹配「${keyword}」的内容` : "这里空空如也~"}
           </p>

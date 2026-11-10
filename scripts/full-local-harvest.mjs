@@ -389,19 +389,41 @@ async function resolveLocalSecret() {
   );
 }
 
-async function fetchStats(secret = "") {
+/** /api/stats 路径；fresh=true 时带 ?fresh=1 绕过 Worker 60 秒缓存（纯函数：供隔离测试） */
+function statsPath(fresh = false) {
+  return fresh ? "/api/stats?fresh=1" : "/api/stats";
+}
+
+/**
+ * 解析 /api/stats 响应（纯函数）。
+ * 旧版 Worker 没有 total_followed_users 时返回 null（未知），绝不按 0 参与增长判断；
+ * 其余既有字段缺失仍按 0 兜底，保持历史兼容。
+ */
+function parseStatsPayload(json) {
+  if (!json || typeof json !== "object") return null;
+  const count = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const knownCount = (v) => {
+    if (v === null || v === undefined || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  return {
+    contents: count(json.total_contents),
+    answers: count(json.total_answers),
+    articles: count(json.total_articles),
+    comments: count(json.total_comments),
+    collections: count(json.total_collections),
+    collection_items: count(json.total_collection_items),
+    upvotes: count(json.total_upvotes),
+    followed_users: knownCount(json.total_followed_users)
+  };
+}
+
+async function fetchStats(secret = "", fresh = false) {
   try {
-    const { res, json } = await localRequest("/api/stats", {}, secret, 15_000);
-    if (!res.ok || !json || typeof json !== "object") return null;
-    return {
-      contents: Number(json.total_contents) || 0,
-      answers: Number(json.total_answers) || 0,
-      articles: Number(json.total_articles) || 0,
-      comments: Number(json.total_comments) || 0,
-      collections: Number(json.total_collections) || 0,
-      collection_items: Number(json.total_collection_items) || 0,
-      upvotes: Number(json.total_upvotes) || 0
-    };
+    const { res, json } = await localRequest(statsPath(fresh), {}, secret, 15_000);
+    if (!res.ok) return null;
+    return parseStatsPayload(json);
   } catch {
     return null;
   }
@@ -804,16 +826,26 @@ function isUnhumanRisk(tail) {
   return /40352|account\/unhuman|unhuman/i.test(String(tail || ""));
 }
 
-/** 本轮正向进展：contents / comments / collection_items / upvotes 任一增长 */
+/** 本轮正向进展：contents / comments / collection_items / upvotes / followed_users 任一增长 */
+const STATS_PROGRESS_KEYS = ["contents", "comments", "collection_items", "upvotes", "followed_users"];
+
 function diffStatsProgress(before, after) {
   if (!after) return { grown: [], comparable: false };
   if (!before) return { grown: ["stats_unavailable_before"], comparable: false };
+  const numeric = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
   const grown = [];
-  for (const key of ["contents", "comments", "collection_items", "upvotes"]) {
-    const delta = (after[key] || 0) - (before[key] || 0);
+  let compared = 0;
+  for (const key of STATS_PROGRESS_KEYS) {
+    const a = numeric(after[key]);
+    const b = numeric(before[key]);
+    // 指标未知（旧版 Worker 没有 followed_users / 历史进度缺失）时跳过该指标，
+    // 绝不把缺失当成 0，否则会把「未知」误判成 0 增长或负增长。
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+    compared += 1;
+    const delta = a - b;
     if (delta > 0) grown.push(`${key}+${delta}`);
   }
-  return { grown, comparable: true };
+  return { grown, comparable: compared > 0 };
 }
 
 function humanVerificationHint() {
@@ -1121,14 +1153,15 @@ async function runStageWithCooldown(stage, ctx, progress) {
       log(`🔁 ${stage.id} 第 ${round}/${MAX_COOLDOWN_ROUNDS} 轮 | 冷却后续跑，已入库条目会自动 0 请求秒跳过`);
     }
 
-    const statsBefore = await fetchStats(ctx.secret);
+    // 本轮开始/结束的统计必须绕过 60s 缓存：否则短阶段会读到同一份缓存，把真实增长误判为 0
+    const statsBefore = await fetchStats(ctx.secret, true);
     entry.attempts = (entry.attempts || 0) + 1;
     const roundStartedAt = Date.now();
     const { code, tail } = await runCrawlerStage(stage, ctx);
     const roundMs = Date.now() - roundStartedAt;
     const riskTerminal = detectRiskTerminal(tail);
     const partialRisk = isPartialRisk(code, tail);
-    const statsAfter = await fetchStats(ctx.secret);
+    const statsAfter = await fetchStats(ctx.secret, true);
     // 赞同阶段以 upvotes_cursor 是否清空为完成标准；其他阶段以退出码 + 终态标记判断
     const remainingCursor = isUpvotes
       ? (await fetchLocalSyncState(ctx.secret).catch(() => null))?.upvotesCursor || null

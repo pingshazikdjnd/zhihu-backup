@@ -28,7 +28,10 @@ export default function RecommendPage() {
   const [aiLoadingPk, setAiLoadingPk] = useState<string | null>(null);
   const [similarMap, setSimilarMap] = useState<Record<string, any[]>>(recommendStore.similarCache);
   const [similarLoadingPk, setSimilarLoadingPk] = useState<string | null>(null);
+  const [similarError, setSimilarError] = useState<Record<string, string>>({});
   const reqIdRef = useRef(0);
+  // 每个 pk 独立序号：并行查找不同条目时，旧响应/旧 finally 不得覆盖新结果或清掉别人的 loading
+  const similarSeqRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
     window.scrollTo(0, recommendStore.scrollPosition);
@@ -113,16 +116,31 @@ export default function RecommendPage() {
       });
       return;
     }
+    const seq = (similarSeqRef.current[pk] || 0) + 1;
+    similarSeqRef.current[pk] = seq;
     setSimilarLoadingPk(pk);
+    setSimilarError(prev => {
+      if (!prev[pk]) return prev;
+      const next = { ...prev };
+      delete next[pk];
+      return next;
+    });
     try {
       const res = await api<{ data: any[] }>(`/api/recommend/similar/${encodeURIComponent(pk)}`);
+      if (similarSeqRef.current[pk] !== seq) return;
       setSimilarMap(prev => {
         const next = { ...prev, [pk]: res.data || [] };
         recommendStore.similarCache = next;
         return next;
       });
+    } catch (err: any) {
+      if (similarSeqRef.current[pk] !== seq) return;
+      setSimilarError(prev => ({ ...prev, [pk]: err?.message || "查找相似回答失败" }));
     } finally {
-      setSimilarLoadingPk(null);
+      // 只结束自己这个 pk 的 loading；并行查找其它条目时不能被旧请求提前清掉
+      if (similarSeqRef.current[pk] === seq) {
+        setSimilarLoadingPk(prev => (prev === pk ? null : prev));
+      }
     }
   };
 
@@ -283,6 +301,23 @@ export default function RecommendPage() {
                       ))}
                     </div>
                   )}
+                </div>
+              )}
+
+              {similarError[item.pk] && (
+                <div
+                  onClick={e => { e.preventDefault(); e.stopPropagation(); }}
+                  style={{
+                    marginTop: 10,
+                    padding: "10px 14px",
+                    borderRadius: 8,
+                    background: "rgba(220,38,38,0.06)",
+                    border: "1px solid rgba(220,38,38,0.2)",
+                    color: "#dc2626",
+                    fontSize: 13
+                  }}
+                >
+                  找相似失败：{similarError[item.pk]}
                 </div>
               )}
 

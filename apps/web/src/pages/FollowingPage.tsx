@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../lib/api.js";
 import { followingStore, recommendStore } from "../lib/store.js";
@@ -99,6 +99,9 @@ function FollowingHome() {
   const [togglingToken, setTogglingToken] = useState<string | null>(null);
   const [aiResults, setAiResults] = useState<Record<string, any>>(recommendStore.aiCache);
   const [aiLoadingPk, setAiLoadingPk] = useState<string | null>(null);
+  // 关注列表与动态流共用 loading/error，因此共用一个请求序号：
+  // 切 tab/搜索/切换 onlyRisk 时旧回包不得再覆盖新列表或清掉新请求的 loading
+  const listReqRef = useRef(0);
 
   useEffect(() => {
     window.scrollTo(0, followingStore.scrollPosition);
@@ -110,6 +113,7 @@ function FollowingHome() {
   }, []);
 
   const loadUsers = async (q = userQ, mode = modeFilter) => {
+    const seq = ++listReqRef.current;
     setLoading(true);
     setError("");
     try {
@@ -117,24 +121,28 @@ function FollowingHome() {
       if (q.trim()) qs.set("q", q.trim());
       if (mode) qs.set("mode", mode);
       const res = await api<{ users: any[]; summary: any }>(`/api/following/users?${qs.toString()}`);
+      if (seq !== listReqRef.current) return;
       setUsers(res.users || []);
       setSummary(res.summary || null);
       followingStore.users = res.users || [];
       followingStore.summary = res.summary || null;
     } catch (e: any) {
+      if (seq !== listReqRef.current) return;
       setError(e?.message || "加载关注列表失败");
     } finally {
-      setLoading(false);
+      if (seq === listReqRef.current) setLoading(false);
     }
   };
 
   const loadFeed = async (onlyRisk: boolean) => {
+    const seq = ++listReqRef.current;
     setLoading(true);
     setError("");
     try {
       const res = await api<{ data: any[]; total: number }>(
         `/api/following/feed?page=1${onlyRisk ? "&only_risk=1" : ""}`
       );
+      if (seq !== listReqRef.current) return;
       if (onlyRisk) {
         setRiskFeed(res.data || []);
         followingStore.riskFeed = res.data || [];
@@ -143,9 +151,10 @@ function FollowingHome() {
         followingStore.feed = res.data || [];
       }
     } catch (e: any) {
+      if (seq !== listReqRef.current) return;
       setError(e?.message || "加载关注动态失败");
     } finally {
-      setLoading(false);
+      if (seq === listReqRef.current) setLoading(false);
     }
   };
 
@@ -471,24 +480,48 @@ function FollowedUserDetail({ urlToken }: { urlToken: string }) {
   const cached = followingStore.userDetailCache[urlToken];
   const [data, setData] = useState<any>(cached?.data || null);
   const [onlyRisk, setOnlyRisk] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const [toggling, setToggling] = useState(false);
+  // 每次请求独立序号；onlyRisk 切换或 urlToken 改变后，旧响应不得覆盖新数据/loading/error
+  const seqRef = useRef(0);
+  const urlTokenRef = useRef(urlToken);
+  urlTokenRef.current = urlToken;
+
+  useEffect(() => () => {
+    // 卸载时作废在途请求，避免回包后继续 setState
+    seqRef.current++;
+  }, []);
 
   const loadDetail = async (riskOnly = onlyRisk) => {
+    const seq = ++seqRef.current;
+    const requestToken = urlToken;
     setLoading(true);
+    setLoadError("");
     try {
       const res = await api<any>(
-        `/api/following/users/${encodeURIComponent(urlToken)}?page=1${riskOnly ? "&only_risk=1" : ""}`
+        `/api/following/users/${encodeURIComponent(requestToken)}?page=1${riskOnly ? "&only_risk=1" : ""}`
       );
+      if (seq !== seqRef.current || requestToken !== urlTokenRef.current) return;
+      // 网络错误走 catch；只有接口明确返回没有 user 时才提示未找到
+      if (!res?.user) {
+        delete followingStore.userDetailCache[requestToken];
+        setData(null);
+        setLoadError("未找到该答主");
+        return;
+      }
       setData(res);
       if (!riskOnly) {
-        followingStore.userDetailCache[urlToken] = {
+        followingStore.userDetailCache[requestToken] = {
           data: res,
-          scrollPosition: followingStore.userDetailCache[urlToken]?.scrollPosition || 0
+          scrollPosition: followingStore.userDetailCache[requestToken]?.scrollPosition || 0
         };
       }
+    } catch (e: any) {
+      if (seq !== seqRef.current || requestToken !== urlTokenRef.current) return;
+      setLoadError(e?.message || "加载答主详情失败");
     } finally {
-      setLoading(false);
+      if (seq === seqRef.current && requestToken === urlTokenRef.current) setLoading(false);
     }
   };
 
@@ -515,6 +548,7 @@ function FollowedUserDetail({ urlToken }: { urlToken: string }) {
       await postUserModeWithAuth(urlToken, nextMode);
       followingStore.users = [];
       followingStore.summary = null;
+      // loadDetail 自己 catch 并展示 loadError，避免这里再弹一次“切换失败”
       await loadDetail(onlyRisk);
     } catch (e: any) {
       if (e?.message !== "已取消密码验证") {
@@ -525,8 +559,20 @@ function FollowedUserDetail({ urlToken }: { urlToken: string }) {
     }
   };
 
-  if (!data && loading) return <div className="loading-state">加载中...</div>;
-  if (!data?.user) return <div className="empty-state">未找到该答主</div>;
+  if (!data?.user) {
+    if (loading) return <div className="loading-state">加载中...</div>;
+    return (
+      <div className="loading-state">
+        <p style={{ marginBottom: 12 }}>{loadError || "未找到该答主"}</p>
+        <button
+          onClick={() => loadDetail(onlyRisk)}
+          style={{ padding: "8px 20px", border: "none", borderRadius: 6, background: "var(--zhihu-blue)", color: "#fff", cursor: "pointer" }}
+        >
+          重试
+        </button>
+      </div>
+    );
+  }
 
   const u = data.user;
   const isFull = u.sync_mode === "full";
@@ -538,6 +584,15 @@ function FollowedUserDetail({ urlToken }: { urlToken: string }) {
       <button className="back-fab" onClick={() => window.history.back()}>
         ← <span>返回</span>
       </button>
+
+      {loadError && (
+        <div className="card" style={{ color: "var(--zhihu-red)", fontSize: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
+          <span>{loadError}</span>
+          <button type="button" className="btn-ghost" disabled={loading} onClick={() => loadDetail(onlyRisk)}>
+            {loading ? "重试中…" : "重试"}
+          </button>
+        </div>
+      )}
 
       <div className="card" style={{ marginBottom: 10 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>

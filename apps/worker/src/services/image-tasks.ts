@@ -16,6 +16,8 @@ import {
  *
  * 状态机：pending → processing → done / failed
  * - 下载失败先回到 pending（下一批重试），累计 MAX_IMAGE_TASK_ATTEMPTS 次才置 failed；
+ * - failed 行不会自动复活：后续 ingest 重新入队时，仅当 updated_at 早于 6 小时冷却阈值，
+ *   才按数据库当前 status='failed' 做 CAS 并重置 attempts / 刷新签名 URL；
  * - processing 超过 10 分钟视为执行者已死（Worker 超时/重载），下一批可以重新领取；
  * - done 行保留：既是「重同步不再入队」的去重依据，也为 /api/images/* 缺失时
  *   回退到原始外链提供查询线索。
@@ -31,6 +33,9 @@ const IMAGE_TASK_KICK_TOTAL_LIMIT = 16;
 
 const MAX_IMAGE_TASK_ATTEMPTS = 3;
 const PROCESSING_STALE_MS = 10 * 60 * 1000;
+// failed 任务的重试冷却：下载失败往往是图床临时故障，重同步同一篇正文时
+// 立刻重排队会在几分钟内把 attempts 再次打满。冷却期过后才允许重新入队。
+const FAILED_RETRY_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 export type ImageTaskStatus = "pending" | "processing" | "done" | "failed";
 
@@ -66,9 +71,10 @@ function warnTasks(message: string, err?: unknown): void {
 /**
  * 把一篇正文的图片任务写进队列。
  *
- * 重同步同一篇正文时只补插新对象名：已 done 的不再下载，failed 且未超次数的
- * 重新排队。已存在行刻意不刷新 image_url（签名 query 每轮都变），否则每次
- * 同步都会产生 N 条无意义的 UPDATE。
+ * 重同步同一篇正文时只补插新对象名：已 done 的不再下载；failed 且已过冷却期
+ * （updated_at 早于 6 小时前）的重新排队，attempts 归零并刷新为本次的新签名 URL。
+ * 重排队用条件 UPDATE 按数据库当前 status='failed' 做 CAS，防止读取后状态被
+ * 其他消费者改掉时误复活；done/pending/processing 行完全不动。
  */
 export async function enqueueImageTasks(
   contentPk: string,
@@ -77,6 +83,7 @@ export async function enqueueImageTasks(
   if (!tasks.length) return 0;
 
   const now = new Date().toISOString();
+  const retryBefore = new Date(Date.now() - FAILED_RETRY_COOLDOWN_MS).toISOString();
   const existing = await db.prepare(
     `SELECT object_key, status, attempts FROM image_tasks WHERE content_pk = ?`
   ).all<{ object_key: string; status: string; attempts: number }>(contentPk);
@@ -95,13 +102,15 @@ export async function enqueueImageTasks(
       inserted += 1;
       continue;
     }
-    // 上次彻底失败但还没到重试上限：重新排队（顺带换成这轮的新签名 URL）
-    if (row.status === "failed" && row.attempts < MAX_IMAGE_TASK_ATTEMPTS) {
+    // 冷却期已过的 failed 行：重置 attempts、换成本轮新签名 URL 后重新排队。
+    // WHERE 里的 status 条件是 CAS：预读之后该行被并发改成 done/processing 时不会误改。
+    if (row.status === "failed") {
       stmts.push(db.prepare(`
         UPDATE image_tasks
-        SET status = 'pending', image_url = ?, updated_at = ?
+        SET status = 'pending', attempts = 0, image_url = ?, updated_at = ?
         WHERE content_pk = ? AND object_key = ?
-      `).raw(task.imageUrl, now, contentPk, task.objectKey));
+          AND status = 'failed' AND updated_at < ?
+      `).raw(task.imageUrl, now, contentPk, task.objectKey, retryBefore));
     }
   }
 
@@ -111,7 +120,10 @@ export async function enqueueImageTasks(
 
 /**
  * 领取一批任务：pending 或「processing 超时未更新」的都算可领。
- * 条件 UPDATE 是乐观锁：并发两个消费者抢同一条时只有一个能拿到（changes=1）。
+ * 所有候选的条件 UPDATE 放进同一个 db.batch 提交（不再逐条 await）：
+ * 100 条候选只产生 1 次 D1 往返，避免撞 Workers 子请求上限。
+ * 条件 UPDATE 仍是乐观锁：并发两个消费者抢同一条时只有一个 changes=1，
+ * 这里按 batch 返回数组里各自的 meta.changes 只取真正抢到的行。
  */
 async function claimImageTasks(limit: number): Promise<ImageTaskRow[]> {
   const staleBefore = new Date(Date.now() - PROCESSING_STALE_MS).toISOString();
@@ -124,16 +136,16 @@ async function claimImageTasks(limit: number): Promise<ImageTaskRow[]> {
   `).all<ImageTaskRow>(staleBefore, limit);
   if (!candidates.length) return [];
 
-  const claimed: ImageTaskRow[] = [];
   const now = new Date().toISOString();
-  for (const row of candidates) {
-    const result = await db.prepare(`
-      UPDATE image_tasks
-      SET status = 'processing', attempts = attempts + 1, updated_at = ?
-      WHERE id = ? AND status = ? AND updated_at = ?
-    `).run(now, row.id, row.status, row.updated_at);
-    const changed = Number(result?.meta?.changes ?? 0);
-    if (changed > 0) claimed.push(row);
+  const results = await db.batch(candidates.map(row => db.prepare(`
+    UPDATE image_tasks
+    SET status = 'processing', attempts = attempts + 1, updated_at = ?
+    WHERE id = ? AND status = ? AND updated_at = ?
+  `).raw(now, row.id, row.status, row.updated_at)));
+
+  const claimed: ImageTaskRow[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    if (Number(results?.[i]?.meta?.changes ?? 0) > 0) claimed.push(candidates[i]);
   }
   return claimed;
 }
