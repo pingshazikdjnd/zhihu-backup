@@ -271,6 +271,67 @@ function runWithDb(d1, fn) {
   return dbModule.dbContext.run(d1, fn);
 }
 
+/** 迁移前写在 D1 comments 里的旧扁平子评论行（parent_comment_id 指向根） */
+function insertLegacyChild(sqlite, { id, rootId = "r1", content, likes = 1, isDeleted = 0 }) {
+  sqlite.prepare(`
+    INSERT INTO comments (
+      id, content_pk, parent_comment_id, author_name, content_md, img_url,
+      time_text, location, likes, comment_hash, first_seen_at, last_seen_at, is_deleted
+    ) VALUES (?, ?, ?, 'Legacy', ?, '', '', '', ?, 'legacy-hash', ?, ?, ?)
+  `).run(id, CONTENT_PK, rootId, content, likes, NOW_ISO, NOW_ISO, isDeleted);
+}
+
+/** 带读写计数的内存 R2，store 用 Map<string,string> */
+function makeTrackedBucket(initialEntries = []) {
+  const store = new Map(initialEntries);
+  const stats = { gets: 0, puts: 0, deletes: 0 };
+  const bucket = {
+    async get(key) {
+      stats.gets++;
+      const value = store.get(key);
+      return value === undefined ? null : { async text() { return value; } };
+    },
+    async put(key, value) {
+      stats.puts++;
+      store.set(key, String(value));
+    },
+    async delete(key) {
+      stats.deletes++;
+      store.delete(key);
+    }
+  };
+  return { bucket, store, stats };
+}
+
+/** replaceCommentsByRoot 的完整根评论 payload */
+function rootPayload({ children = [], childCount = children.length, isChildrenComplete = true, partial = false, allRootIds = ["r1"] } = {}) {
+  return {
+    contentPk: CONTENT_PK,
+    partial,
+    allRootIds,
+    roots: [{
+      id: "r1",
+      author: "RootUser",
+      authorAvatar: "",
+      content: "root body",
+      img: "",
+      time: NOW_ISO,
+      location: "",
+      likes: 10,
+      isAuthor: false,
+      isTop: false,
+      isFeatured: false,
+      childCount,
+      isChildrenComplete,
+      children
+    }]
+  };
+}
+
+function childComment(id, content = `reply ${id}`) {
+  return { id, parentId: "r1", author: "A", content, likes: 1, isAuthor: false };
+}
+
 // ---------- 评论写入 ----------
 
 test("重复发送 NULL 时间/位置的评论产生 0 条 UPDATE", async () => {
@@ -584,6 +645,167 @@ test("单根楼中楼删光：R2 与 comment_threads 同步清空，不再显示
   assert.equal(thread.child_count, 0);
   assert.equal(thread.is_complete, 1);
   assert.equal(thread.preview_json, "[]");
+});
+
+test("complete-empty：旧扁平 D1 子评论 + 无线程索引时建立 R2 空快照与计数 0，读取 API 不回退旧行", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  insertLegacyChild(sqlite, { id: "legacy-child", content: "legacy reply" });
+  const { bucket, store, stats } = makeTrackedBucket();
+
+  const result = await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(
+    rootPayload({ children: [], childCount: 0, isChildrenComplete: true }),
+    { DB: d1, BUCKET: bucket }
+  ));
+
+  assert.equal(result.r2Puts, 1, "权威空快照必须写入 complete-empty R2 对象");
+  assert.equal(stats.puts, 1);
+  const stored = JSON.parse(store.get("childcomments/r1.json"));
+  assert.deepEqual(stored.children, []);
+  assert.equal(stored.complete, true);
+
+  const thread = sqlite.prepare(`SELECT child_count, is_complete, preview_json FROM comment_threads WHERE root_id = 'r1'`).get();
+  assert.equal(thread.child_count, 0, "即使原先没有线程索引也必须建立 child_count=0 的索引");
+  assert.equal(thread.is_complete, 1);
+  assert.equal(thread.preview_json, "[]");
+
+  const children = await runWithDb(d1, () => commentsModule.getChildComments(bucket, "r1", d1));
+  assert.deepEqual(children, [], "complete-empty 快照必须阻止读取 API 回退旧 D1 子评论");
+  assert.equal(
+    sqlite.prepare(`SELECT COUNT(*) AS n FROM comments WHERE id = 'legacy-child'`).get().n,
+    1,
+    "清空 R2/索引时不得删除 D1 旧子评论行"
+  );
+});
+
+test("complete-empty：R2 有旧子评论但线程计数被人为置 0 时仍清除旧对象与索引", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  const { bucket, store, stats } = makeTrackedBucket();
+
+  // 先正常同步一条子评论，再把线程计数人为改成 0（模拟旧迁移/人工修复留下的不一致）
+  await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(
+    rootPayload({ children: [childComment("ch1")], childCount: 1, isChildrenComplete: true }),
+    { DB: d1, BUCKET: bucket }
+  ));
+  sqlite.prepare(`UPDATE comment_threads SET child_count = 0 WHERE root_id = 'r1'`).run();
+  const putsBefore = stats.puts;
+
+  const result = await quietly(() => runWithDb(d1, () => commentsModule.replaceCommentsByRoot(
+    rootPayload({ children: [], childCount: 0, isChildrenComplete: true }),
+    { DB: d1, BUCKET: bucket }
+  )));
+
+  assert.equal(result.r2Puts, 1, "不能因为 child_count 已经是 0 就跳过 R2 清空");
+  assert.equal(stats.puts, putsBefore + 1);
+  const stored = JSON.parse(store.get("childcomments/r1.json"));
+  assert.deepEqual(stored.children, []);
+  assert.equal(stored.complete, true);
+  const thread = sqlite.prepare(`SELECT child_count, is_complete FROM comment_threads WHERE root_id = 'r1'`).get();
+  assert.equal(thread.child_count, 0);
+  assert.equal(thread.is_complete, 1);
+});
+
+test("complete-empty：第二遍同输入命中快路径，0 次 R2 PUT / 0 条线程写入", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  const { bucket, stats } = makeTrackedBucket();
+
+  await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(
+    rootPayload({ children: [], childCount: 0, isChildrenComplete: true }),
+    { DB: d1, BUCKET: bucket }
+  ));
+
+  const statsAfterFirst = { ...stats };
+  d1.writes.length = 0;
+  const second = await quietly(() => runWithDb(d1, () => commentsModule.replaceCommentsByRoot(
+    rootPayload({ children: [], childCount: 0, isChildrenComplete: true }),
+    { DB: d1, BUCKET: bucket }
+  )));
+
+  assert.equal(second.r2Puts, 0, "重复 complete-empty 不得再次 PUT R2");
+  assert.equal(second.threadUpserts, 0, "重复 complete-empty 不得写 comment_threads");
+  assert.equal(stats.puts, statsAfterFirst.puts);
+  assert.equal(stats.gets, statsAfterFirst.gets, "快路径不得读取 R2");
+  assert.equal(d1.writes.length, 0, "快路径不得产生任何 D1 写入");
+});
+
+test("partial 合并：R2 missing 时把旧扁平 D1 子评论与新子评论合并，且保持 incomplete 计数语义", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  insertLegacyChild(sqlite, { id: "legacy-child", content: "legacy reply", likes: 7 });
+  const { bucket, store } = makeTrackedBucket();
+
+  const payload = rootPayload({
+    children: [childComment("new-child", "new reply")],
+    childCount: 1,
+    isChildrenComplete: false,
+    partial: true,
+    allRootIds: undefined
+  });
+  const first = await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(payload, { DB: d1, BUCKET: bucket }));
+  assert.equal(first.r2Puts, 1);
+
+  const stored = JSON.parse(store.get("childcomments/r1.json"));
+  assert.deepEqual(stored.children.map(child => child.id), ["legacy-child", "new-child"]);
+  assert.equal(stored.complete, false, "partial 结果必须保持 incomplete");
+  const thread = sqlite.prepare(`SELECT child_count, is_complete FROM comment_threads WHERE root_id = 'r1'`).get();
+  assert.equal(thread.child_count, 1, "child_count 只能来自原站计数/本次抓取数，不能把 D1 旧行数冒充全量");
+  assert.equal(thread.is_complete, 0);
+
+  const children = await runWithDb(d1, () => commentsModule.getChildComments(bucket, "r1", d1));
+  assert.deepEqual(children.map(child => child.id).sort(), ["legacy-child", "new-child"]);
+  assert.equal(
+    sqlite.prepare(`SELECT COUNT(*) AS n FROM comments WHERE id = 'legacy-child'`).get().n,
+    1,
+    "合并不得删除 D1 旧子评论"
+  );
+
+  // 同输入重复 partial 按设计可直接命中快路径跳过写入
+  const second = await quietly(() => runWithDb(d1, () => commentsModule.replaceCommentsByRoot(payload, { DB: d1, BUCKET: bucket })));
+  assert.equal(second.r2Puts, 0);
+  assert.equal(second.threadUpserts, 0);
+});
+
+test("partial 合并：R2 读取失败时即使 D1 有旧子评论也绝不 PUT 覆盖", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  insertLegacyChild(sqlite, { id: "legacy-child", content: "legacy reply" });
+  const key = "childcomments/r1.json";
+  const original = JSON.stringify({ children: [childComment("r2-old")], complete: false });
+  const r2Store = new Map([[key, original]]);
+  let r2Puts = 0;
+  const bucket = {
+    async get() {
+      throw new Error("r2 read boom");
+    },
+    async put(k, value) {
+      r2Puts++;
+      r2Store.set(k, String(value));
+    }
+  };
+
+  const result = await quietly(() => runWithDb(d1, () => commentsModule.replaceCommentsByRoot(
+    rootPayload({
+      children: [childComment("new-child")],
+      childCount: 1,
+      isChildrenComplete: false,
+      partial: true,
+      allRootIds: undefined
+    }),
+    { DB: d1, BUCKET: bucket }
+  )));
+
+  assert.equal(result.r2Puts, 0, "R2 读失败时不得写 R2");
+  assert.equal(r2Puts, 0, "不得用 D1 旧数据 + 新数据覆盖不可读的 R2 对象");
+  assert.equal(r2Store.get(key), original, "R2 原对象必须保持原样");
+  const thread = sqlite.prepare(`SELECT is_complete, incoming_hash FROM comment_threads WHERE root_id = 'r1'`).get();
+  assert.equal(thread.is_complete, 0);
+  assert.equal(thread.incoming_hash, "", "失败后必须清空 incoming_hash 以便下轮重试");
+  assert.equal(
+    sqlite.prepare(`SELECT COUNT(*) AS n FROM comments WHERE id = 'legacy-child'`).get().n,
+    1
+  );
 });
 
 test("R2 楼中楼 complete=true 且 children 为空时返回 []，不回退 D1 历史子评论", async () => {

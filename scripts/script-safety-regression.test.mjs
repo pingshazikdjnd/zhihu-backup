@@ -14,6 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -360,32 +361,137 @@ test("diffStatsProgress 把 followed_users 纳入增长，未知指标不按 0 �
 // ---------------------------------------------------------------------------
 // local-sync：wx 原子锁行为与代码顺序
 // ---------------------------------------------------------------------------
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function waitForExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve(child.exitCode ?? 1);
+  }
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", code => resolve(code ?? 1));
+  });
+}
+
+/** 子进程写完结果后可能瞬间存在空文件：轮询到可解析为止 */
+function readJsonWhenReady(file, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      return JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      if (Date.now() > deadline) throw new Error(`等待 JSON 文件超时: ${file}`);
+      sleepSync(20);
+    }
+  }
+}
+
+function spawnLockHarness(harnessPath, args) {
+  return spawn(process.execPath, [harnessPath, ...args], {
+    cwd: path.dirname(harnessPath),
+    stdio: "ignore"
+  });
+}
+
+const LOCK_FUNCTION_NAMES = [
+  "isPidAlive",
+  "readLocalLock",
+  "releaseLocalLock",
+  "tryCreateLocalLock",
+  "acquireLocalLock"
+];
+
+/** 提取生产锁函数源码，供 vm / 子进程 harness 复用（不 import 真实 local-sync 主脚本） */
+function lockFunctionSources() {
+  return LOCK_FUNCTION_NAMES.map(name => extractFunction(localSyncSrc, name)).join("\n");
+}
+
+/** 用生产锁函数源码生成独立子进程 harness，用文件同步模拟 runMain 的进入/持有/释放 */
+function buildLockChildHarness(lockFile) {
+  return [
+    `"use strict";`,
+    `const fs = require("node:fs");`,
+    `const LOCK_FILE = ${JSON.stringify(lockFile)};`,
+    "let lockWritten = false;",
+    "let localLockToken = null;",
+    "const LOCK_TTL_MS = 12 * 60 * 60 * 1000;",
+    lockFunctionSources(),
+    `
+const role = process.argv[2];
+const readyPath = process.argv[3];
+const goPath = process.argv[4];
+const resultPath = process.argv[5];
+const releasePath = process.argv[6];
+const sleepSync = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+function waitFor(file) {
+  const deadline = Date.now() + 10000;
+  while (!fs.existsSync(file)) {
+    if (Date.now() > deadline) throw new Error("timeout waiting for " + file);
+    sleepSync(20);
+  }
+}
+function writeResult(record) {
+  fs.writeFileSync(resultPath, JSON.stringify(record));
+}
+try {
+  waitFor(goPath);
+  if (role === "exception") {
+    const state = acquireLocalLock();
+    try {
+      if (!state.ok) throw new Error("异常场景抢锁失败: " + JSON.stringify(state));
+      throw new Error("模拟 runMain 异常");
+    } finally {
+      if (state.owned) releaseLocalLock();
+    }
+  }
+  const state = acquireLocalLock();
+  const record = {
+    ok: state.ok,
+    owned: state.owned,
+    enteredRunMain: state.ok && state.owned,
+    pid: process.pid
+  };
+  writeResult(record);
+  if (state.owned) {
+    fs.writeFileSync(readyPath, "acquired");
+    waitFor(releasePath);
+    releaseLocalLock();
+    record.released = !fs.existsSync(LOCK_FILE);
+    writeResult(record);
+  }
+} catch (err) {
+  try { writeResult({ error: String(err && err.stack || err), pid: process.pid }); } catch {}
+  process.exitCode = 1;
+}
+`
+  ].join("\n");
+}
+
 function createLockHarness(lockFile) {
+  const logs = [];
   const code = [
     "let lockWritten = false;",
     "let localLockToken = null;",
     "const LOCK_TTL_MS = 12 * 60 * 60 * 1000;",
-    extractFunction(localSyncSrc, "readLocalLock"),
-    extractFunction(localSyncSrc, "releaseLocalLock"),
-    extractFunction(localSyncSrc, "tryCreateLocalLock"),
-    extractFunction(localSyncSrc, "isPidAlive"),
-    extractFunction(localSyncSrc, "acquireLocalLock"),
+    lockFunctionSources(),
     "globalThis.__lock = {",
-    "  tryCreate() { return tryCreateLocalLock(); },",
-    "  release() { return releaseLocalLock(); },",
     "  acquire() { return acquireLocalLock(); },",
+    "  release() { return releaseLocalLock(); },",
     "  state() { return { lockWritten, localLockToken }; },",
-    "  setState(written, token) { lockWritten = written; localLockToken = token; }",
+    "  setState(written, token) { lockWritten = written; localLockToken = token; },",
+    "  setEnv(name, value) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }",
     "};"
   ].join("\n");
   const context = vm.createContext({
     fs,
     LOCK_FILE: lockFile,
-    JSON,
-    Date,
-    Math,
-    Number,
-    console: { log() {}, warn() {}, error() {} },
+    console: {
+      log: (...args) => logs.push(args.map(String).join(" ")),
+      warn: (...args) => logs.push(args.map(String).join(" ")),
+      error: (...args) => logs.push(args.map(String).join(" "))
+    },
     process: {
       pid: process.pid,
       env: {},
@@ -393,66 +499,228 @@ function createLockHarness(lockFile) {
     }
   });
   vm.runInContext(code, context);
-  return context.__lock;
+  return { lock: context.__lock, logs };
 }
 
-test("local-sync 锁：wx 原子占位、EEXIST 跳过、只释放自己的锁、陈旧锁接管", () => {
+test("local-sync 锁：wx 原子占位、EEXIST 跳过、只释放自己的锁", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-local-sync-lock-"));
   const lockFile = path.join(dir, ".local-sync.lock");
   try {
-    const lock = createLockHarness(lockFile);
+    const { lock, logs } = createLockHarness(lockFile);
 
-    assert.equal(lock.tryCreate(), true);
+    const first = lock.acquire();
+    assert.deepEqual({ ok: first.ok, owned: first.owned }, { ok: true, owned: true });
     assert.equal(lock.state().lockWritten, true);
     assert.equal(fs.existsSync(lockFile), true);
-    assert.equal(lock.tryCreate(), false, "同一把锁第二次 wx 必须 EEXIST");
+    const ownRaw = fs.readFileSync(lockFile, "utf8");
+    const own = JSON.parse(ownRaw);
+    assert.deepEqual(Object.keys(own).sort(), ["pid", "startedAt", "token"]);
+    assert.equal(own.pid, process.pid);
+
+    const second = lock.acquire();
+    assert.deepEqual({ ok: second.ok, owned: second.owned }, { ok: false, owned: false });
+    assert.equal(fs.readFileSync(lockFile, "utf8"), ownRaw, "EEXIST 不得改写已有锁");
 
     lock.release();
     assert.equal(fs.existsSync(lockFile), false);
     assert.equal(lock.state().lockWritten, false);
 
     // 其他进程持有：release 不能误删
-    fs.writeFileSync(
-      lockFile,
-      JSON.stringify({ pid: process.pid + 1, startedAt: new Date().toISOString(), token: "foreign" }),
-      "utf8"
-    );
+    const foreignRaw = JSON.stringify({
+      pid: process.pid + 1,
+      startedAt: new Date().toISOString(),
+      token: "foreign"
+    });
+    fs.writeFileSync(lockFile, foreignRaw, "utf8");
     lock.setState(true, "mine");
     lock.release();
-    assert.equal(fs.existsSync(lockFile), true, "不得删除其他进程的锁");
-    const foreign = JSON.parse(fs.readFileSync(lockFile, "utf8"));
-    assert.equal(foreign.token, "foreign");
+    assert.equal(fs.readFileSync(lockFile, "utf8"), foreignRaw, "不得删除其他进程的锁");
 
-    // 活跃锁（当前 PID + 新 startedAt）：友好跳过且不删除
-    fs.writeFileSync(
-      lockFile,
-      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), token: "live" }),
-      "utf8"
-    );
+    // 活跃锁（当前 PID + 新 startedAt）：友好跳过，日志说明 PID
+    const liveRaw = JSON.stringify({
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      token: "live"
+    });
+    fs.writeFileSync(lockFile, liveRaw, "utf8");
+    logs.length = 0;
     const live = lock.acquire();
-    assert.equal(live.ok, false);
-    assert.equal(live.owned, false);
-    assert.equal(JSON.parse(fs.readFileSync(lockFile, "utf8")).token, "live");
-
-    // 陈旧锁（PID 不存活 + 超 TTL）：接管并写入自己的 token
-    fs.writeFileSync(
-      lockFile,
-      JSON.stringify({ pid: 2147483647, startedAt: "2000-01-01T00:00:00.000Z", token: "stale" }),
-      "utf8"
+    assert.deepEqual({ ok: live.ok, owned: live.owned }, { ok: false, owned: false });
+    assert.equal(fs.readFileSync(lockFile, "utf8"), liveRaw);
+    assert.ok(
+      logs.some(line => line.includes("已有本地同步任务正在运行") && line.includes(String(process.pid))),
+      "活跃锁必须给出友好跳过提示"
     );
-    const taken = lock.acquire();
-    assert.equal(taken.ok, true);
-    assert.equal(taken.owned, true);
-    const own = JSON.parse(fs.readFileSync(lockFile, "utf8"));
-    assert.notEqual(own.token, "stale");
-    lock.release();
-    assert.equal(fs.existsSync(lockFile), false);
+
+    // 父进程已持锁时子进程直接继承，不重复创建文件
+    fs.rmSync(lockFile, { force: true });
+    lock.setEnv("__LOCAL_SYNC_LOCK_INHERITED", "1");
+    const inherited = lock.acquire();
+    assert.deepEqual({ ok: inherited.ok, owned: inherited.owned }, { ok: true, owned: false });
+    assert.equal(fs.existsSync(lockFile), false, "继承锁不得重复创建 canonical 锁");
+    lock.setEnv("__LOCAL_SYNC_LOCK_INHERITED", undefined);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("local-sync 在拿锁前不做任何网络/输入/编译操作", () => {
+test("local-sync 锁：陈旧/损坏/超 TTL 活锁一律安全拒绝且原样保留锁文件", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-local-sync-stale-"));
+  const lockFile = path.join(dir, ".local-sync.lock");
+  const cases = [
+    {
+      name: "PID 不存活的陈旧锁",
+      raw: JSON.stringify({ pid: 2147483647, startedAt: "2000-01-01T00:00:00.000Z", token: "dead" }),
+      reason: "进程已不存活"
+    },
+    {
+      name: "PID 存活但超过 TTL",
+      raw: JSON.stringify({ pid: process.pid, startedAt: "2000-01-01T00:00:00.000Z", token: "old-live" }),
+      reason: "进程仍存活"
+    },
+    {
+      name: "损坏锁",
+      raw: "{not-json",
+      reason: "无法解析或读取锁内容"
+    }
+  ];
+  try {
+    const { lock, logs } = createLockHarness(lockFile);
+    for (const item of cases) {
+      fs.writeFileSync(lockFile, item.raw, "utf8");
+      logs.length = 0;
+      const state = lock.acquire();
+      assert.deepEqual(
+        { ok: state.ok, owned: state.owned },
+        { ok: false, owned: false },
+        `${item.name}：必须安全拒绝`
+      );
+      assert.equal(fs.readFileSync(lockFile, "utf8"), item.raw, `${item.name}：canonical 锁内容必须原样保留`);
+      assert.ok(logs.some(line => line.includes(item.reason)), `${item.name}：日志必须说明拒绝原因`);
+      assert.ok(logs.some(line => line.includes(lockFile)), `${item.name}：日志必须打印锁文件完整路径`);
+      assert.ok(
+        logs.some(line => line.includes("手动删除") && line.includes(".local-sync.lock")),
+        `${item.name}：日志必须给出人工处理提示`
+      );
+      assert.deepEqual(fs.readdirSync(dir), [".local-sync.lock"], `${item.name}：不得产生 stale/隔离文件`);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("local-sync 锁：真实多进程同时抢无锁路径，只有一个进入 runMain", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-local-sync-race-"));
+  const lockFile = path.join(dir, ".local-sync.lock");
+  const harnessPath = path.join(dir, "lock-harness.cjs");
+  const goPath = path.join(dir, "go");
+  const releasePath = path.join(dir, "release");
+  const resultPaths = Array.from({ length: 4 }, (_, i) => path.join(dir, `result-${i}.json`));
+  const children = [];
+  try {
+    fs.writeFileSync(harnessPath, buildLockChildHarness(lockFile), "utf8");
+    resultPaths.forEach((resultPath, i) => {
+      children.push(
+        spawnLockHarness(harnessPath, ["race", path.join(dir, `ready-${i}`), goPath, resultPath, releasePath])
+      );
+    });
+    fs.writeFileSync(goPath, "go");
+
+    const results = resultPaths.map(resultPath => readJsonWhenReady(resultPath));
+    for (const record of results) assert.equal(record.error, undefined, `子进程异常: ${record.error}`);
+
+    const winners = results.filter(record => record.enteredRunMain);
+    assert.equal(winners.length, 1, "同一时刻只能有一个进程进入 runMain");
+    assert.ok(results.every(record => record.ok === record.owned), "没拿到锁的进程必须安全拒绝");
+
+    const winnerIndex = results.indexOf(winners[0]);
+    const held = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+    assert.equal(held.pid, children[winnerIndex].pid, "canonical 锁必须属于唯一赢家");
+    assert.ok(held.token, "锁必须带 token");
+    assert.deepEqual(fs.readdirSync(dir).filter(name => name.includes(".stale-")), [], "不得产生 stale 文件");
+
+    fs.writeFileSync(releasePath, "release");
+    const exits = await Promise.all(children.map(waitForExit));
+    assert.deepEqual(exits, [0, 0, 0, 0], "所有子进程都必须正常退出");
+    assert.equal(fs.existsSync(lockFile), false, "赢家释放后不得残留 canonical 锁");
+    assert.equal(
+      JSON.parse(fs.readFileSync(resultPaths[winnerIndex], "utf8")).released,
+      true,
+      "赢家必须在模拟 runMain 结束后释放自己的锁"
+    );
+  } finally {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("local-sync 锁：启动前已有陈旧锁时多进程全部安全拒绝且锁文件完全不变", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-local-sync-stale-race-"));
+  const lockFile = path.join(dir, ".local-sync.lock");
+  const harnessPath = path.join(dir, "lock-harness.cjs");
+  const goPath = path.join(dir, "go");
+  const staleRaw = JSON.stringify({
+    pid: 2147483647,
+    startedAt: "2000-01-01T00:00:00.000Z",
+    token: "stale"
+  });
+  const resultPaths = Array.from({ length: 4 }, (_, i) => path.join(dir, `result-${i}.json`));
+  const children = [];
+  try {
+    fs.writeFileSync(lockFile, staleRaw, "utf8");
+    const beforeStat = fs.statSync(lockFile);
+    fs.writeFileSync(harnessPath, buildLockChildHarness(lockFile), "utf8");
+    resultPaths.forEach(resultPath => {
+      children.push(spawnLockHarness(harnessPath, ["stale", "", goPath, resultPath, ""]));
+    });
+    fs.writeFileSync(goPath, "go");
+
+    const exits = await Promise.all(children.map(waitForExit));
+    assert.deepEqual(exits, [0, 0, 0, 0], "安全拒绝必须正常退出");
+    const results = resultPaths.map(resultPath => JSON.parse(fs.readFileSync(resultPath, "utf8")));
+    for (const record of results) {
+      assert.equal(record.error, undefined, `子进程异常: ${record.error}`);
+      assert.equal(record.ok, false);
+      assert.equal(record.owned, false);
+      assert.equal(record.enteredRunMain, false, "陈旧锁存在时任何进程都不得进入 runMain");
+    }
+
+    assert.equal(fs.readFileSync(lockFile, "utf8"), staleRaw, "canonical 锁内容必须逐字节不变");
+    assert.equal(fs.statSync(lockFile).size, beforeStat.size, "canonical 锁文件大小必须不变");
+    assert.deepEqual(fs.readdirSync(dir).filter(name => name.includes(".stale-")), [], "不得产生任何 stale 文件");
+  } finally {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("local-sync 锁：runMain 异常时 finally 仍释放自己的锁", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-local-sync-exception-"));
+  const lockFile = path.join(dir, ".local-sync.lock");
+  const harnessPath = path.join(dir, "lock-harness.cjs");
+  const goPath = path.join(dir, "go");
+  const resultPath = path.join(dir, "result.json");
+  let child = null;
+  try {
+    fs.writeFileSync(harnessPath, buildLockChildHarness(lockFile), "utf8");
+    child = spawnLockHarness(harnessPath, ["exception", "", goPath, resultPath, ""]);
+    fs.writeFileSync(goPath, "go");
+    const exitCode = await waitForExit(child);
+    assert.equal(exitCode, 1, "模拟异常必须以非零状态退出");
+    const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+    assert.match(result.error, /模拟 runMain 异常/);
+    assert.equal(fs.existsSync(lockFile), false, "异常退出路径必须释放本进程的锁");
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) child.kill();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("local-sync 在拿锁前不做任何网络/输入/编译操作，且不自动接管已有锁", () => {
   const mainStart = localSyncSrc.indexOf("async function main() {");
   const runMainStart = localSyncSrc.indexOf("async function runMain() {");
   assert.ok(runMainStart > 0 && mainStart > runMainStart, "缺少 runMain/main 包装结构");
@@ -483,6 +751,29 @@ test("local-sync 在拿锁前不做任何网络/输入/编译操作", () => {
   assert.match(localSyncSrc, /__LOCAL_SYNC_LOCK_INHERITED/);
   assert.match(localSyncSrc, /if \(lockState\.owned\) releaseLocalLock\(\);/);
   assert.ok(!localSyncSrc.includes("if (lockWritten) {"), "旧的内层锁释放必须移除");
+
+  // 不得再保留 rename/quarantine/恢复式自动接管；EEXIST 后只读诊断
+  assert.ok(!localSyncSrc.includes("quarantine"), "不得保留 quarantine 隔离实现");
+  assert.ok(!localSyncSrc.includes("takeoverStaleLocalLock"), "不得保留自动接管实现");
+  assert.ok(!localSyncSrc.includes("restoreQuarantinedLock"), "不得保留恢复隔离文件实现");
+  assert.ok(!localSyncSrc.includes("lockIdentity"), "不得保留 rename 身份校验辅助函数");
+  assert.ok(!localSyncSrc.includes(".stale-"), "锁模块不得生成 stale 隔离文件名");
+
+  const acquireBody = extractFunction(localSyncSrc, "acquireLocalLock");
+  assert.ok(
+    !/fs\.(unlinkSync|renameSync|copyFileSync)/.test(acquireBody),
+    "EEXIST 后不得删除/移动/恢复 canonical 锁文件"
+  );
+  assert.match(acquireBody, /readLocalLock\(\)/, "EEXIST 后必须只读检查现有锁");
+  assert.match(acquireBody, /isPidAlive\(lockData\.pid\)/, "必须区分 PID 是否存活");
+  assert.match(acquireBody, /LOCK_FILE/, "人工处理提示必须包含完整锁文件路径");
+  assert.match(acquireBody, /手动删除/, "陈旧/损坏锁必须提示人工删除");
+  assert.match(acquireBody, /\.local-sync\.lock/, "提示必须点名 .local-sync.lock");
+  assert.equal(
+    (localSyncSrc.match(/fs\.writeFileSync\(\s*LOCK_FILE,/g) || []).length,
+    1,
+    "canonical 锁只允许 tryCreateLocalLock 用 wx 创建一次"
+  );
 
   // 锁内容只允许 pid/startedAt/token，绝不带 cookie/apiSecret
   const lockWriteBody = extractFunction(localSyncSrc, "tryCreateLocalLock");

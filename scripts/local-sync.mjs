@@ -6,7 +6,8 @@
  * 1. 读取项目根目录 .env.local（或环境变量）中的 WORKER_URL、API_SECRET 与代理配置
  * 2. 自动探测 HTTPS_PROXY 端口是否存活：存活则自动携带 --use-env-proxy 使 Node fetch
  *    访问 *.workers.dev 走代理（Playwright 抓知乎仍走国内直连防风控）；未启动则自动回退直连
- * 3. 单实例原子文件锁（wx 占位，先于 INPUT 清理 / 代理探测 / 网络 / 编译）
+ * 3. 单实例原子文件锁（wx 占位，先于 INPUT 清理 / 代理探测 / 网络 / 编译；
+ *    已存在的锁一律不自动接管，只提示人工确认后删除）
  * 4. 请求线上 Worker 的 GET /ingest/sync-state，自动获取：
  *    - D1 中最新的 zhihu_cookie（网页端扫码/更新后自动生效）
  *    - 当前赞同断点游标 upvotes_cursor（从上次中断处继续向旧历史翻页）
@@ -33,13 +34,13 @@ const INPUT_JSON_PATH = path.join(KV_DEFAULT_DIR, "INPUT.json");
 // 保证未进入主 try 之前的异常/提前返回也不会把锁白占 15 分钟。
 let emergencyReleaseCloudLock = null;
 // 本地文件锁状态：只有本进程真正用 wx 原子写入的锁才允许释放。
-// token 用于释放前校验，避免 PID 复用或误删其他进程刚接管的锁。
+// token 用于释放前校验，避免 PID 复用或误删其他进程写入的锁。
 let lockWritten = false;
 let localLockToken = null;
 // 代理自重启时：父进程是否持有本地锁由它传给子进程
 let ownsLocalLock = false;
-// 锁最多信任 12 小时：PID 被系统复用、或断电后残留的锁文件，
-// 会让后续所有定时同步都被判成「已在运行」而永久跳过。
+// 锁 TTL 仅用于诊断/日志：判断 PID 仍存活的锁是否已长时间未更新。
+// 无论是否超过 TTL，都不会自动删除/接管锁文件（见 acquireLocalLock）。
 const LOCK_TTL_MS = 12 * 60 * 60 * 1000;
 
 // 1. 加载 .env.local（如果存在）
@@ -70,7 +71,7 @@ function isPidAlive(pid) {
   }
 }
 
-/** 读取锁文件（损坏/不存在返回 null）；只读 pid/startedAt/token，不含任何凭据 */
+/** 读取 canonical 锁文件（损坏/不可读/不存在返回 null）；只读 pid/startedAt/token，不含任何凭据 */
 function readLocalLock() {
   try {
     const data = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
@@ -82,7 +83,7 @@ function readLocalLock() {
 
 /**
  * 只释放本进程写入的锁：PID + token 双重校验。
- * 若锁已被其他进程接管/替换，直接放弃 unlink，绝不误删别人的锁。
+ * 若锁已被其他进程替换，直接放弃 unlink，绝不误删别人的锁。
  */
 function releaseLocalLock() {
   if (!lockWritten) return;
@@ -118,8 +119,14 @@ function tryCreateLocalLock() {
 
 /**
  * 原子抢占本地文件锁。必须先于 INPUT 清理 / 代理自重启 / 网络请求 / tsc 编译执行。
- * EEXIST 时保留陈旧锁清理逻辑（PID 已死或超过 TTL）：删除后重试一次，
- * 仍抢不到就友好跳过。返回 { ok, owned }；owned=false 表示父进程已持锁、本进程仅继承。
+ *
+ * 为什么故意不自动清理陈旧锁：wx 抢锁失败后，无法可靠区分「上次崩溃留下的陈旧锁」
+ * 和「另一个进程刚创建/替换的活锁」。任何 unlink/rename/恢复式自动接管都存在
+ * 空窗或恢复失败窗口，可能让两个进程同时进入 runMain、重复写库。
+ * 因此这里只在 canonical 不存在时用 wx 原子创建；一旦 EEXIST，只读诊断后
+ * 安全退出，把删除决定交给人工，宁可跳过一轮也不双跑。
+ *
+ * 返回 { ok, owned }；owned=false 表示父进程已持锁、本进程仅继承。
  */
 function acquireLocalLock() {
   if (process.env.__LOCAL_SYNC_LOCK_INHERITED === "1") {
@@ -128,23 +135,27 @@ function acquireLocalLock() {
   }
   if (tryCreateLocalLock()) return { ok: true, owned: true };
 
+  // EEXIST：只读诊断，绝不 unlink / rename / 恢复 canonical 锁。
   const lockData = readLocalLock();
   const startedAtMs = Date.parse(lockData?.startedAt || "");
-  const fresh = Number.isFinite(startedAtMs) && Date.now() - startedAtMs < LOCK_TTL_MS;
-  if (lockData && isPidAlive(lockData.pid) && fresh) {
+  const ageMs = Number.isFinite(startedAtMs) ? Math.max(0, Date.now() - startedAtMs) : null;
+  const pidAlive = lockData ? isPidAlive(lockData.pid) : false;
+
+  if (lockData && pidAlive && ageMs !== null && ageMs < LOCK_TTL_MS) {
     console.log(`⏭️ 已有本地同步任务正在运行 (PID: ${lockData.pid}, 启动于 ${lockData.startedAt})，本次跳过。`);
     return { ok: false, owned: false };
   }
-  console.log(
-    `⚠️ 检测到陈旧锁文件 (PID: ${lockData?.pid ?? "未知"}, 启动于 ${lockData?.startedAt ?? "未知"})，自动接管。`
-  );
-  try {
-    fs.unlinkSync(LOCK_FILE);
-  } catch {
-    /* 可能已被其他进程清理 */
-  }
-  if (tryCreateLocalLock()) return { ok: true, owned: true };
-  console.log("⏭️ 本地同步锁刚被其他进程接管，本次跳过。");
+
+  // 走到这里一律安全退出：
+  // - PID 已不存活或超过 TTL 的陈旧锁；
+  // - PID 仍存活但超过 TTL（可能卡死，但绝不擅自杀进程/删锁）；
+  // - 损坏或不可读的锁（无法判断持有者）。
+  const detail = lockData
+    ? `PID: ${lockData.pid ?? "未知"}, 启动于 ${lockData.startedAt ?? "未知"}${pidAlive ? "（进程仍存活）" : "（进程已不存活）"}`
+    : "无法解析或读取锁内容";
+  console.warn(`⚠️ 检测到已存在的本地同步锁（${detail}），本次不自动接管，跳过。`);
+  console.warn(`   锁文件: ${LOCK_FILE}`);
+  console.warn("   请确认没有本地同步进程后，手动删除该 .local-sync.lock 文件再重试。");
   return { ok: false, owned: false };
 }
 

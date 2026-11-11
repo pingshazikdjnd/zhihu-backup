@@ -501,6 +501,35 @@ async function replaceCommentsByRootInner(
   `).bind(input.contentPk).all<ExistingThreadRow>();
   const existingThreads = new Map((threadResult.results ?? []).map(row => [row.root_id, row]));
 
+  // partial 合并只读 R2 会把迁移前写在 D1 的旧扁平子评论弄丢（R2 404 时尤其明显）。
+  // 按 content_pk 一次批量取出本内容 is_deleted=0 的旧子评论行，再按 parent 分组；
+  // 不在每根循环里发 SQL，避免 N+1。只有 partial 才需要这份数据。
+  const legacyChildrenByRoot = new Map<string, ChildCommentRecord[]>();
+  let legacyChildrenReadFailed = false;
+  if (input.partial) {
+    try {
+      const legacyResult = await database.prepare(`
+        SELECT id, parent_comment_id, author_name, author_avatar, be_replied, content_md,
+               img_url, time_text, location, likes, is_author
+        FROM comments
+        WHERE content_pk = ? AND parent_comment_id IS NOT NULL AND is_deleted = 0
+        ORDER BY first_seen_at ASC
+      `).bind(input.contentPk).all<ChildSelectRow>();
+      for (const row of legacyResult.results ?? []) {
+        const parentId = row.parent_comment_id;
+        if (!parentId) continue;
+        const child = mapStoredChildRow(row);
+        const list = legacyChildrenByRoot.get(parentId);
+        if (list) list.push(child);
+        else legacyChildrenByRoot.set(parentId, [child]);
+      }
+    } catch (err) {
+      // 旧 D1 子评论状态未知：后续 partial 根不能基于半份数据盲写 R2。
+      legacyChildrenReadFailed = true;
+      console.warn(`[comments] failed to read legacy D1 children for ${input.contentPk}:`, err);
+    }
+  }
+
   // 同一 root 重复出现（翻页漂移）只保留最后一条
   const uniqueRoots = new Map<string, IngestRootCommentInput>();
   for (const root of input.roots) uniqueRoots.set(root.id, root);
@@ -722,34 +751,83 @@ async function replaceCommentsByRootInner(
     const existingThread = existingThreads.get(root.id);
 
     // 单个根下的楼中楼在原站被删光：本次抓全且站点确认 childCount = 0。
-    // 必须主动清空 R2 与线程索引，否则已删光的楼中楼会一直展示旧预览。
-    if (
-      !input.partial &&
-      !hasChildren &&
-      childCount === 0 &&
-      root.isChildrenComplete &&
-      existingThread &&
-      existingThread.child_count > 0
-    ) {
+    // 必须主动清空 R2 并建立 complete-empty 线程索引，不能依赖 existingThread.child_count > 0：
+    // 旧扁平 D1 迁移根可能没有 comment_threads 行，或 R2 里仍有旧对象但索引计数被清零，
+    // 跳过清空会让已删光的楼中楼一直展示旧预览，read API 也会回退 D1 历史子评论。
+    if (!input.partial && !hasChildren && childCount === 0 && root.isChildrenComplete) {
       const key = childCommentsKey(root.id);
       const emptyThreadHash = await sha256(JSON.stringify({ children: [], complete: true }));
       const emptyIncomingHash = await sha256(JSON.stringify({ children: [], childCount: 0, complete: true }));
-      try {
-        await env.BUCKET.put(key, JSON.stringify({ children: [], complete: true, updatedAt: now }), {
-          httpMetadata: { contentType: "application/json; charset=utf-8" }
-        });
-        r2Puts++;
-        // 清空也必须立即见效：边缘缓存里可能还留着旧楼中楼
-        await purgeR2EdgeCache(key);
+
+      // 快路径：上一轮已经是权威 complete-empty（R2 已落盘且索引一致）→ 0 R2 / 0 D1 写，
+      // 避免每次重同步都重复 PUT 同一个空对象。
+      if (
+        existingThread &&
+        existingThread.incoming_hash === emptyIncomingHash &&
+        existingThread.thread_hash === emptyThreadHash &&
+        existingThread.child_count === 0 &&
+        existingThread.is_complete === 1 &&
+        existingThread.preview_json === "[]"
+      ) {
+        continue;
+      }
+
+      let r2Ready = false;
+      const stored = await readStoredChildThread(env.BUCKET, root.id);
+      if (stored.status === "error") {
+        // 读取失败时状态未知：绝不盲写覆盖可能仍可读的旧对象，下面保留重试状态。
+        console.warn(`[comments] skip empty R2 put for ${key}: previous object unreadable`);
+      } else if (stored.status === "ok" && stored.complete && stored.children.length === 0) {
+        // R2 已经是同一份 complete-empty 快照：省掉这次 PUT。
+        r2Ready = true;
+      } else {
+        try {
+          await env.BUCKET.put(key, JSON.stringify({ children: [], complete: true, updatedAt: now }), {
+            httpMetadata: { contentType: "application/json; charset=utf-8" }
+          });
+          r2Puts++;
+          // 清空也必须立即见效：边缘缓存里可能还留着旧楼中楼
+          await purgeR2EdgeCache(key);
+          r2Ready = true;
+        } catch (err) {
+          // R2 写失败则保留旧索引：避免出现「R2 仍是旧子评论、D1 却宣称 0 条」的不一致
+          console.warn(`[comments] R2 put failed for ${key}:`, err);
+        }
+      }
+
+      if (r2Ready) {
+        threadStmts.push(database.prepare(`
+          INSERT INTO comment_threads (
+            root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at
+          ) VALUES (?, ?, ?, 0, 1, ?, ?, '[]', ?)
+          ON CONFLICT(root_id) DO UPDATE SET
+            content_pk = excluded.content_pk,
+            r2_key = excluded.r2_key,
+            child_count = 0,
+            is_complete = 1,
+            thread_hash = excluded.thread_hash,
+            incoming_hash = excluded.incoming_hash,
+            preview_json = '[]',
+            synced_at = excluded.synced_at
+        `).bind(root.id, input.contentPk, key, emptyThreadHash, emptyIncomingHash, now));
+      } else {
+        // R2 读取/写入失败：没有旧索引时保持原样（本来就没有可回退状态），
+        // 有旧索引时保留可能仍可读的计数与哈希，但把 is_complete 置 0、incoming_hash 清空，
+        // 确保下一轮不会误命中快路径，会重新尝试清空。
+        if (!existingThread) continue;
+        const fallbackThreadHash = existingThread.thread_hash ?? "";
+        if (
+          existingThread.is_complete === 0 &&
+          existingThread.incoming_hash === "" &&
+          existingThread.thread_hash === fallbackThreadHash
+        ) {
+          continue;
+        }
         threadStmts.push(database.prepare(`
           UPDATE comment_threads
-          SET child_count = 0, is_complete = 1, preview_json = '[]',
-              thread_hash = ?, incoming_hash = ?, synced_at = ?
+          SET is_complete = 0, thread_hash = ?, incoming_hash = '', synced_at = ?
           WHERE root_id = ?
-        `).bind(emptyThreadHash, emptyIncomingHash, now, root.id));
-      } catch (err) {
-        // R2 写失败则保留 D1 旧索引：避免出现「R2 仍是旧子评论、D1 却宣称 0 条」的不一致
-        console.warn(`[comments] R2 put failed for ${key}:`, err);
+        `).bind(fallbackThreadHash, now, root.id));
       }
       continue;
     }
@@ -807,10 +885,23 @@ async function replaceCommentsByRootInner(
       // 本次没抓全：与 R2 旧对象合并，只增改不删。
       // 读失败（error）时状态未知，绝不能把本次不完整数据当成合并结果写回去。
       const stored = await readStoredChildThread(env.BUCKET, root.id);
-      if (stored.status === "ok") {
-        childrenToStore = mergeChildren(stored.children, children);
-      } else if (stored.status === "error") {
+      if (stored.status === "error") {
         readFailed = true;
+      } else if (legacyChildrenReadFailed) {
+        // D1 旧子评论状态未知：不能用一份看起来完整的 R2 合并结果盲写。
+        readFailed = true;
+      } else if (stored.status === "ok") {
+        childrenToStore = mergeChildren(stored.children, children);
+        // 已存在非空 R2 时按原逻辑只合并 R2；只有 R2 是不完整空对象
+        // （迁移前既没有旧对象、也没有可用子评论）时才补入 D1 旧子评论，
+        // 否则这次写回会把 D1 里仅存的历史回复永久挡在 R2 之外。
+        // complete=true 的旧 R2 是权威快照，不能掺入可能早已在原站删除的 D1 旧行。
+        if (stored.children.length === 0 && !stored.complete) {
+          childrenToStore = mergeChildren(legacyChildrenByRoot.get(root.id) ?? [], childrenToStore);
+        }
+      } else {
+        // R2 404：迁移前的旧扁平 D1 子评论与本次新抓到的子评论一起写入，避免丢失。
+        childrenToStore = mergeChildren(legacyChildrenByRoot.get(root.id) ?? [], children);
       }
     }
     const complete = root.isChildrenComplete;
