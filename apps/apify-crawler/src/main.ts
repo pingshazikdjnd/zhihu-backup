@@ -1830,7 +1830,10 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
       break;
     }
     if (!json.data || json.data.length === 0) {
-      // 风控空页已在 zhihuJson 内重试并计数；能到这里的是 is_end 的合法空页
+      // 风控空页已在 zhihuJson 内重试并计数；能到这里的是 is_end 的合法空页。
+      // 合法空页意味着历史已到底，必须清掉断点游标：否则每轮都从末尾断点空转，
+      // 总控会把「0 新增 + 秒级结束」误判成风控，冷却几轮后要求人机验证（实际并没有滑块）。
+      if (json.paging?.is_end) await reportCursor(null);
       break;
     }
 

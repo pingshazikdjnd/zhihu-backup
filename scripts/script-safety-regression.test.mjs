@@ -14,8 +14,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -784,4 +786,394 @@ test("local-sync 在拿锁前不做任何网络/输入/编译操作，且不自�
   assert.match(releaseBody, /data\.pid !== process\.pid/);
   assert.match(releaseBody, /data\.token !== token/);
   assert.equal((releaseBody.match(/fs\.unlinkSync\(LOCK_FILE\)/g) || []).length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// full-local-harvest：评论补采候选覆盖「第一页 20 条」截断
+// ---------------------------------------------------------------------------
+test("评论补采候选同时覆盖 roots*3<评论数 与 评论数>20 且 roots=20，且不泛化", () => {
+  // REPAIR_CANDIDATE_SQL 以 .join("\n") 收尾，不能用只认 `];` 的 extractConstArray
+  const sqlArray = /const\s+REPAIR_CANDIDATE_SQL\s*=\s*(\[[\s\S]*?\])\s*\.join/.exec(harvestSrc);
+  assert.ok(sqlArray, "缺少 REPAIR_CANDIDATE_SQL 数组定义");
+  const sql = Array.from(vm.runInNewContext(sqlArray[1])).join("\n");
+
+  // 原判定必须保留（roots=0 只可能从这里命中，不会被新分支宽泛纳入）
+  assert.match(sql, /COALESCE\(r\.roots, 0\) \* 3 < c\.comment_count/, "原判定必须保留");
+  assert.match(sql, /COALESCE\(r\.roots, 0\) < 50/, "原判定的 roots<50 上限必须保留");
+  // 新判定：精确的 20 条截断签名
+  assert.match(sql, /c\.comment_count > 20 AND COALESCE\(r\.roots, 0\) = 20/, "必须覆盖第一页 20 条截断");
+  assert.ok(!/roots, 0\) <= 20/.test(sql), "不得把截断判定放宽成 <=20");
+  assert.ok(
+    !/COALESCE\(r\.roots, 0\) < c\.comment_count(?! \* 3)/.test(sql),
+    "不得泛化成「根评论 < 评论总数就重抓」"
+  );
+
+  // 用内存 SQLite 按真实数据形态验证候选集合（不触碰任何本地/远端 D1 文件）
+  const db = new Database(":memory:");
+  try {
+    db.exec(`
+      CREATE TABLE contents (
+        pk TEXT PRIMARY KEY, source_type TEXT NOT NULL, comment_count INTEGER NOT NULL, is_deleted INTEGER NOT NULL
+      );
+      CREATE TABLE comments (
+        id TEXT PRIMARY KEY, content_pk TEXT NOT NULL, parent_comment_id TEXT, is_deleted INTEGER NOT NULL
+      );
+    `);
+    const insertContent = db.prepare(
+      "INSERT INTO contents (pk, source_type, comment_count, is_deleted) VALUES (?, ?, ?, ?)"
+    );
+    const insertRoot = db.prepare(
+      "INSERT INTO comments (id, content_pk, parent_comment_id, is_deleted) VALUES (?, ?, NULL, 0)"
+    );
+    const insertReply = db.prepare(
+      "INSERT INTO comments (id, content_pk, parent_comment_id, is_deleted) VALUES (?, ?, ?, 0)"
+    );
+    const seed = (pk, type, commentCount, roots, deleted = 0) => {
+      insertContent.run(pk, type, commentCount, deleted);
+      for (let i = 0; i < roots; i += 1) insertRoot.run(`${pk}-r${i}`, pk);
+    };
+
+    seed("answer:1", "answer", 21, 20); // 命中新判定
+    seed("answer:2", "answer", 20, 20); // 未超过 20，不命中
+    seed("answer:3", "answer", 5, 0); // 仅命中原判定（roots=0 不应被新分支纳入）
+    seed("answer:4", "answer", 100, 40); // 回复占比高，120<100 不成立
+    seed("answer:5", "answer", 130, 40); // 命中原判定
+    seed("answer:6", "answer", 1000, 60); // roots<50 不成立
+    seed("article:7", "article", 30, 20); // 文章同样覆盖
+    seed("answer:8", "answer", 21, 21); // roots 不是 20，不命中
+    seed("pin:9", "pin", 21, 20); // 非 answer/article
+    seed("answer:10", "answer", 21, 20, 1); // 已删除
+    seed("answer:11", "answer", 100, 20); // 真实 20 条根评论 + 大量回复：已知可接受误报，会重抓一次
+    // 楼中楼不计入 roots
+    for (let i = 0; i < 10; i += 1) insertReply.run(`answer:1-c${i}`, "answer:1", "answer:1-r0");
+
+    const pks = db.prepare(sql).all().map((row) => row.pk);
+    assert.deepEqual(pks, ["answer:1", "answer:11", "answer:3", "answer:5", "article:7"]);
+  } finally {
+    db.close();
+  }
+});
+
+test("full-local-harvest --repair-images 在拿实例锁前转交独立脚本，且不改写阶段进度", () => {
+  assert.match(harvestSrc, /if \(opts\.repairImages\)/, "必须提供 --repair-images 分流");
+  assert.match(harvestSrc, /repair-local-images\.mjs/, "必须转交独立脚本");
+  const branchAt = harvestSrc.indexOf("if (opts.repairImages)");
+  const lockAt = harvestSrc.indexOf("if (!acquireInstanceLock())");
+  assert.ok(branchAt > 0 && lockAt > branchAt, "图片补采必须在实例锁之前分流");
+  const branch = harvestSrc.slice(branchAt, lockAt);
+  assert.match(branch, /runRepairImagesMode\(\)/);
+  assert.ok(!branch.includes("repairMax"), "图片补采不能被 --repair-max 限制");
+  assert.ok(!branch.includes("writeProgress"), "图片补采不得写阶段进度");
+
+  // 图片参数由独立的转交函数透传（不与评论补采/阶段状态机共用参数）
+  const delegate = extractFunction(harvestSrc, "runRepairImagesMode");
+  assert.match(delegate, /repair-local-images\.mjs/);
+  assert.match(delegate, /--image-batch-size=\$\{opts\.imageBatchSize\}/);
+  assert.match(delegate, /--image-max-batches=\$\{opts\.imageMaxBatches\}/);
+  assert.match(delegate, /opts\.imageScanOnly/);
+  assert.match(delegate, /opts\.dryRun/);
+  assert.ok(!delegate.includes("repairMax"), "图片补采不能被 --repair-max 限制");
+
+  // 评论补采的风控中断仍必须以非零退出（不能被当成成功）
+  assert.match(harvestSrc, /process\.exitCode = ok \? 0 : 1;/);
+});
+
+// ---------------------------------------------------------------------------
+// repair-local-images：与 Worker 生产图片身份规则逐字一致
+// ---------------------------------------------------------------------------
+const repairImagesSrc = readScript("scripts/repair-local-images.mjs");
+const imagesProductionSrc = readScript("apps/worker/src/services/images.ts");
+
+/** 提取 `const NAME = ...;` 源码片段（可跨行，不含裸分号） */
+function extractConstSource(src, name) {
+  const match = new RegExp(`const\\s+${name}\\s*=\\s*[^;]+;`).exec(src);
+  assert.ok(match, `源码中缺少常量 ${name}`);
+  return match[0];
+}
+
+/** 提取 `const NAME = <expr>;` 的右值并在独立上下文求值 */
+function evalConstRhs(src, name) {
+  const match = new RegExp(`const\\s+${name}\\s*=\\s*`).exec(src);
+  assert.ok(match, `源码中缺少常量 ${name}`);
+  const start = match.index + match[0].length;
+  const end = src.indexOf(";", start);
+  assert.ok(end > start, `常量 ${name} 缺少结束分号`);
+  return vm.runInNewContext(`(${src.slice(start, end)})`);
+}
+
+function loadRepairImagePure() {
+  const extraSource = [
+    "IMAGE_KEY_PREFIX",
+    "IMAGE_API_PREFIX",
+    "MAX_IMAGES_PER_CONTENT",
+    "ALLOWED_IMAGE_EXTENSIONS",
+    "LOCAL_IMAGE_SRC_RE"
+  ]
+    .map((name) => extractConstSource(repairImagesSrc, name))
+    .join("\n");
+  const names = [
+    "isZhihuImageUrl",
+    "imageIdentity",
+    "extensionFromUrl",
+    "toFetchableUrl",
+    "extractImgSources",
+    "sha256Hex",
+    "imageObjectKeyForUrl",
+    "localImageObjectName",
+    "planContentImageTasks",
+    "clampImageBatchSize",
+    "clampImageMaxBatches",
+    "assertLocalWorkerUrl",
+    "normalizeBatchResult"
+  ];
+  const code = [
+    extraSource,
+    ...names.map((name) => extractFunction(repairImagesSrc, name)),
+    `globalThis.__pure = { ${names.join(", ")} };`
+  ].join("\n\n");
+  const context = vm.createContext({ createHash, URL });
+  vm.runInContext(code, context);
+  return context.__pure;
+}
+
+test("图片身份规则与 Worker 生产实现逐字等价（常量/正则/扩展名归一）", () => {
+  // 允许扩展名集合、单篇上限、R2/站内路径前缀必须完全一致
+  assert.deepEqual(
+    [...evalConstRhs(repairImagesSrc, "ALLOWED_IMAGE_EXTENSIONS")].sort(),
+    [...evalConstRhs(imagesProductionSrc, "ALLOWED_EXTENSIONS")].sort(),
+    "允许的图片扩展名必须与生产一致"
+  );
+  assert.equal(
+    evalConstRhs(repairImagesSrc, "MAX_IMAGES_PER_CONTENT"),
+    evalConstRhs(imagesProductionSrc, "MAX_IMAGES_PER_CONTENT"),
+    "单篇图片上限必须与生产一致"
+  );
+  assert.equal(
+    evalConstRhs(repairImagesSrc, "IMAGE_KEY_PREFIX"),
+    evalConstRhs(imagesProductionSrc, "IMAGE_KEY_PREFIX"),
+    "R2 图片对象前缀必须与生产一致"
+  );
+  assert.equal(
+    evalConstRhs(repairImagesSrc, "IMAGE_API_PREFIX"),
+    evalConstRhs(imagesProductionSrc, "IMAGE_API_PREFIX"),
+    "站内图片路径前缀必须与生产一致"
+  );
+
+  // 身份串/扩展名/可抓取 URL/图片提取四条规则必须逐字沿用生产实现
+  const identityChain = '.replace(/^\\/+/, "").replace(/_\\d+w(?=\\.[^./]+$)/i, "")';
+  const extMatch = "pathname.match(/\\.([a-z0-9]+)$/i)";
+  const jpegRule = 'ext === "jpeg" ? "jpg" : ext';
+  const ampRule = 'src.trim().replace(/&amp;/gi, "&")';
+  const imgTagRe = "const tagRe = /<img\\b[^>]*>/gi;";
+  const imgSrcAttrRe = `const srcAttrRe = /\\ssrc\\s*=\\s*(?:"([^"]*)"|'([^']*)')/i;`;
+  const hostRule = 'host === "zhimg.com" || host.endsWith(".zhimg.com")';
+  for (const snippet of [identityChain, extMatch, jpegRule, ampRule, imgTagRe, imgSrcAttrRe, hostRule]) {
+    assert.ok(imagesProductionSrc.includes(snippet), `生产图片规则缺少预期片段：${snippet}`);
+    assert.ok(repairImagesSrc.includes(snippet), `本地脚本必须沿用生产片段：${snippet}`);
+  }
+  assert.ok(imagesProductionSrc.includes('parsed.protocol !== "https:"'));
+  assert.ok(repairImagesSrc.includes('parsed.protocol !== "https:"'));
+
+  // sha256 必须是 UTF-8 小写 hex（与 Worker utils/hash.ts 的 crypto.subtle 结果一致）
+  const pure = loadRepairImagePure();
+  assert.equal(pure.sha256Hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  assert.equal(pure.sha256Hex("v2-abc.jpg"), "52ad864b4bd98cc6f92dd9863da543cd7e1f92c6512cd562bb7a5c8e0c4263d0");
+  assert.equal(
+    pure.imageObjectKeyForUrl("https://pic1.zhimg.com/v2-abc_720w.jpg?source=1"),
+    "images/52ad864b4bd98cc6f92dd9863da543cd7e1f92c6512cd562bb7a5c8e0c4263d0.jpg"
+  );
+  assert.equal(pure.imageIdentity("https://picx.zhimg.com/v2-abc_720w.jpg?x=1"), "v2-abc.jpg");
+});
+
+test("图片任务规划：外链按身份去重入队，站内路径绝不二次哈希", () => {
+  const pure = loadRepairImagePure();
+  const url = "https://pic1.zhimg.com/v2-abc_720w.jpg?source=1";
+  const expectedKey = pure.imageObjectKeyForUrl(url);
+
+  // 1) 对象缺失 → 生成一条任务
+  const missing = pure.planContentImageTasks(`<p>a<img src="${url}">b</p>`, {
+    objectExists: () => false,
+    findTask: () => null
+  });
+  assert.equal(missing.tasks.length, 1);
+  assert.equal(missing.tasks[0].objectKey, expectedKey);
+  assert.equal(missing.tasks[0].imageUrl, url);
+  assert.equal(missing.counts.externalUrls, 1);
+  assert.equal(missing.counts.newTasks, 1);
+
+  // 2) 对象已存在 → 不入队
+  const backedUp = pure.planContentImageTasks(`<img src="${url}">`, {
+    objectExists: (key) => key === expectedKey,
+    findTask: () => null
+  });
+  assert.equal(backedUp.tasks.length, 0);
+  assert.equal(backedUp.counts.externalBackedUp, 1);
+
+  // 3) 同一路径不同子域/尺寸只算一张
+  const duplicated = pure.planContentImageTasks(
+    '<img src="https://pic1.zhimg.com/v2-abc_720w.jpg?source=1"><img src="https://picx.zhimg.com/v2-abc.jpg?sign=2">',
+    { objectExists: () => false, findTask: () => null }
+  );
+  assert.equal(duplicated.tasks.length, 1);
+  assert.equal(duplicated.counts.externalUrls, 2);
+
+  // 4) 已改写的站内路径缺对象且没有任务行：不可恢复，跳过且绝不生成新对象名
+  const localName = `${"a".repeat(64)}.jpg`;
+  const localMissing = pure.planContentImageTasks(`<img src="/api/images/${localName}">`, {
+    objectExists: () => false,
+    findTask: () => null
+  });
+  assert.equal(localMissing.tasks.length, 0);
+  assert.equal(localMissing.counts.localPaths, 1);
+  assert.equal(localMissing.counts.skipped["local-path-no-task"], 1);
+  assert.ok(!JSON.stringify(localMissing.tasks).includes("/api/images/"), "站内路径不得被当成外链");
+
+  // 5) 站内路径缺对象但本地任务行是 pending：交给现有队列消费
+  const localPending = pure.planContentImageTasks(`<img src="/api/images/${localName}">`, {
+    objectExists: () => false,
+    findTask: () => ({ imageUrl: url, status: "pending" })
+  });
+  assert.equal(localPending.tasks.length, 0);
+  assert.equal(localPending.counts.localTaskPending, 1);
+
+  // 6) failed / done 的旧行不会本次复活，单独计入跳过
+  const localFailed = pure.planContentImageTasks(`<img src="/api/images/${localName}">`, {
+    objectExists: () => false,
+    findTask: () => ({ imageUrl: url, status: "failed" })
+  });
+  assert.equal(localFailed.counts.skipped["local-path-failed-task"], 1);
+  const localDone = pure.planContentImageTasks(`<img src="/api/images/${localName}">`, {
+    objectExists: () => false,
+    findTask: () => ({ imageUrl: url, status: "done" })
+  });
+  assert.equal(localDone.counts.skipped["local-path-done-without-object"], 1);
+
+  // 7) 外链已有 failed 行：不重复入队，等生产冷却逻辑处理
+  const externalFailed = pure.planContentImageTasks(`<img src="${url}">`, {
+    objectExists: () => false,
+    findTask: () => ({ imageUrl: url, status: "failed" })
+  });
+  assert.equal(externalFailed.tasks.length, 0);
+  assert.equal(externalFailed.counts.skipped["external-failed-task"], 1);
+});
+
+test("图片任务规划：协议相对地址被还原、无扩展名/非知乎域名/超上限都只统计不猜", () => {
+  const pure = loadRepairImagePure();
+
+  // 协议相对地址补 https: 后才可抓取
+  const protocolRelative = pure.planContentImageTasks(
+    '<img src="//pic1.zhimg.com/v2-rel.png?x=1&amp;y=2">',
+    { objectExists: () => false, findTask: () => null }
+  );
+  assert.equal(protocolRelative.tasks.length, 1);
+  assert.ok(protocolRelative.tasks[0].imageUrl.startsWith("https://pic1.zhimg.com/"));
+  assert.ok(protocolRelative.tasks[0].imageUrl.includes("&y=2"), "&amp; 必须还原成 &");
+
+  // 无扩展名：保留现状（不猜 Content-Type、不生成对象名）
+  const noExt = pure.planContentImageTasks('<img src="https://pic1.zhimg.com/v2-noext">', {
+    objectExists: () => false,
+    findTask: () => null
+  });
+  assert.equal(noExt.tasks.length, 0);
+  assert.equal(noExt.counts.skipped["no-extension"], 1);
+
+  // 非知乎域名 / 非 https 一律跳过
+  const other = pure.planContentImageTasks(
+    '<img src="https://evil.example.com/a.jpg"><img src="http://pic1.zhimg.com/v2-http.jpg">',
+    { objectExists: () => false, findTask: () => null }
+  );
+  assert.equal(other.tasks.length, 0);
+  assert.equal(other.counts.skipped["non-zhihu"], 2);
+
+  // 超过 50 张时与生产一致：只处理前 50 个候选，其余计入 over-limit
+  const many = Array.from({ length: 55 }, (_, i) => `<img src="https://pic1.zhimg.com/v2-${i}.jpg">`).join("");
+  const capped = pure.planContentImageTasks(many, { objectExists: () => false, findTask: () => null });
+  assert.equal(capped.tasks.length, 50);
+  assert.equal(capped.counts.externalUrls, 50);
+  assert.equal(capped.counts.skipped["over-limit"], 5);
+
+  // 空正文/无图片直接返回空计划
+  assert.equal(pure.planContentImageTasks("", { objectExists: () => false, findTask: () => null }).tasks.length, 0);
+  assert.equal(
+    pure.planContentImageTasks("<p>no image</p>", { objectExists: () => false, findTask: () => null }).tasks.length,
+    0
+  );
+});
+
+test("图片补采参数收敛：batch-size 1..100、max-batches >=0、只允许 loopback Worker", () => {
+  const pure = loadRepairImagePure();
+  assert.equal(pure.clampImageBatchSize(20), 20);
+  assert.equal(pure.clampImageBatchSize(0), 1);
+  assert.equal(pure.clampImageBatchSize(101), 100);
+  assert.equal(pure.clampImageBatchSize(Number.NaN), 20);
+  assert.equal(pure.clampImageBatchSize("30"), 30);
+
+  assert.equal(pure.clampImageMaxBatches(0), 0);
+  assert.equal(pure.clampImageMaxBatches(5), 5);
+  assert.equal(pure.clampImageMaxBatches(-3), 0);
+  assert.equal(pure.clampImageMaxBatches(Number.NaN), 0);
+
+  assert.equal(pure.assertLocalWorkerUrl("http://127.0.0.1:18787"), "http://127.0.0.1:18787");
+  assert.equal(pure.assertLocalWorkerUrl("http://localhost:18787"), "http://localhost:18787");
+  assert.throws(() => pure.assertLocalWorkerUrl("https://zhihu-backup.pages.dev"), /拒绝非 loopback/);
+
+  // vm 里创建的对象原型属于另一个 realm，逐字段比较而不是 deepEqual
+  const batch = pure.normalizeBatchResult({ claimed: 20, done: 19, failed: 0, retry: 1 });
+  assert.equal(batch.claimed, 20);
+  assert.equal(batch.done, 19);
+  assert.equal(batch.failed, 0);
+  assert.equal(batch.retry, 1);
+  for (const empty of [pure.normalizeBatchResult({}), pure.normalizeBatchResult(null)]) {
+    assert.equal(empty.claimed, 0);
+    assert.equal(empty.done, 0);
+    assert.equal(empty.failed, 0);
+    assert.equal(empty.retry, 0);
+  }
+});
+
+test("repair-local-images 只写本地 image_tasks、只连 loopback、临时 SQL 必清理", () => {
+  const src = repairImagesSrc;
+
+  // 绝不出现远端执行标志，且唯一硬编码的地址是 loopback
+  assert.ok(!src.includes("--remote"), "源码不得出现任何远端执行标志");
+  assert.ok(!/https:\/\//.test(src), "源码不得硬编码任何远端地址");
+  assert.equal((src.match(/http:\/\//g) || []).length, 1, "唯一允许的地址是 loopback Worker");
+  assert.match(src, /const LOCAL_WORKER_URL = "http:\/\/127\.0\.0\.1:\d+";/);
+  assert.match(src, /assertLocalWorkerUrl\(LOCAL_WORKER_URL\)/);
+  assert.equal((src.match(/\bfetch\(/g) || []).length, 1, "只允许一个 fetch 出口");
+  assert.match(src, /fetchJson\(`\$\{LOCAL_WORKER_URL\}\$\{pathname\}`/);
+
+  // 只写 image_tasks，且必须幂等
+  assert.match(src, /INSERT OR IGNORE INTO image_tasks/);
+  assert.match(src, /\(content_pk, image_url, object_key, status, attempts, created_at, updated_at\)/);
+  assert.ok(!/INTO\s+contents\b/i.test(src), "不得写 contents");
+  assert.ok(!/UPDATE\s+contents\b/i.test(src), "不得改 contents");
+  assert.ok(!/content_hash\s*=/i.test(src), "不得改 content_hash");
+  assert.ok(!/\/ingest\/content/.test(src), "不得重新入库正文");
+
+  // 写库走 wrangler 本地 SQL 文件，且 SQL 文件与临时目录都在 finally 清理
+  assert.match(src, /"d1", "execute", DB_NAME, "--local", "--yes", `--file=\$\{sqlPath\}`/);
+  assert.match(src, /fs\.rmSync\(sqlPath, \{ force: true \}\)/);
+  assert.match(src, /fs\.rmSync\(tempDir, \{ recursive: true, force: true \}\)/);
+  assert.match(src, /fs\.mkdtempSync\(path\.join\(os\.tmpdir\(\)/);
+
+  // 显式模式标记 + 只读打开的本地库
+  assert.match(src, /if \(!opts\.repairImages\)/);
+  assert.match(src, /readonly: true, fileMustExist: true/);
+  assert.match(src, /query_only = ON/);
+
+  // 日志里不得出现图片外链 / HTML / 正文 / cookie
+  assert.ok(!/cookie/i.test(src), "脚本不得处理 cookie");
+  const logLines = src.split("\n").filter((line) => /console\.(log|error|warn)\(|(^|\s)log\(/.test(line));
+  for (const line of logLines) {
+    assert.ok(!line.includes("imageUrl"), `日志不得打印图片外链: ${line.trim()}`);
+    assert.ok(!line.includes("image_url"), `日志不得打印外链字段: ${line.trim()}`);
+  }
+  assert.ok(!/JSON\.stringify\([^)]*tasks/.test(src), "不得把任务外链序列化进日志");
+  assert.ok(!/JSON\.stringify\([^)]*html/.test(src), "不得把 HTML 序列化进日志");
+
+  // 只有两个带鉴权的本地端点；健康检查走 /api/stats
+  const endpoints = [...src.matchAll(/localRequest\(\s*"([^"]+)"/g)].map((match) => match[1]).sort();
+  assert.deepEqual(endpoints, ["/ingest/image-batch", "/ingest/sync-state"]);
+  assert.match(src, /fetchJson\(`\$\{LOCAL_WORKER_URL\}\/api\/stats`/);
 });

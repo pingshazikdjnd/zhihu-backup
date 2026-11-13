@@ -15,13 +15,22 @@
  *   node scripts/full-local-harvest.mjs --from=stage4_following_full
  *   node scripts/full-local-harvest.mjs --cooldown-seconds=600  # 覆盖风控冷却秒数（默认 600，最多 12 轮）
  *   node scripts/full-local-harvest.mjs --repair-comments      # 独立运维入口：补采存量被 v4 截断的评论
+ *   node scripts/full-local-harvest.mjs --repair-images       # 独立运维入口：从本地正文重建缺失图片任务并有限批补下
  *
  * 存量评论补采（--repair-comments）：
  *   修复前的 v4 根评论端点对高评论回答假 is_end，存量内容只入库第一页 20 条根评论。
- *   本模式从本地 D1 查出「根评论数 < 评论总数/3 且根评论 < 50」的 answer/article，
+ *   本模式从本地 D1 查出「根评论数明显少于评论总数」的 answer/article：
+ *     - 原判定：根评论 * 3 < 评论总数 且 根评论 < 50（根评论数量级明显不足）；
+ *     - 截断判定：评论总数 > 20 且 根评论 = 20（正好停在第一页 20 条，是 v4 假 is_end 的签名）。
  *   每 50 条一批交给爬虫 runType=repair-comments 全量重抓（翻到 is_end + 删除对账）。
  *   它不写进度文件、不参与 stage1-5 状态机，默认不运行，必须显式传参触发；
  *   中途被风控打断或进程退出后重跑同一条命令即可，已补齐的内容会因根评论数增长自动从清单消失。
+ *
+ * 存量图片补采（--repair-images）：
+ *   独立入口，转交 scripts/repair-local-images.mjs：只读本地 D1/R2 已有正文，按 Worker
+ *   生产图片身份规则重建 image_tasks，再有限批调用本地 Worker /ingest/image-batch。
+ *   它不访问知乎正文/评论、不写阶段进度，也不会 upsert 正文或改 content_hash。
+ *   --image-batch-size / --image-max-batches / --image-scan-only / --dry-run 原样透传。
  *
  * 风控冷却续跑：
  *   任意阶段返回 partial_risk_controlled（知乎临时风控 40352）时不会直接退出，
@@ -120,6 +129,12 @@ const opts = {
   repairBatchSize: 50,
   // 单次最多补采多少条（0=不限制）：先小批量试跑、确认风控表现后再全量
   repairMax: 0,
+  // 存量图片补采（独立入口，转交 scripts/repair-local-images.mjs）：默认关闭
+  repairImages: false,
+  imageBatchSize: 20,
+  imageMaxBatches: 0,
+  imageScanOnly: false,
+  dryRun: false,
   // 知乎 40352 滑窗风控冷却：默认休息 10 分钟再自动续跑
   cooldownSeconds: 600,
   waitWorkerSeconds: 120,
@@ -139,7 +154,17 @@ for (const arg of process.argv.slice(2)) {
   } else if (arg.startsWith("--repair-max=")) {
     const n = Number(arg.slice("--repair-max=".length));
     if (Number.isFinite(n) && n >= 0) opts.repairMax = Math.trunc(n);
-  } else if (arg.startsWith("--cooldown-seconds=")) {
+  } else if (arg === "--repair-images") opts.repairImages = true;
+  else if (arg.startsWith("--image-batch-size=")) {
+    // 透传给 scripts/repair-local-images.mjs（1..100，越界由该脚本收敛）
+    const n = Number(arg.slice("--image-batch-size=".length));
+    if (Number.isFinite(n) && n > 0) opts.imageBatchSize = Math.trunc(n);
+  } else if (arg.startsWith("--image-max-batches=")) {
+    const n = Number(arg.slice("--image-max-batches=".length));
+    if (Number.isFinite(n) && n >= 0) opts.imageMaxBatches = Math.trunc(n);
+  } else if (arg === "--image-scan-only") opts.imageScanOnly = true;
+  else if (arg === "--dry-run") opts.dryRun = true;
+  else if (arg.startsWith("--cooldown-seconds=")) {
     const n = Number(arg.slice("--cooldown-seconds=".length));
     if (Number.isFinite(n) && n >= 0) opts.cooldownSeconds = Math.trunc(n);
   } else if (arg.startsWith("--rest-seconds=")) {
@@ -953,9 +978,17 @@ async function queryLocalD1Json(sql, label) {
 }
 
 /**
- * 补采候选：根评论数明显少于评论总数的 answer/article。
- * 判定与爬虫 shouldSyncCommentsDeep 保持一致（roots * 3 < comment_count 且 roots < 50），
- * 上限 50 同时保证「根评论本来就多、只是回复占比高」的正常内容不会被反复补采。
+ * 补采候选：根评论数明显少于评论总数，或正好停在第一页 20 条的 answer/article。
+ *
+ * 两条判定取并集：
+ *   1. 原判定（与爬虫 shouldSyncCommentsDeep 一致）：roots * 3 < comment_count 且 roots < 50。
+ *      上限 50 保证「根评论本来就多、只是回复占比高」的正常内容不会被反复补采。
+ *   2. 首 20 条截断：comment_count > 20 且 roots = 20。v4 根评论端点对高评论回答假 is_end，
+ *      结果恰好只入库第一页 20 条根评论，这是该 bug 的精确签名；只认 roots=20 这一个点，
+ *      不是 roots<=20 的区间，因此不会顺手把 roots 很少的内容全拉进重抓，
+ *      更不会退化成「根评论 < 评论总数就重抓」（回复占比高的内容会反复抓同一批根评论）。
+ *      代价：真实只有 20 条根评论、回复很多的内容会在补采后仍留在清单里，
+ *      重跑一次的代价是翻到 is_end（请求数远小于全量重抓），可接受。
  */
 const REPAIR_CANDIDATE_SQL = [
   "SELECT c.pk AS pk",
@@ -969,13 +1002,15 @@ const REPAIR_CANDIDATE_SQL = [
   "WHERE c.is_deleted = 0",
   "  AND c.source_type IN ('answer', 'article')",
   "  AND c.comment_count > 0",
-  "  AND COALESCE(r.roots, 0) * 3 < c.comment_count",
-  "  AND COALESCE(r.roots, 0) < 50",
+  "  AND (",
+  "    (COALESCE(r.roots, 0) * 3 < c.comment_count AND COALESCE(r.roots, 0) < 50)",
+  "    OR (c.comment_count > 20 AND COALESCE(r.roots, 0) = 20)",
+  "  )",
   "ORDER BY c.pk"
 ].join("\n");
 
 async function queryRepairCommentTargets() {
-  log("🔎 从本地 D1 查询待补采内容（根评论数 < 评论总数/3 且根评论 < 50）...");
+  log("🔎 从本地 D1 查询待补采内容（根评论数 < 评论总数/3 且根评论 < 50，或评论数 > 20 且根评论 = 20）...");
   const rows = await queryLocalD1Json(REPAIR_CANDIDATE_SQL, "补采候选清单");
   const targets = [];
   for (const row of rows) {
@@ -1108,6 +1143,36 @@ async function runRepairCommentsMode(ctx) {
   }
   log("════════════════════════════════════════════════════════");
   return completed;
+}
+
+/**
+ * 存量图片补采（--repair-images）：独立入口，转交 scripts/repair-local-images.mjs。
+ * 该子脚本只读本地 D1/R2 已有正文，按 Worker 生产图片身份规则重建 image_tasks，
+ * 再有限批调用本地 Worker /ingest/image-batch；不访问知乎正文/评论、不写阶段进度、
+ * 不 upsert 正文、不改 content_hash。这里只透传参数并继承退出码。
+ */
+function runRepairImagesMode() {
+  const scriptPath = path.join(__dirname, "repair-local-images.mjs");
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`找不到图片补采脚本：${scriptPath}`);
+  }
+  const args = [
+    scriptPath,
+    "--repair-images",
+    `--image-batch-size=${opts.imageBatchSize}`,
+    `--image-max-batches=${opts.imageMaxBatches}`
+  ];
+  if (opts.imageScanOnly) args.push("--image-scan-only");
+  if (opts.dryRun) args.push("--dry-run");
+  log("🖼️ 转入独立图片补采入口 scripts/repair-local-images.mjs（只读本地正文，不访问知乎正文/评论）");
+  return new Promise(resolve => {
+    const child = spawn(process.execPath, args, { cwd: ROOT, stdio: "inherit" });
+    child.on("error", err => {
+      log(`❌ 启动图片补采脚本失败: ${err?.message || err}`);
+      resolve(1);
+    });
+    child.on("close", code => resolve(code ?? 1));
+  });
 }
 
 /**
@@ -1245,7 +1310,13 @@ async function runStageWithCooldown(stage, ctx, progress) {
         `⛔ 阶段 ${stage.id} 冷却后重跑仍 0 条新进展，且在 ${Math.max(1, Math.round(roundMs / 1000))} 秒内` +
           `再次被风控打断（第 ${round}/${MAX_COOLDOWN_ROUNDS} 轮）`
       );
-      log(`🖐️ ${humanVerificationHint()}`);
+      // 没有抓到任何 40352/unhuman 标记时，不要把「断点空页空转」误报成需要滑块
+      log(
+        unhuman
+          ? `🖐️ ${humanVerificationHint()}`
+          : "🖐️ 未检测到 40352 人机验证标记：更可能是断点游标已到末尾未清空（空页空转）或接口软限流；" +
+            "请检查 upvotes_cursor 后重跑，无需在浏览器做滑块"
+      );
       return { ok: false, code };
     }
 
@@ -1291,11 +1362,16 @@ function printHelp() {
       "  node scripts/full-local-harvest.mjs --only=stage4_following_full",
       "  node scripts/full-local-harvest.mjs --from=stage3_collections_full",
       "  node scripts/full-local-harvest.mjs --repair-comments   补采存量被 v4 截断的评论（独立运维入口，不写阶段进度）",
+      "  node scripts/full-local-harvest.mjs --repair-images    从本地已有正文重建缺失图片任务并有限批补下（独立运维入口）",
       "",
       "可选参数：",
       "  --skip-build                跳过爬虫编译（直接使用现有 dist/main.js）",
       "  --repair-batch-size=50      补采每批下发的内容条数（默认 50）",
-      "  --repair-max=0              单次补采最多处理多少条（0=不限制，便于先小批量试跑）",
+      "  --repair-max=0              单次评论补采最多处理多少条（0=不限制，便于先小批量试跑）",
+      "  --image-batch-size=20       图片补采每批领取张数（1..100，默认 20）",
+      "  --image-max-batches=0       图片补采最多消费多少批（0=持续消费至队列清空或遇到失败）",
+      "  --image-scan-only           图片补采只扫描入队，不调用 /ingest/image-batch",
+      "  --dry-run                   图片补采只扫描统计：不写库、不下载",
       `  --cooldown-seconds=600      知乎临时风控（partial_risk_controlled）冷却秒数（默认 600 秒，最多 12 轮）`,
       "  --wait-worker-seconds=120   等待本地 Worker 就绪的秒数（默认 120）",
       "",
@@ -1426,6 +1502,17 @@ function stopHeartbeat() {
 async function main() {
   if (opts.help) {
     printHelp();
+    return;
+  }
+  // 独立图片补采入口：在拿实例锁之前分流。它不碰知乎、不写阶段进度，
+  // 与正在跑的全量阶段互不干扰（image_tasks 的领取本身是乐观锁 CAS）。
+  if (opts.repairImages) {
+    if (opts.repairComments) {
+      log("❌ --repair-comments 与 --repair-images 不能同时使用");
+      process.exitCode = 1;
+      return;
+    }
+    process.exitCode = await runRepairImagesMode();
     return;
   }
   if (!acquireInstanceLock()) {
