@@ -273,11 +273,12 @@ function buildContentPayloadFromDetail(sourceType, sourceId, item) {
     sourceType === "answer"
       ? item.question?.title || "未知问题"
       : item.title || "未知文章";
-  const hasQuestionId = item.question?.id != null && String(item.question.id).trim() !== "";
+  const qId = item.question?.id == null ? "" : String(item.question.id).trim();
+  const hasQuestionId = qId !== "" && qId !== "undefined" && qId !== "null";
   const sourceUrl =
     sourceType === "answer"
       ? hasQuestionId
-        ? `https://www.zhihu.com/question/${item.question.id}/answer/${sourceId}`
+        ? `https://www.zhihu.com/question/${qId}/answer/${sourceId}`
         : `https://www.zhihu.com/answer/${sourceId}`
       : `https://zhuanlan.zhihu.com/p/${sourceId}`;
   return {
@@ -293,7 +294,7 @@ function buildContentPayloadFromDetail(sourceType, sourceId, item) {
     },
     question:
       sourceType === "answer" && hasQuestionId
-        ? { id: String(item.question.id), title: item.question?.title }
+        ? { id: qId, title: item.question?.title }
         : undefined,
     contentHtml: cleanHtml(item.content),
     contentMd: "",

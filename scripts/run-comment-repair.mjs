@@ -500,6 +500,7 @@ async function main() {
   const completedSet = new Set(progress.completedPks);
   const skippedClosedSet = new Set(progress.skippedClosedPks);
   const skippedSet = new Set(progress.skippedPks);
+  const sessionDeferredSet = new Set();
   const allRemaining = scan.targets.filter(
     (t) => !completedSet.has(t.pk) && !skippedClosedSet.has(t.pk) && !skippedSet.has(t.pk)
   );
@@ -592,7 +593,11 @@ async function main() {
 
     while (true) {
       const pending = targetSlice.filter(
-        (x) => !completedSet.has(x.pk) && !skippedClosedSet.has(x.pk) && !skippedSet.has(x.pk)
+        (x) =>
+          !completedSet.has(x.pk) &&
+          !skippedClosedSet.has(x.pk) &&
+          !skippedSet.has(x.pk) &&
+          !sessionDeferredSet.has(x.pk)
       );
       if (pending.length === 0) break;
 
@@ -641,7 +646,8 @@ async function main() {
       if (!riskHit && result.warnedPks.size > 0) {
         for (const pk of result.warnedPks) {
           if (!completedSet.has(pk) && !skippedClosedSet.has(pk)) {
-            log(`[batch ${batchNo}] 单条告警 (${pk}) 暂不写入完成/永久跳过，留待后续轮次重试`);
+            sessionDeferredSet.add(pk);
+            log(`[batch ${batchNo}] 单条告警 (${pk}) 暂不写入完成/永久跳过，本轮先延后，留待后续启动重试`);
           }
         }
       }

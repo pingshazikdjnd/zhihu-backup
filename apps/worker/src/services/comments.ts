@@ -1039,17 +1039,32 @@ export async function listRootComments(
   const rows = result.results ?? [];
   const offloadTargets = bucket ? await listReadableCommentOffloadTargets(bucket).catch(() => []) : [];
 
-  // 主 D1 一条都没有：评论整批被 offload 到外部扩容库，直接透明回源
+  // 主 D1 一条都没有：评论整批被 offload 到外部扩容库（或位于主 D1 末尾之后），直接透明回源
   if (rows.length === 0) {
-    let remoteOffset = offset;
     if (offset > 0 && offloadTargets.length > 0) {
-      const countRow = await database.prepare(
-        `SELECT COUNT(*) AS cnt FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL AND is_deleted = 0`
-      ).bind(contentPk).first<{ cnt: number }>().catch(() => null);
-      remoteOffset = Math.max(0, offset - (Number(countRow?.cnt ?? 0) || 0));
+      const mainIdsResult = await database.prepare(
+        `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL AND is_deleted = 0`
+      ).bind(contentPk).all<{ id: string }>().catch(() => ({ results: [] as Array<{ id: string }> }));
+      const mainIds = new Set(
+        (mainIdsResult.results ?? []).map(r => r.id).filter(Boolean)
+      );
+      if (mainIds.size > 0) {
+        // 混合过渡态：主 D1 有旧根、外部库可能重存过同一根；先去重再按外部序列真实偏移切片
+        const priorRemoteNeeded = Math.max(0, offset - mainIds.size);
+        const fetchLimit = limit + priorRemoteNeeded + mainIds.size;
+        for (const target of offloadTargets) {
+          const remoteRows = await fetchOffloadRootComments(target, contentPk, fetchLimit, 0);
+          if (remoteRows.length > 0) {
+            return remoteRows
+              .filter(row => !mainIds.has(row.id))
+              .slice(priorRemoteNeeded, priorRemoteNeeded + limit);
+          }
+        }
+        return rows;
+      }
     }
     for (const target of offloadTargets) {
-      const remoteRows = await fetchOffloadRootComments(target, contentPk, limit, remoteOffset);
+      const remoteRows = await fetchOffloadRootComments(target, contentPk, limit, offset);
       if (remoteRows.length > 0) return remoteRows;
     }
     return rows;
@@ -1284,7 +1299,9 @@ async function replaceCommentsByRootOffloaded(
   const now = new Date().toISOString();
   await ensureRemoteCommentSchema(target);
 
-  // 远端现状：根评论 + 线程索引（partial 时顺带取旧扁平子评论）合成 1 次 pipeline 读取
+  const needLegacyChildMerge =
+    Boolean(input.partial) || input.roots.some(root => !root.isChildrenComplete);
+  // 远端现状：根评论 + 线程索引（需合并未完结楼中楼时顺带取旧扁平子评论）合成 1 次 pipeline 读取
   const readBatchStatements: RemoteSqlStatement[] = [
     {
       sql: `SELECT id, comment_hash, is_deleted, author_avatar, likes, time_text, location, child_count
@@ -1299,7 +1316,7 @@ async function replaceCommentsByRootOffloaded(
       params: [input.contentPk]
     }
   ];
-  if (input.partial) {
+  if (needLegacyChildMerge) {
     readBatchStatements.push({
       sql: `SELECT id, parent_comment_id, author_name, author_avatar, be_replied, content_md,
                    img_url, time_text, location, likes, is_author
@@ -1316,7 +1333,7 @@ async function replaceCommentsByRootOffloaded(
     (threadResult?.rows ?? []).map(toRemoteThreadRow).map(row => [row.root_id, row])
   );
   const remoteLegacyChildrenByRoot = new Map<string, ChildCommentRecord[]>();
-  const remoteLegacyReadFailed = Boolean(input.partial) && !remoteLegacyResult;
+  const remoteLegacyReadFailed = needLegacyChildMerge && !remoteLegacyResult;
   if (remoteLegacyResult) {
     for (const row of remoteLegacyResult.rows) {
       const parentId = row.parent_comment_id == null ? "" : String(row.parent_comment_id);
@@ -1759,10 +1776,9 @@ export async function getChildComments(
       if (blob.status === "ok" && (blob.complete || blob.children.length > 0)) {
         return blob.children;
       }
-      if (blob.status === "missing") {
-        const rowChildren = await readRemoteChildRows(target, rootId);
-        if (rowChildren.length > 0) return rowChildren;
-      }
+      // blob 缺失、读取失败或是不完整空快照时，回查外部库扁平子评论行兼容历史写入
+      const rowChildren = await readRemoteChildRows(target, rootId);
+      if (rowChildren.length > 0) return rowChildren;
     }
 
     const stored = await readStoredChildThread(bucket, rootId);

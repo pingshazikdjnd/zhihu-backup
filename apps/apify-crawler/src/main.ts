@@ -598,6 +598,19 @@ function getCookiesArray() {
   return cookies;
 }
 
+/** 从知乎 API 的 question 对象提取有效 question 引用与规范回答链接，避免拼出 /question/undefined/... */
+function resolveAnswerQuestionMeta(question: any, answerId: string | number) {
+  const rawId = question?.id;
+  const qId = rawId == null ? "" : String(rawId).trim();
+  const hasQuestionId = qId !== "" && qId !== "undefined" && qId !== "null";
+  return {
+    sourceUrl: hasQuestionId
+      ? `https://www.zhihu.com/question/${qId}/answer/${answerId}`
+      : `https://www.zhihu.com/answer/${answerId}`,
+    question: hasQuestionId ? { id: qId, title: question?.title } : undefined
+  };
+}
+
 function cleanHtml(html: any) {
   if (typeof html !== "string") return "";
   let cleaned = html.replace(/<img([^>]*)>/g, (match, attrs) => {
@@ -741,16 +754,14 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       const finalCommentCount = trueStats?.commentCount ?? item.comment_count ?? 0;
 
 
-      const hasQuestionId = item.question?.id != null && String(item.question.id).trim() !== "";
+      const { sourceUrl: answerSourceUrl, question: normalizedQuestion } = resolveAnswerQuestionMeta(item.question, item.id);
       const contentInput = {
         sourceType: "answer" as const,
         sourceId: String(item.id),
         title: item.question?.title || "未知问题",
-        sourceUrl: hasQuestionId
-          ? `https://www.zhihu.com/question/${item.question.id}/answer/${item.id}`
-          : `https://www.zhihu.com/answer/${item.id}`,
+        sourceUrl: answerSourceUrl,
         author: { name: item.author?.name, urlToken: item.author?.url_token, avatarUrl: item.author?.avatar_url, headline: item.author?.headline },
-        question: hasQuestionId ? { id: String(item.question.id), title: item.question?.title } : undefined,
+        question: normalizedQuestion,
         contentHtml: cleanHtml(item.content),
         contentMd: "",
         excerpt: item.excerpt || "",
@@ -1399,8 +1410,14 @@ export async function syncHotCommentsForContent(
                 ...(isArticle ? { allow404: true } : {})
               })).json;
             } catch (e: any) {
+              const errMsg = sanitizeErrorForLog(e);
+              if (/已关闭评论/.test(errMsg)) {
+                console.log(`ℹ️ 评论 ${c.id} 楼中楼已关闭，跳过 (${errMsg})`);
+                chIsEnd = true;
+                break;
+              }
               console.warn(
-                `⚠️ 楼中楼抓取中断 (${sourceType}:${sourceId} 评论 ${c.id}): ${sanitizeErrorForLog(e)}`
+                `⚠️ 楼中楼抓取中断 (${sourceType}:${sourceId} 评论 ${c.id}): ${errMsg}`
               );
               cIncomplete = true;
               cFailed = true;
@@ -1408,8 +1425,9 @@ export async function syncHotCommentsForContent(
             }
             const chData: any[] = Array.isArray(chJson.data) ? chJson.data : [];
             if (chData.length === 0) {
-              // 合法空页：只有明确 is_end 才算翻完
+              // 合法空页：只有明确 is_end 才算翻完；否则标记 cIncomplete 避免整篇误做删除对账
               chIsEnd = chJson.paging?.is_end === true;
+              if (!chIsEnd) cIncomplete = true;
               break;
             }
             chPages++;
@@ -1698,10 +1716,11 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
             if (!item || !item.type) continue;
 
             const sourceType = KNOWN_TYPES.has(item.type) ? item.type : "pin";
+            const answerMeta = item.type === "answer" ? resolveAnswerQuestionMeta(item.question, item.id) : null;
             // item.url 可能为空串或相对路径，zod .url() 会拒掉整个快照（不是丢一条）。
             // 拼接 URL 永远语法合法，item.url 仅在通过 URL 校验时才采用。
-            const fallbackUrl = item.type === "answer"
-                 ? `https://www.zhihu.com/question/${item.question?.id}/answer/${item.id}`
+            const fallbackUrl = answerMeta
+                 ? answerMeta.sourceUrl
                  : item.type === "article" ? `https://zhuanlan.zhihu.com/p/${item.id}` : `https://www.zhihu.com/pin/${item.id}`;
             let sourceUrl = fallbackUrl;
             if (typeof item.url === "string" && item.url) {
@@ -1727,7 +1746,7 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
                 title,
                 sourceUrl,
                 author: { name: item.author?.name, urlToken: item.author?.url_token, avatarUrl: item.author?.avatar_url, headline: item.author?.headline },
-                question: item.question ? { id: String(item.question.id), title: item.question.title } : undefined,
+                question: answerMeta?.question,
                 contentHtml: cleanHtml(rawContent),
                 contentMd: "",
                 // 收藏夹里的专栏文章没有 excerpt，摘要只在 excerpt_title（13-live-collections 实测）
@@ -2018,11 +2037,14 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
       let sourceId = String(target.id);
       let title = "";
       let sourceUrl = "";
+      let normalizedQuestion: { id: string; title: any } | undefined;
       
       if (target.type === "answer") {
         sourceType = "answer";
         title = target.question?.title || "未知问题";
-        sourceUrl = `https://www.zhihu.com/question/${target.question?.id}/answer/${target.id}`;
+        const resolved = resolveAnswerQuestionMeta(target.question, target.id);
+        sourceUrl = resolved.sourceUrl;
+        normalizedQuestion = resolved.question;
       } else if (target.type === "article") {
         sourceType = "article";
         title = target.title || "未知文章";
@@ -2056,7 +2078,7 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
         title,
         sourceUrl,
         author: { name: target.author?.name, urlToken: target.author?.url_token, avatarUrl: target.author?.avatar_url, headline: target.author?.headline },
-        question: target.question ? { id: String(target.question.id), title: target.question.title } : undefined,
+        question: normalizedQuestion,
         contentHtml,
         contentMd: "",
         excerpt: effectiveExcerpt,
@@ -2697,18 +2719,19 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               console.log(`  📌 [首次摸底 ${u.name}] 最热第 ${top60Seen} 篇无条件保存: ${item.question?.title || item.id}`);
             }
 
+            const { sourceUrl: answerSourceUrl, question: normalizedQuestion } = resolveAnswerQuestionMeta(item.question, item.id);
             const contentInput = {
               sourceType: "answer" as const,
               sourceId: String(item.id),
               title: item.question?.title || "未知问题",
-              sourceUrl: `https://www.zhihu.com/question/${item.question?.id}/answer/${item.id}`,
+              sourceUrl: answerSourceUrl,
               author: {
                 name: item.author?.name || u.name,
                 urlToken: item.author?.url_token || u.urlToken,
                 avatarUrl: item.author?.avatar_url || u.avatarUrl,
                 headline: item.author?.headline || u.headline
               },
-              question: item.question ? { id: String(item.question.id), title: item.question.title } : undefined,
+              question: normalizedQuestion,
               contentHtml: cleanedHtml,
               contentMd: "",
               excerpt: item.excerpt || "",

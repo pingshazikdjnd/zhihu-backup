@@ -1177,3 +1177,43 @@ test("repair-local-images 只写本地 image_tasks、只连 loopback、临时 SQ
   assert.deepEqual(endpoints, ["/ingest/image-batch", "/ingest/sync-state"]);
   assert.match(src, /fetchJson\(`\$\{LOCAL_WORKER_URL\}\/api\/stats`/);
 });
+
+// ---------------------------------------------------------------------------
+// run-comment-repair / repair-upvotes-and-gaps / crawler 安全回归
+// ---------------------------------------------------------------------------
+test("run-comment-repair 对非风控单条告警使用进程内 sessionDeferredSet 延后，既不写死 skippedPks 也不原地死循环", () => {
+  const repairSrc = readScript("scripts/run-comment-repair.mjs");
+  assert.match(repairSrc, /const sessionDeferredSet = new Set\(\)/);
+  assert.match(repairSrc, /!sessionDeferredSet\.has\(x\.pk\)/);
+  assert.match(repairSrc, /sessionDeferredSet\.add\(pk\)/);
+  assert.ok(!repairSrc.includes("progress.skippedPks.push(pk)"), "单条瞬时告警不得永久写入 skippedPks");
+});
+
+test("crawler 与补抓脚本统一过滤无效 question.id 并处理楼中楼关闭/空页", () => {
+  const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");
+  const gapRepairSrc = readScript("scripts/repair-upvotes-and-gaps.mjs");
+
+  const metaFns = loadPureFunctions(
+    crawlerSrc.replace("function resolveAnswerQuestionMeta(question: any, answerId: string | number)", "function resolveAnswerQuestionMeta(question, answerId)"),
+    ["resolveAnswerQuestionMeta"]
+  );
+  for (const badQ of [{ id: undefined, title: "T" }, { id: "undefined", title: "T" }, { id: "null", title: "T" }]) {
+    const res = metaFns.resolveAnswerQuestionMeta(badQ, "123");
+    assert.equal(res.sourceUrl, "https://www.zhihu.com/answer/123");
+    assert.equal(res.question, undefined);
+  }
+  const validMeta = metaFns.resolveAnswerQuestionMeta({ id: 456, title: "有效问题" }, "123");
+  assert.equal(validMeta.sourceUrl, "https://www.zhihu.com/question/456/answer/123");
+  assert.equal(validMeta.question.id, "456");
+
+  // 确认不再残留裸拼 /question/${...question?.id}/answer/
+  assert.ok(!crawlerSrc.includes("${item.question?.id}/answer/"));
+  assert.ok(!crawlerSrc.includes("${target.question?.id}/answer/"));
+  assert.match(gapRepairSrc, /qId !== "undefined" && qId !== "null"/);
+
+  // syncHotCommentsForContent 楼中楼需识别闭评错误且在非 is_end 空页置位 cIncomplete
+  const syncBody = crawlerSrc.slice(crawlerSrc.indexOf("export async function syncHotCommentsForContent("));
+  const childLoop = syncBody.slice(0, syncBody.indexOf("rootsBuffer.push("));
+  assert.match(childLoop, /\/已关闭评论\/\.test\(errMsg\)/);
+  assert.match(childLoop, /if \(!chIsEnd\) cIncomplete = true;/);
+});

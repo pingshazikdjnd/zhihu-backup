@@ -2500,3 +2500,200 @@ test("upsertContent：历史空串元数据与 null 比较不产生伪写入，�
   assert.equal(thirdRes.changed, false);
   assert.equal(d1.writes.length, 0, "修复后同输入再次写入必须 0 写");
 });
+
+test("offload：listRootComments 混合分页跨页去重、getChildComments 不完整空快照与 partial=false 不完整楼中楼合并旧扁平行", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.invalidateMainCommentCountCache();
+  auth.resetRemoteSchemaCache();
+
+  const remoteSqlite = new Database(":memory:");
+  const targetConfig = {
+    id: "ext-turso-hybrid-pagination",
+    name: "Turso 混合分页测试库",
+    provider: "turso",
+    enabled: true,
+    syncScopes: ["comments"],
+    storageRole: "offload",
+    overflowThresholdRows: 1500000,
+    endpointUrl: "https://ext-turso-hybrid.example.com",
+    authToken: "turso-hybrid-token",
+    createdAt: NOW_ISO,
+    updatedAt: NOW_ISO
+  };
+
+  const r2Store = new Map([[auth.R2_EXTERNAL_TARGETS_KEY, JSON.stringify([targetConfig])]]);
+  const bucket = {
+    async get(key) {
+      const value = r2Store.get(key);
+      return value === undefined ? null : { async text() { return value; } };
+    },
+    async put(key, value) { r2Store.set(key, String(value)); },
+    async head() { return null; },
+    async delete(key) { r2Store.delete(key); }
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const target = String(url);
+    if (target !== "https://ext-turso-hybrid.example.com/v2/pipeline") {
+      throw new Error(`unexpected fetch: ${target}`);
+    }
+    const body = JSON.parse(String(init.body));
+    const results = [];
+    for (const request of body.requests) {
+      if (request.type === "close") {
+        results.push({ type: "ok", response: { type: "close" } });
+        continue;
+      }
+      const sql = request.stmt.sql;
+      const args = (request.stmt.args || []).map(arg => {
+        if (!arg || arg.type === "null") return null;
+        if (arg.type === "integer" || arg.type === "float") return Number(arg.value);
+        return String(arg.value);
+      });
+      const statement = remoteSqlite.prepare(sql);
+      if (statement.reader) {
+        const cols = statement.columns().map(column => ({ name: column.name }));
+        const rows = statement.all(...args).map(row => cols.map(column => tursoCell(row[column.name])));
+        results.push({ type: "ok", response: { type: "execute", result: { cols, rows, affected_row_count: 0, last_insert_rowid: null } } });
+      } else {
+        const info = statement.run(...args);
+        results.push({ type: "ok", response: { type: "execute", result: { cols: [], rows: [], affected_row_count: info.changes, last_insert_rowid: null } } });
+      }
+    }
+    return { ok: true, status: 200, json: async () => ({ results }), text: async () => "" };
+  };
+
+  try {
+    // 1) 主 D1 有 3 条旧根评论 (A:100, B:50, Z:10)
+    const insertMainRoot = sqlite.prepare(`
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+      VALUES (?, ?, NULL, 'User', 'text', ?, 'h', ?, ?, 0)
+    `);
+    insertMainRoot.run("root_A", CONTENT_PK, 100, NOW_ISO, NOW_ISO);
+    insertMainRoot.run("root_B", CONTENT_PK, 50, NOW_ISO, NOW_ISO);
+    insertMainRoot.run("root_Z", CONTENT_PK, 10, NOW_ISO, NOW_ISO);
+
+    // 2) 外部库写入 3 条根评论 (root_B 重叠:50, root_C:30, root_D:5)，且 root_C 带 1 条不完整子评论；
+    // 先插入一条外部库旧扁平子行给 root_C，验证 partial=false + isChildrenComplete=false 也能合并保留它
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        roots: [{
+          id: "root_B",
+          author: "UserB",
+          authorAvatar: "",
+          content: "B",
+          img: "",
+          time: NOW_ISO,
+          location: "上海",
+          likes: 50,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 0,
+          isChildrenComplete: true,
+          children: []
+        }]
+      }, { DB: d1, BUCKET: bucket })
+    );
+
+    remoteSqlite.prepare(`
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+      VALUES ('legacy_child_1', ?, 'root_C', 'Legacy', 'legacy reply', 1, 'h1', ?, ?, 0)
+    `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        roots: [
+          {
+            id: "root_B",
+            author: "UserB",
+            authorAvatar: "",
+            content: "B",
+            img: "",
+            time: NOW_ISO,
+            location: "上海",
+            likes: 50,
+            isAuthor: false,
+            isTop: false,
+            isFeatured: false,
+            childCount: 0,
+            isChildrenComplete: true,
+            children: []
+          },
+          {
+            id: "root_C",
+            author: "UserC",
+            authorAvatar: "",
+            content: "C",
+            img: "",
+            time: NOW_ISO,
+            location: "上海",
+            likes: 30,
+            isAuthor: false,
+            isTop: false,
+            isFeatured: false,
+            childCount: 2,
+            isChildrenComplete: false,
+            children: [{ id: "new_child_2", parentId: "root_C", author: "New", content: "new reply", likes: 2 }]
+          },
+          {
+            id: "root_D",
+            author: "UserD",
+            authorAvatar: "",
+            content: "D",
+            img: "",
+            time: NOW_ISO,
+            location: "上海",
+            likes: 5,
+            isAuthor: false,
+            isTop: false,
+            isFeatured: false,
+            childCount: 0,
+            isChildrenComplete: true,
+            children: []
+          }
+        ]
+      }, { DB: d1, BUCKET: bucket })
+    );
+
+    // 验证 partial=false + isChildrenComplete=false 合并保留了外部库旧扁平子评论
+    const mergedChildren = await runWithDb(d1, () => commentsModule.getChildComments(bucket, "root_C", d1));
+    assert.deepEqual(
+      mergedChildren.map(c => c.id),
+      ["legacy_child_1", "new_child_2"],
+      "partial=false 时若单根 isChildrenComplete=false 也必须合并外部库旧扁平子评论"
+    );
+
+    // 验证 getChildComments 在外部库 blob 为不完整空快照 (complete=0, children=[]) 时回查外部扁平子评论行
+    remoteSqlite.prepare(`
+      INSERT OR REPLACE INTO child_comment_blobs (root_id, content_pk, payload_json, complete, updated_at)
+      VALUES ('root_C', ?, ?, 0, ?)
+    `).run(CONTENT_PK, JSON.stringify({ children: [], complete: false, updatedAt: NOW_ISO }), NOW_ISO);
+    const recoveredChildren = await runWithDb(d1, () => commentsModule.getChildComments(bucket, "root_C", d1));
+    assert.deepEqual(
+      recoveredChildren.map(c => c.id),
+      ["legacy_child_1"],
+      "不完整空 blob 不得屏蔽外部库既有扁平子评论"
+    );
+
+    // 验证 listRootComments 混合分页（limit=2: page1=[A,B], page2=[Z,C], page3=[D]）不重复不跳过
+    const p1 = await runWithDb(d1, () => commentsModule.listRootComments(d1, CONTENT_PK, { limit: 2, offset: 0 }, bucket));
+    const p2 = await runWithDb(d1, () => commentsModule.listRootComments(d1, CONTENT_PK, { limit: 2, offset: 2 }, bucket));
+    const p3 = await runWithDb(d1, () => commentsModule.listRootComments(d1, CONTENT_PK, { limit: 2, offset: 4 }, bucket));
+    assert.deepEqual(p1.map(r => r.id), ["root_A", "root_B"]);
+    assert.deepEqual(p2.map(r => r.id), ["root_Z", "root_C"]);
+    assert.deepEqual(p3.map(r => r.id), ["root_D"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    auth.invalidateExternalTargetsCache();
+  }
+});
