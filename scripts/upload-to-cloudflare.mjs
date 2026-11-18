@@ -1390,7 +1390,7 @@ if (todo.length) {
   await runPool(todo, HAS_API ? CONCURRENCY : WRANGLER_CONCURRENCY, uploadOne);
 }
 saveProgress(true);
-const skippedNow = Math.max(0, todo.length - uploadedCount);
+const skippedNow = doneForManifest + Math.max(0, todo.length - uploadedCount);
 console.log(
   `  R2 完成：新上传 ${fmtInt(uploadedCount)} 个 / ${fmtBytes(uploadedBytes)}，本轮跳过 ${fmtInt(skippedNow)} 个（含历史已完成）。`
 );

@@ -207,10 +207,16 @@ export async function processImageBatch(
           summary.retry += 1;
         }
       } catch (err) {
-        // 任务层任何异常都不能让整批失败：单条置回 pending，等下一轮
+        // 任务层任何异常都不能让整批失败，但也必须受 MAX_IMAGE_TASK_ATTEMPTS 上限约束防止无限重试
         warnTasks(`task ${row.id} failed`, err);
-        await markTaskRetry(row.id).catch(() => {});
-        summary.retry += 1;
+        const errMsg = err instanceof Error ? err.message : String(err || "download error");
+        if (row.attempts + 1 >= MAX_IMAGE_TASK_ATTEMPTS) {
+          await markTaskFailed(row.id, errMsg.slice(0, 200)).catch(() => {});
+          summary.failed += 1;
+        } else {
+          await markTaskRetry(row.id).catch(() => {});
+          summary.retry += 1;
+        }
       }
     }));
   }

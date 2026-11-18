@@ -1435,6 +1435,7 @@ function okJson(json) {
 
 globalThis.__crawlerContext = {
   addCookies: async () => {},
+  addInitScript: async () => {},
   request: {
     get: async url => {
       const target = String(url);
@@ -2208,4 +2209,294 @@ export default Hono;
     if (originalCaches === undefined) delete globalThis.caches;
     else globalThis.caches = originalCaches;
   }
+});
+
+test("processImageBatch：catch 异常分支受 MAX_IMAGE_TASK_ATTEMPTS 上限约束，第 3 次标 failed 不无限重试", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  const key = `images/${"9".repeat(64)}.jpg`;
+  const id = seedImageTask(sqlite, {
+    imageUrl: "https://picx.zhimg.com/throw-err.jpg",
+    objectKey: key,
+    status: "pending",
+    attempts: 2,
+    updatedAt: NOW_ISO
+  });
+
+  const throwingBucket = {
+    async head() { throw new Error("simulated R2 head outage"); },
+    async get() { return null; },
+    async put() {},
+    async delete() {}
+  };
+
+  const result = await runWithDb(d1, () =>
+    imageTasksModule.processImageBatch(throwingBucket, 5)
+  );
+  assert.equal(result.claimed, 1);
+  assert.equal(result.failed, 1);
+  assert.equal(result.retry, 0);
+
+  const row = sqlite.prepare(`SELECT status, last_error FROM image_tasks WHERE id = ?`).get(id);
+  assert.equal(row.status, "failed");
+  assert.match(row.last_error || "", /simulated R2 head outage/);
+});
+
+test("offload：getChildComments 优先外部库、empty complete 不复活旧回复，且 upsertContent 保留 prevCommentCount", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  sqlite.prepare(`UPDATE contents SET comment_count = 15, title = 'Old Title' WHERE pk = ?`).run(CONTENT_PK);
+
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.invalidateMainCommentCountCache();
+  auth.resetRemoteSchemaCache();
+
+  const remoteSqlite = new Database(":memory:");
+  const targetConfig = {
+    id: "ext-turso-offload-consistency",
+    name: "Turso 扩容库",
+    provider: "turso",
+    enabled: true,
+    syncScopes: ["comments"],
+    storageRole: "offload",
+    overflowThresholdRows: 1500000,
+    endpointUrl: "https://ext-turso-check.example.com",
+    authToken: "turso-unit-token",
+    createdAt: NOW_ISO,
+    updatedAt: NOW_ISO
+  };
+
+  // 主 R2 放一个启用 offload 前残留的旧快照；主 D1 也残留旧扁平子行
+  const r2Store = new Map([
+    [auth.R2_EXTERNAL_TARGETS_KEY, JSON.stringify([targetConfig])],
+    ["childcomments/r1.json", JSON.stringify({ children: [{ id: "stale_r2", content: "stale r2" }], complete: true })]
+  ]);
+  sqlite.prepare(`
+    INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+    VALUES ('stale_d1_child', ?, 'r1', 'Old', 'stale d1', 0, 'h', ?, ?, 0)
+  `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+
+  const bucket = {
+    async get(key) {
+      const value = r2Store.get(key);
+      return value === undefined ? null : { async text() { return value; } };
+    },
+    async put(key, value) { r2Store.set(key, String(value)); },
+    async head() { return null; },
+    async delete(key) { r2Store.delete(key); }
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const target = String(url);
+    if (target !== "https://ext-turso-check.example.com/v2/pipeline") {
+      throw new Error(`unexpected fetch: ${target}`);
+    }
+    const body = JSON.parse(String(init.body));
+    const results = [];
+    for (const request of body.requests) {
+      if (request.type === "close") {
+        results.push({ type: "ok", response: { type: "close" } });
+        continue;
+      }
+      const sql = request.stmt.sql;
+      const args = (request.stmt.args || []).map(arg => {
+        if (!arg || arg.type === "null") return null;
+        if (arg.type === "integer" || arg.type === "float") return Number(arg.value);
+        return String(arg.value);
+      });
+      const statement = remoteSqlite.prepare(sql);
+      if (statement.reader) {
+        const cols = statement.columns().map(column => ({ name: column.name }));
+        const rows = statement.all(...args).map(row => cols.map(column => tursoCell(row[column.name])));
+        results.push({ type: "ok", response: { type: "execute", result: { cols, rows, affected_row_count: 0, last_insert_rowid: null } } });
+      } else {
+        const info = statement.run(...args);
+        results.push({ type: "ok", response: { type: "execute", result: { cols: [], rows: [], affected_row_count: info.changes, last_insert_rowid: null } } });
+      }
+    }
+    return { ok: true, status: 200, json: async () => ({ results }), text: async () => "" };
+  };
+
+  try {
+    // 1) 先写入有子评论的数据，再模拟在原站把楼中楼删光（complete=true, children=[]）
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        roots: [{
+          id: "r1",
+          author: "RootUser",
+          authorAvatar: "",
+          content: "root body",
+          img: "",
+          time: NOW_ISO,
+          location: "上海",
+          likes: 10,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 1,
+          isChildrenComplete: true,
+          children: [{ id: "ch1", parentId: "r1", author: "A", content: "reply 1", likes: 1 }]
+        }]
+      }, { DB: d1, BUCKET: bucket })
+    );
+
+    // 人为在外部库残留一条旧扁平子行，然后提交完整空快照
+    remoteSqlite.prepare(`
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+      VALUES ('stale_remote_child', ?, 'r1', 'Old', 'stale remote', 0, 'h', ?, ?, 0)
+    `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        roots: [{
+          id: "r1",
+          author: "RootUser",
+          authorAvatar: "",
+          content: "root body",
+          img: "",
+          time: NOW_ISO,
+          location: "上海",
+          likes: 10,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 0,
+          isChildrenComplete: true,
+          children: []
+        }]
+      }, { DB: d1, BUCKET: bucket })
+    );
+
+    const children = await runWithDb(d1, () => commentsModule.getChildComments(bucket, "r1", d1));
+    assert.deepEqual(children, [], "外部库 complete=true 空楼中楼必须返回 []，不得被主 R2 旧快照遮蔽或复活旧扁平行");
+
+    // 2) 主 D1 0 行评论时，upsertContent 通过外部库感知已有评论，保持 prevCommentCount = 15
+    const existingRow = sqlite.prepare(`SELECT * FROM contents WHERE pk = ?`).get(CONTENT_PK);
+    const up = await runWithDb(d1, () =>
+      contentsModule.upsertContent({
+        sourceType: "answer",
+        sourceId: existingRow.source_id,
+        title: existingRow.title,
+        sourceUrl: existingRow.source_url,
+        contentHtml: "",
+        contentMd: existingRow.content_md,
+        excerpt: existingRow.excerpt,
+        voteupCount: existingRow.voteup_count,
+        commentCount: 15,
+        favoriteCount: existingRow.favorite_count,
+        visitCount: existingRow.visit_count
+      }, bucket)
+    );
+    assert.equal(up.prevCommentCount, 15, "评论已 offload 时 prevCommentCount 不得误退回 0");
+  } finally {
+    globalThis.fetch = originalFetch;
+    auth.invalidateExternalTargetsCache();
+  }
+});
+
+test("upsertContent：历史空串元数据与 null 比较不产生伪写入，真实修复元数据走单条轻量 UPDATE 且二次 0 写", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  const initialHash = "legacy-empty-meta-hash";
+  sqlite.prepare(`
+    INSERT INTO contents (
+      pk, source_type, source_id, source_url, title,
+      author_name, author_url_token, author_avatar, author_headline,
+      question_id, question_title, content_html, content_md, excerpt,
+      voteup_count, comment_count, favorite_count, visit_count,
+      is_collapsed, is_labeled, label_info,
+      created_time, updated_time, content_hash, first_seen_at, last_seen_at, is_deleted
+    ) VALUES (?, 'answer', '1', 'https://www.zhihu.com/answer/1', 'Existing Title',
+              'OldAuthor', '', '', '', '', '', '', 'existing md', 'existing excerpt',
+              5, 0, 1, 2, 0, 0, '', ?, ?, ?, ?, ?, 0)
+  `).run(CONTENT_PK, NOW_ISO, NOW_ISO, initialHash, NOW_ISO, NOW_ISO);
+
+  d1.writes.length = 0;
+
+  // 1) 传入默认/空字段，不得把数据库里的 "" 与 null 判为不同而触发伪写入
+  const noopRes = await runWithDb(d1, () =>
+    contentsModule.upsertContent({
+      sourceType: "answer",
+      sourceId: "1",
+      title: "Existing Title",
+      sourceUrl: "https://www.zhihu.com/answer/1",
+      author: { name: "OldAuthor", urlToken: null, avatarUrl: "", headline: "" },
+      question: { id: "", title: "" },
+      contentHtml: "",
+      contentMd: "",
+      excerpt: "existing excerpt",
+      voteupCount: 5,
+      commentCount: 0,
+      favoriteCount: 1,
+      visitCount: 2,
+      labelInfo: "",
+      createdTime: NOW_ISO,
+      updatedTime: NOW_ISO
+    })
+  );
+  assert.equal(noopRes.changed, false);
+  assert.equal(d1.writes.length, 0, "空串与 null 等价，弱载荷同步不得触发任何 UPDATE");
+
+  // 2) 传入修复后的作者名/question/sourceUrl（title 与正文不变）：走 1 次轻量 UPDATE 且 changed=false
+  const repairedRes = await runWithDb(d1, () =>
+    contentsModule.upsertContent({
+      sourceType: "answer",
+      sourceId: "1",
+      title: "Existing Title",
+      sourceUrl: "https://www.zhihu.com/question/999/answer/1",
+      author: { name: "FixedAuthor", urlToken: "fixed-token", avatarUrl: "", headline: "" },
+      question: { id: "999", title: "Fixed Question Title" },
+      contentHtml: "",
+      contentMd: "",
+      excerpt: "existing excerpt",
+      voteupCount: 5,
+      commentCount: 0,
+      favoriteCount: 1,
+      visitCount: 2,
+      labelInfo: "",
+      createdTime: NOW_ISO,
+      updatedTime: NOW_ISO
+    })
+  );
+  assert.equal(repairedRes.changed, false);
+  assert.equal(d1.writes.length, 1, "修复元数据应执行 1 次轻量 UPDATE");
+
+  const updatedRow = sqlite.prepare(
+    `SELECT author_name, author_url_token, source_url, question_id, question_title FROM contents WHERE pk = ?`
+  ).get(CONTENT_PK);
+  assert.equal(updatedRow.author_name, "FixedAuthor");
+  assert.equal(updatedRow.author_url_token, "fixed-token");
+  assert.equal(updatedRow.source_url, "https://www.zhihu.com/question/999/answer/1");
+  assert.equal(updatedRow.question_id, "999");
+  assert.equal(updatedRow.question_title, "Fixed Question Title");
+
+  // 3) 再次同输入 0 写
+  d1.writes.length = 0;
+  const thirdRes = await runWithDb(d1, () =>
+    contentsModule.upsertContent({
+      sourceType: "answer",
+      sourceId: "1",
+      title: "Existing Title",
+      sourceUrl: "https://www.zhihu.com/question/999/answer/1",
+      author: { name: "FixedAuthor", urlToken: "fixed-token", avatarUrl: "", headline: "" },
+      question: { id: "999", title: "Fixed Question Title" },
+      contentHtml: "",
+      contentMd: "",
+      excerpt: "existing excerpt",
+      voteupCount: 5,
+      commentCount: 0,
+      favoriteCount: 1,
+      visitCount: 2,
+      labelInfo: "",
+      createdTime: NOW_ISO,
+      updatedTime: NOW_ISO
+    })
+  );
+  assert.equal(thirdRes.changed, false);
+  assert.equal(d1.writes.length, 0, "修复后同输入再次写入必须 0 写");
 });

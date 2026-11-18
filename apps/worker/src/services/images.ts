@@ -507,7 +507,7 @@ async function localizeOne(
     if (legacyHash !== hash) {
       const legacyKey = `${IMAGE_KEY_PREFIX}${legacyHash}.${urlExt}`;
       if (await bucket.head(legacyKey)) {
-        // 把旧对象复制到新 key，让新旧路径都能访问；复制失败不影响本次复用
+        // 把旧对象复制到新 key，让新旧路径都能访问；只有复制真正成功才复用，否则回退重抓写入 expectedKey
         try {
           const obj = await bucket.get(legacyKey);
           if (obj) {
@@ -515,11 +515,11 @@ async function localizeOne(
               httpMetadata: { contentType: obj.httpMetadata?.contentType || "image/jpeg" },
               customMetadata: obj.customMetadata || {}
             });
+            return `${IMAGE_API_PREFIX}${hash}.${urlExt}`;
           }
-        } catch {
-          // 复制失败仍返回旧路径，图片可访问
+        } catch (err) {
+          warnImage(`copy legacy image ${legacyKey} -> ${expectedKey} failed`, err);
         }
-        return `${IMAGE_API_PREFIX}${legacyHash}.${urlExt}`;
       }
     }
   }

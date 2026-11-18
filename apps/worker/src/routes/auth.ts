@@ -173,20 +173,31 @@ export async function saveExternalTargetsRaw(bucket: any, targets: ExternalStora
   // 先刷新内存缓存：即使下面的 D1/R2 写入失败，本 isolate 内也必须立刻看到新配置
   cachedExternalTargets = { at: Date.now(), list: cloneTargets(saved) };
   const now = new Date().toISOString();
+  let r2Ok = false;
+  let r2Err: unknown = null;
   if (bucket) {
     try {
       await bucket.put(R2_EXTERNAL_TARGETS_KEY, payload, {
         httpMetadata: { contentType: "application/json; charset=utf-8" }
       });
-    } catch { /* ignore */ }
+      r2Ok = true;
+    } catch (err) {
+      r2Err = err;
+    }
   }
+  let d1Err: unknown = null;
   try {
     await db.prepare(`
       INSERT INTO app_settings (key, value, updated_at)
       VALUES (?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
     `).run(EXTERNAL_TARGETS_KEY, payload, now);
-  } catch { /* ignore */ }
+  } catch (err) {
+    d1Err = err;
+  }
+  if (d1Err && (!bucket || !r2Ok)) {
+    throw d1Err instanceof Error ? d1Err : (r2Err instanceof Error ? r2Err : new Error("保存外部存储目标失败"));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -713,14 +724,18 @@ export async function getSyncConfig(bucket: any): Promise<SyncConfig> {
     if (row?.value) d1Cfg = JSON.parse(row.value);
   } catch { /* ignore */ }
 
-  const merged = {
-    ...DEFAULT_SYNC_CONFIG,
-    ...(d1Cfg || {}),
-    ...(r2Cfg || {})
-  };
+  const r2Ts = r2Cfg?.updatedAt ? Date.parse(String(r2Cfg.updatedAt)) : NaN;
+  const d1Ts = d1Cfg?.updatedAt ? Date.parse(String(d1Cfg.updatedAt)) : NaN;
+  const preferD1 =
+    d1Cfg &&
+    (!r2Cfg ||
+      (Number.isFinite(d1Ts) && (!Number.isFinite(r2Ts) || d1Ts >= r2Ts)));
+  const merged = preferD1
+    ? { ...DEFAULT_SYNC_CONFIG, ...(r2Cfg || {}), ...(d1Cfg || {}) }
+    : { ...DEFAULT_SYNC_CONFIG, ...(d1Cfg || {}), ...(r2Cfg || {}) };
   return {
     commentsMyAnswers: VALID_COMMENT_MODES.has(merged.commentsMyAnswers as CommentSyncMode) ? (merged.commentsMyAnswers as CommentSyncMode) : "full",
-    commentsCollections: VALID_COMMENT_MODES.has(merged.commentsCollections as CommentSyncMode) ? (merged.commentsCollections as CommentSyncMode) : "hot",
+    commentsCollections: VALID_COMMENT_MODES.has(merged.commentsCollections as CommentSyncMode) ? (merged.commentsCollections as CommentSyncMode) : "full",
     commentsUpvotes: VALID_COMMENT_MODES.has(merged.commentsUpvotes as CommentSyncMode) ? (merged.commentsUpvotes as CommentSyncMode) : "hot",
     commentsFollowing: VALID_COMMENT_MODES.has(merged.commentsFollowing as CommentSyncMode) ? (merged.commentsFollowing as CommentSyncMode) : "hot",
     followingSensitivity: VALID_SENSITIVITY.has(merged.followingSensitivity) ? merged.followingSensitivity : "standard",
@@ -761,7 +776,11 @@ export async function getFallbackAiConfig(env: Bindings): Promise<FallbackAiConf
   const dbBase = String(cfg?.fallbackAiBaseUrl || "").trim();
   const baseUrl = (dbBase || envBase || DEFAULT_FALLBACK_AI_BASE_URL).replace(/\/+$/, "");
   const apiKey = dbKey || envKey;
-  const model = normalizeFallbackModel(cfg?.fallbackAiModel, envModel || DEFAULT_FALLBACK_AI_MODEL);
+  const dbModel =
+    cfg?.fallbackAiModel && cfg.fallbackAiModel !== DEFAULT_FALLBACK_AI_MODEL
+      ? cfg.fallbackAiModel
+      : "";
+  const model = normalizeFallbackModel(dbModel, envModel || DEFAULT_FALLBACK_AI_MODEL);
   return {
     baseUrl,
     apiKey,
@@ -1467,7 +1486,10 @@ authRoutes.post("/external-targets/test", async c => {
         testOk = false;
         testMsg = "请按 AccountID/DatabaseID 格式填写数据库标识";
       } else {
-        const d1Url = `https://api.cloudflare.com/client/v4/accounts/${accId}/d1/database/${dbId}/query`;
+        const d1Base = (endpointUrl || "https://api.cloudflare.com")
+          .replace(/\/+$/, "")
+          .replace(/\/client\/v4$/i, "");
+        const d1Url = `${d1Base}/client/v4/accounts/${accId}/d1/database/${dbId}/query`;
         const res = await fetch(d1Url, {
           method: "POST",
           headers: {
@@ -1532,9 +1554,12 @@ authRoutes.post("/external-targets/test", async c => {
       }
       clearTimeout(timer);
 
-      if (res && res.status < 500) {
+      if (res && res.ok) {
         testOk = true;
         testMsg = `HTTP 连通成功 (响应码 ${res.status})`;
+      } else if (res && res.status < 500) {
+        testOk = false;
+        testMsg = `目标返回客户端错误 (HTTP ${res.status})`;
       } else if (res) {
         testOk = false;
         testMsg = `目标返回服务器错误 (HTTP ${res.status})`;

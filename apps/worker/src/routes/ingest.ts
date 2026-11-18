@@ -62,7 +62,7 @@ async function forwardToExternalTargets(
         try {
           if (t.provider === "webhook") {
             const destUrl = `${t.endpointUrl.replace(/\/+$/, "")}${eventPath}`;
-            await fetch(destUrl, {
+            const res = await fetch(destUrl, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
@@ -71,9 +71,10 @@ async function forwardToExternalTargets(
               body: payloadStr,
               signal: controller.signal
             });
+            if (!res.ok) console.warn(`[mirror:${t.name}] webhook HTTP ${res.status}`);
           } else if (t.provider === "turso") {
             const tursoUrl = `${t.endpointUrl.replace(/\/+$/, "")}/v2/pipeline`;
-            await fetch(tursoUrl, {
+            const res = await fetch(tursoUrl, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
@@ -104,19 +105,23 @@ async function forwardToExternalTargets(
               }),
               signal: controller.signal
             });
+            if (!res.ok) console.warn(`[mirror:${t.name}] turso HTTP ${res.status}`);
           } else if (t.provider === "cloudflare_d1") {
             const databaseId = t.databaseId || "";
             const parts = databaseId.includes("/") ? databaseId.split("/") : databaseId.split(":");
             const accId = parts[0]?.trim();
             const dbId = parts[1]?.trim();
             if (accId && dbId) {
-              const d1Url = `https://api.cloudflare.com/client/v4/accounts/${accId}/d1/database/${dbId}/query`;
+              const d1Base = (t.endpointUrl || "https://api.cloudflare.com")
+                .replace(/\/+$/, "")
+                .replace(/\/client\/v4$/i, "");
+              const d1Url = `${d1Base}/client/v4/accounts/${accId}/d1/database/${dbId}/query`;
               const d1Headers = {
                 "Content-Type": "application/json",
                 ...(t.authToken ? { Authorization: `Bearer ${t.authToken}` } : {})
               };
               // D1 REST /query 一次只接受一条语句：建表和写入必须拆成两次请求
-              await fetch(d1Url, {
+              const ddlRes = await fetch(d1Url, {
                 method: "POST",
                 headers: d1Headers,
                 body: JSON.stringify({
@@ -130,7 +135,8 @@ async function forwardToExternalTargets(
                 }),
                 signal: controller.signal
               });
-              await fetch(d1Url, {
+              if (!ddlRes.ok) console.warn(`[mirror:${t.name}] cloudflare_d1 DDL HTTP ${ddlRes.status}`);
+              const writeRes = await fetch(d1Url, {
                 method: "POST",
                 headers: d1Headers,
                 body: JSON.stringify({
@@ -139,13 +145,14 @@ async function forwardToExternalTargets(
                 }),
                 signal: controller.signal
               });
+              if (!writeRes.ok) console.warn(`[mirror:${t.name}] cloudflare_d1 write HTTP ${writeRes.status}`);
             }
           } else if (t.provider === "s3_r2") {
             // S3 兼容对象存储：path-style PUT 归档到 <endpoint>/<bucket>/<scope>/<entityKey>.json
             const bucketName = (t.databaseId || "").trim().replace(/^\/+|\/+$/g, "");
             if (!bucketName) return;
             const objectUrl = `${t.endpointUrl.replace(/\/+$/, "")}/${encodeURIComponent(bucketName)}/${encodeURIComponent(scope)}/${encodeURIComponent(entityKey)}.json`;
-            await fetch(objectUrl, {
+            const res = await fetch(objectUrl, {
               method: "PUT",
               headers: {
                 "Content-Type": "application/json; charset=utf-8",
@@ -154,9 +161,10 @@ async function forwardToExternalTargets(
               body: payloadStr,
               signal: controller.signal
             });
+            if (!res.ok) console.warn(`[mirror:${t.name}] s3_r2 HTTP ${res.status}`);
           } else if (t.provider === "supabase") {
             const supaUrl = `${t.endpointUrl.replace(/\/+$/, "")}/rest/v1/zhihu_backup_mirror`;
-            await fetch(supaUrl, {
+            const res = await fetch(supaUrl, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
@@ -171,6 +179,7 @@ async function forwardToExternalTargets(
               }),
               signal: controller.signal
             });
+            if (!res.ok) console.warn(`[mirror:${t.name}] supabase HTTP ${res.status}`);
           }
         } finally {
           clearTimeout(timer);
@@ -265,7 +274,8 @@ ingestRoutes.post("/content", async c => {
 
   // 先写库（幂等），成功后再写 R2，避免「R2 已是新正文、D1 还是旧 hash」
   const result = await upsertContent(
-    storedHtml === htmlToStore ? parsed.data : { ...parsed.data, contentHtml: storedHtml }
+    storedHtml === htmlToStore ? parsed.data : { ...parsed.data, contentHtml: storedHtml },
+    bucket
   );
 
   // 正文真分流：命中扩容目标时 HTML 只写外部库（content_blobs / S3 对象），

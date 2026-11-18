@@ -118,6 +118,24 @@ function isEmptyRiskPage(json: unknown): boolean {
     return (rec.paging as { is_end?: unknown }).is_end !== true;
 }
 
+/**
+ * 新版 comment_v5 接口在评论区被作者关闭时仍返回 HTTP 200，但
+ * `data: []`、`paging.is_end: false` 且附带 `comment_status: { type: 1, text: "评论区已关闭" }`。
+ * 这属于业务态无评论而非风控空页，必须立即放行，绝不能触发 60s×2 重试或累计风控计数。
+ */
+function isClosedCommentResponse(json: unknown): string | null {
+    if (!json || typeof json !== "object") return null;
+    const rec = json as { data?: unknown; comment_status?: unknown };
+    if (!Array.isArray(rec.data) || rec.data.length !== 0) return null;
+    if (!rec.comment_status || typeof rec.comment_status !== "object") return null;
+    const statusObj = rec.comment_status as { type?: unknown; text?: unknown };
+    const text = String(statusObj.text || "").trim();
+    if (statusObj.type === 1 || /评论.*已关闭|关闭评论|禁止评论/.test(text)) {
+        return text || "评论区已关闭";
+    }
+    return null;
+}
+
 function readHeader(res: ZhihuResponseLike, name: string): string | null {
     try {
         if (typeof res.headers === "function") {
@@ -167,6 +185,7 @@ function computePauseMs(retryAfterMs: number | null, random: () => number): numb
 
 function safeText(value: unknown): string {
     return String(value ?? "")
+        .replace(/([?&]session=)[^&\s"']+/gi, "$1[REDACTED]")
         .replace(/[\r\n\t]+/g, " ")
         .slice(0, 180);
 }
@@ -308,6 +327,18 @@ export function createZhihuJson(stats: ZhihuRiskStats, deps: ZhihuFetchDeps = {}
 
                 // allowEmptyPage：调用方已确认该接口会合法返回此形态（如 voteups 静默过滤页），
                 // 直接按正常空页返回，避免每轮白暂停 3×60s 并把阶段永久卡在 partial_risk_controlled
+                const closedText = isClosedCommentResponse(json);
+                if (closedText) {
+                    throw recordFailure(
+                        "http",
+                        status,
+                        label,
+                        `知乎内容已关闭评论 (${label}): ${closedText}`,
+                        false,
+                        false
+                    );
+                }
+
                 if (!opts.allowEmptyPage && isEmptyRiskPage(json)) {
                     const reason = "data 为空且 paging.is_end !== true（疑似风控空页）";
                     if (!isLastAttempt) {
@@ -364,6 +395,20 @@ export function createZhihuJson(stats: ZhihuRiskStats, deps: ZhihuFetchDeps = {}
                     `知乎内容已关闭评论 (${label}): HTTP 403 ${detail}`,
                     false,
                     false
+                );
+            }
+
+            // 知乎 40352 (/account/unhuman) 需要人工交互过验证，原地等待 65s 连撞只会延长风控惩罚；
+            // 立即置 riskExhausted 并终止本轮，交给编排脚本落盘断点后提示人工验证。
+            if (status === 403 && (/"code"\s*:\s*40352\b/i.test(detail) || /\/account\/unhuman/i.test(detail))) {
+                stats.riskExhausted = true;
+                throw recordFailure(
+                    "auth",
+                    status,
+                    label,
+                    `知乎触发人机验证 40352 (${label}): HTTP 403 ${detail}`,
+                    true,
+                    countStats
                 );
             }
 

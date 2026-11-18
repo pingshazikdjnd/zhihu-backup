@@ -174,11 +174,17 @@ function summarizeReconAnomalies(recon) {
     missing: num(t.missing),
     zeroSize: num(t.zeroSize),
     blobMissing: num(t.blobMissing),
+    sizeMismatch: num(t.sizeMismatch),
     parseFailures: num(t.parseFailures),
     childCountMismatch: num(t.childCountMismatch)
   };
   threads.total =
-    threads.missing + threads.zeroSize + threads.blobMissing + threads.parseFailures + threads.childCountMismatch;
+    threads.missing +
+    threads.zeroSize +
+    threads.blobMissing +
+    threads.sizeMismatch +
+    threads.parseFailures +
+    threads.childCountMismatch;
   const childJsonSample = {
     missingBlob: num(c.missingBlob),
     parseFailures: num(c.parseFailures)
@@ -483,6 +489,7 @@ const threadRecon = {
   missingLikelyInFlight: 0,
   zeroSize: 0,
   blobMissing: 0,
+  sizeMismatch: 0,
   parseFailures: 0,
   sampled: 0,
   childCountMismatch: 0,
@@ -514,6 +521,7 @@ for (const row of threadRows) {
   const bs = blobStatus(obj);
   if (bs.ok) threadRecon.ok += 1;
   else if (bs.reason === "zero_byte") threadRecon.zeroSize += 1;
+  else if (bs.reason === "size_mismatch") threadRecon.sizeMismatch += 1;
   else threadRecon.blobMissing += 1;
 }
 
@@ -850,8 +858,8 @@ item(
   `${fmtInt(threadRecon.ok)} / ${fmtInt(threadRecon.checked)} 个线程真实存在`,
   `缺失 ${fmtInt(threadRecon.missing)} 个（疑似在途 ${fmtInt(threadRecon.missingLikelyInFlight)}）`
 );
-if (threadRecon.zeroSize || threadRecon.blobMissing) {
-  item("  异常对象", `0 字节 ${fmtInt(threadRecon.zeroSize)} / blobs 缺失 ${fmtInt(threadRecon.blobMissing)}`);
+if (threadRecon.zeroSize || threadRecon.blobMissing || threadRecon.sizeMismatch) {
+  item("  异常对象", `0 字节 ${fmtInt(threadRecon.zeroSize)} / blobs 缺失 ${fmtInt(threadRecon.blobMissing)} / 尺寸不符 ${fmtInt(threadRecon.sizeMismatch)}`);
 }
 if (threadRecon.missingSamples.length) {
   console.log("  缺失样例：");

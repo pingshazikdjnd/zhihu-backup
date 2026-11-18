@@ -530,8 +530,36 @@ const ZHIHU_USERNAME = zhihuUsername;
 const ZHIHU_COOKIE_STRING = cookieString;
 const ZHIHU_COOKIE_Z_C0 = undefined;
 
+const BROWSER_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+
 async function setupBrowser() {
-  return chromium.launch({ headless: true });
+  return chromium.launch({
+    headless: true,
+    args: ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+  });
+}
+
+/** 创建带桌面浏览器指纹伪装的 Playwright Context，降低 Headless 特征被风控概率 */
+async function createStealthContext(browser: Awaited<ReturnType<typeof setupBrowser>>) {
+  const context = await browser.newContext({
+    userAgent: BROWSER_USER_AGENT,
+    locale: "zh-CN",
+    timezoneId: "Asia/Shanghai",
+    viewport: { width: 1440, height: 900 },
+    extraHTTPHeaders: {
+      "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"'
+    }
+  });
+  if (typeof (context as any).addInitScript === "function") {
+    await (context as any).addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    });
+  }
+  return context;
 }
 
 // 已知内容类型：收藏夹里会出现 zvideo 等未知类型，直接透传会被服务端
@@ -632,7 +660,7 @@ export async function runScraper() {
 async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
   console.log("🚀 开始知乎回答自动同步...");
   
-  const context = await browser.newContext();
+  const context = await createStealthContext(browser);
   await context.addCookies(getCookiesArray());
 
   const pendingCommentsQueue: Array<{ answerId: string; url: string; commentCount: number }> = [];
@@ -713,13 +741,16 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       const finalCommentCount = trueStats?.commentCount ?? item.comment_count ?? 0;
 
 
+      const hasQuestionId = item.question?.id != null && String(item.question.id).trim() !== "";
       const contentInput = {
         sourceType: "answer" as const,
         sourceId: String(item.id),
         title: item.question?.title || "未知问题",
-        sourceUrl: `https://www.zhihu.com/question/${item.question?.id}/answer/${item.id}`,
+        sourceUrl: hasQuestionId
+          ? `https://www.zhihu.com/question/${item.question.id}/answer/${item.id}`
+          : `https://www.zhihu.com/answer/${item.id}`,
         author: { name: item.author?.name, urlToken: item.author?.url_token, avatarUrl: item.author?.avatar_url, headline: item.author?.headline },
-        question: { id: String(item.question?.id), title: item.question?.title },
+        question: hasQuestionId ? { id: String(item.question.id), title: item.question?.title } : undefined,
         contentHtml: cleanHtml(item.content),
         contentMd: "",
         excerpt: item.excerpt || "",
@@ -927,13 +958,23 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
                     { label: `评论 ${c.id} 子评论` }
                   )).json;
                 } catch (e: any) {
-                  console.warn(`⚠️ 评论 ${c.id} 子评论中断: ${sanitizeErrorForLog(e)}`);
+                  const errMsg = sanitizeErrorForLog(e);
+                  if (/已关闭评论/.test(errMsg)) {
+                    console.log(`ℹ️ 评论 ${c.id} 子评论已关闭，跳过 (${errMsg})`);
+                    chIsEnd = true;
+                    break;
+                  }
+                  console.warn(`⚠️ 评论 ${c.id} 子评论中断: ${errMsg}`);
                   cIncomplete = true;
                   cFailed = true;
                   break;
                 }
                 if (!chJson.data || chJson.data.length === 0) {
-                  chIsEnd = true;
+                  if (chJson.paging?.is_end === true) {
+                    chIsEnd = true;
+                  } else {
+                    cIncomplete = true;
+                  }
                   break;
                 }
                 chPages++;
@@ -1061,7 +1102,7 @@ export async function runArticleScraper() {
 async function runArticleScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
   console.log("🚀 开始知乎专栏文章自动同步...");
 
-  const context = await browser.newContext();
+  const context = await createStealthContext(browser);
   await context.addCookies(getCookiesArray());
 
   // include 与关注答主文章段（12-live-articles 真机验证）保持一致：
@@ -1207,31 +1248,34 @@ export async function syncHotCommentsForContent(
   sourceType: "answer" | "article" | "pin",
   sourceId: string,
   mode: "full" | "hot" | "none" = "hot"
-) {
-  if (mode === "none") return;
-  if (sourceType !== "answer" && sourceType !== "article") return;
-  if (stats.circuitBroken || stats.riskExhausted) return;
+): Promise<"ok" | "closed" | "failed"> {
+  if (mode === "none") return "ok";
+  if (sourceType !== "answer" && sourceType !== "article") return "closed";
+  if (stats.circuitBroken || stats.riskExhausted) return "failed";
 
   const contentPk = `${sourceType}:${sourceId}`;
   const isArticle = sourceType === "article";
-  const buildUrl = (offset: number) =>
-    isArticle
-      ? `https://www.zhihu.com/api/v4/comment_v5/articles/${sourceId}/root_comment?order_by=score&limit=20&offset=${offset === 0 ? "" : offset}`
-      : `https://www.zhihu.com/api/v4/comment_v5/answers/${sourceId}/root_comment?order_by=${
-          mode === "full" ? "ts" : "score"
-        }&limit=20&offset=${offset === 0 ? "" : offset}`;
+  const buildUrl = (offset: number, orderByOverride?: "ts" | "score") => {
+    const orderBy = orderByOverride ?? (mode === "full" ? "ts" : "score");
+    return isArticle
+      ? `https://www.zhihu.com/api/v4/comment_v5/articles/${sourceId}/root_comment?order_by=${orderBy}&limit=20&offset=${offset === 0 ? "" : offset}`
+      : `https://www.zhihu.com/api/v4/comment_v5/answers/${sourceId}/root_comment?order_by=${orderBy}&limit=20&offset=${offset === 0 ? "" : offset}`;
+  };
 
   // 中途风控/异常/撞页数上限 → 不允许做删除对账；
   // cFailed 单独记录「请求失败/风控中断」，供下一轮强制重抓，不把页数上限误判为失败
+  // cClosed 记录评论区已关闭（HTTP 403 / comment_status.type===1），供补采模式计入 skipped 而非 ok
   let cIncomplete = false;
   let cFailed = false;
+  let cClosed = false;
+  let pagesFetched = 0;
 
   try {
     let cOffset = 0;
     let cIsEnd = false;
-    let nextUrl = buildUrl(cOffset);
+    let currentOrderBy: "ts" | "score" = mode === "full" ? "ts" : "score";
+    let nextUrl = buildUrl(cOffset, currentOrderBy);
     const maxPages = mode === "full" ? MAX_COMMENT_PAGES : 1;
-    let pagesFetched = 0;
     const seenRootIds = new Set<string>();
     const allRootIds: string[] = [];
     let rootsBuffer: RootCommentGroup[] = [];
@@ -1252,15 +1296,45 @@ export async function syncHotCommentsForContent(
 
     while (!cIsEnd && pagesFetched < maxPages && !stats.circuitBroken && !stats.riskExhausted) {
       let cJson: any;
+      const canFallbackScore = mode === "full" && pagesFetched === 0 && currentOrderBy === "ts";
       try {
         const res = await zhihuJson(context, nextUrl, {
           label: `${sourceType} ${sourceId} 热评`,
           // 单篇文章关闭评论/被删会 404：属正常业务结果，不能污染整轮风控计数
-          ...(isArticle ? { allow404: true } : {})
+          ...(isArticle ? { allow404: true } : {}),
+          // full 模式首页 order_by=ts 偶尔被知乎静默置空（data=[] 且 is_end=false），
+          // 先放行探测以便立刻回退到 order_by=score，避免无谓消耗 60s×2 与误触连续风控熔断
+          ...(canFallbackScore ? { allowEmptyPage: true } : {})
         });
         cJson = res.json;
+        if (
+          canFallbackScore &&
+          Array.isArray(cJson?.data) &&
+          cJson.data.length === 0 &&
+          cJson.paging?.is_end !== true
+        ) {
+          console.log(`ℹ️ ${sourceType} ${sourceId} order_by=ts 首页空页（is_end=false），回退改用 order_by=score`);
+          await jitterSleep(400, 750);
+          currentOrderBy = "score";
+          nextUrl = buildUrl(0, "score");
+          cJson = (
+            await zhihuJson(context, nextUrl, {
+              label: `${sourceType} ${sourceId} 热评(score)`,
+              ...(isArticle ? { allow404: true } : {})
+            })
+          ).json;
+        }
       } catch (e: any) {
-        console.warn(`⚠️ 抓取评论中断 (${sourceType}:${sourceId}): ${sanitizeErrorForLog(e)}`);
+        const errMsg = sanitizeErrorForLog(e);
+        if (/已关闭评论/.test(errMsg)) {
+          // zhihuJson 已拦截 HTTP 200 comment_status.type===1 与 403 闭评提示：
+          // 属于业务态无评论（非风控空页），标记 cClosed 让调用方计入「跳过」而不计成功/失败
+          if (pagesFetched > 0) cIncomplete = true;
+          cClosed = true;
+          console.log(`ℹ️ 评论区已关闭，跳过 (${sourceType}:${sourceId})`);
+          break;
+        }
+        console.warn(`⚠️ 抓取评论中断 (${sourceType}:${sourceId}): ${errMsg}`);
         cIncomplete = true;
         cFailed = true;
         break;
@@ -1361,8 +1435,12 @@ export async function syncHotCommentsForContent(
                 chOffset += 20;
                 chNextUrl = buildChildUrl(chOffset);
               }
-              await jitterSleep(900, 1700);
+              await jitterSleep(800, 1400);
             }
+          }
+          // 单页楼中楼（<=20条）若不休息，相邻根评论的 child_comments 会以 0ms 间隔连发触发风控脉冲
+          if (chPages > 0 && chIsEnd && !stats.riskExhausted && !stats.circuitBroken) {
+            await jitterSleep(550, 950);
           }
           if (!chIsEnd && chPages >= MAX_COMMENT_PAGES) {
             cIncomplete = true;
@@ -1433,9 +1511,11 @@ export async function syncHotCommentsForContent(
   // 仅靠评论数比较下一轮会永久跳过；本轮内再次遇到（多阶段重叠）必须补抓。
   if (cFailed) {
     commentSyncIncomplete.add(contentPk);
+    return "failed";
   } else if (!cIncomplete) {
     commentSyncIncomplete.delete(contentPk);
   }
+  return cClosed && pagesFetched === 0 ? "closed" : "ok";
 }
 
 /**
@@ -1456,7 +1536,7 @@ export async function runCommentRepairScraper() {
 }
 
 async function runCommentRepairScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
-  const context = await browser.newContext();
+  const context = await createStealthContext(browser);
   await context.addCookies(getCookiesArray());
 
   // 去重：多阶段收藏夹/赞同/关注可能把同一条内容重复排进补采清单，
@@ -1493,17 +1573,20 @@ async function runCommentRepairScraperBody(browser: Awaited<ReturnType<typeof se
     // 评论链路内部会吞掉单条失败（只打 warn + 登记 commentSyncIncomplete），
     // 用失败计数增量判定本条是否真的成功，失败条数会随终态输出给编排脚本
     const failureBefore = stats.authRejected + stats.riskEmpty + stats.zhihuRejected + stats.failed;
+    let syncOutcome: "ok" | "closed" | "failed" = "ok";
     try {
-      await syncHotCommentsForContent(context, sourceType, sourceId, "full");
+      syncOutcome = await syncHotCommentsForContent(context, sourceType, sourceId, "full");
     } catch (e) {
       console.warn(`⚠️ 补采评论异常 (${pk}): ${sanitizeErrorForLog(e)}`);
+      syncOutcome = "failed";
     }
     const failureAfter = stats.authRejected + stats.riskEmpty + stats.zhihuRejected + stats.failed;
-    if (failureAfter > failureBefore) failed++;
+    if (failureAfter > failureBefore || syncOutcome === "failed") failed++;
+    else if (syncOutcome === "closed") skipped++;
     else ok++;
     console.log(`🩹 评论补采进度 ${ok + skipped + failed}/${uniqueTargets.length}（${pk}）`);
-    // 与既有评论链路一致的条目间隔：补采是长时间连续请求，固定节奏同样会触发 40352
-    await jitterSleep(800, 1500);
+    // 页内与楼中楼已自带均匀节流，条间保留温和抖动避免长间隔空耗
+    await jitterSleep(650, 1150);
   }
 
   if (stats.circuitBroken || stats.riskExhausted) stopped = true;
@@ -1526,7 +1609,7 @@ export async function runCollectionScraper() {
 async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
   console.log("🚀 开始知乎收藏夹自动同步...");
   
-  const context = await browser.newContext();
+  const context = await createStealthContext(browser);
   await context.addCookies(getCookiesArray());
 
   const foundCollections: Array<{ id: string; title: string; updatedTime?: string }> = [];
@@ -1764,6 +1847,91 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
   console.log("🎉 收藏夹同步完成！");
 }
 
+/**
+ * 赞同动态列表接口对长文本会下发截断后的 excerpt/content；
+ * 当检测到截断信号时按低频抖动回源单篇详情接口，补齐完整 HTML 与准确计数。
+ */
+async function fetchFullContentForUpvote(
+  context: any,
+  sourceType: "answer" | "article",
+  sourceId: string
+): Promise<{
+  contentHtml: string;
+  excerpt: string;
+  voteupCount?: number;
+  commentCount?: number;
+  favoriteCount?: number;
+  visitCount?: number;
+} | null> {
+  await jitterSleep(250, 550);
+  const url =
+    sourceType === "answer"
+      ? `https://www.zhihu.com/api/v4/answers/${sourceId}?include=content,excerpt,content_need_truncated,voteup_count,visit_count,comment_count,favorite_count`
+      : `https://zhuanlan.zhihu.com/api/articles/${sourceId}`;
+  try {
+    const { json } = await zhihuJson(context, url, {
+      label: `赞同全文回源 ${sourceType}:${sourceId}`,
+      allow404: true
+    });
+    const contentHtml = cleanHtml(json?.content);
+    if (!contentHtml) return null;
+    return {
+      contentHtml,
+      excerpt: typeof json?.excerpt === "string" ? json.excerpt : "",
+      voteupCount: typeof json?.voteup_count === "number" ? json.voteup_count : undefined,
+      commentCount: typeof json?.comment_count === "number" ? json.comment_count : undefined,
+      favoriteCount: typeof json?.favorite_count === "number" ? json.favorite_count : undefined,
+      visitCount: typeof json?.visit_count === "number" ? json.visit_count : undefined
+    };
+  } catch (e: any) {
+    console.warn(`⚠️ 赞同全文回源失败 (${sourceType}:${sourceId})，保留列表正文: ${sanitizeErrorForLog(e)}`);
+    return null;
+  }
+}
+
+/**
+ * 判断第 5 轮赞同动态条目是否被知乎列表接口截断：
+ * 除显式 content_need_truncated === true 外，兼顾“正文等价 excerpt 且带省略号或无结尾标点”的隐式截断形态。
+ */
+function isUpvotesTargetTruncated(target: any, cleanedHtml: string): boolean {
+  if (target?.content_need_truncated === true) return true;
+  const plain = cleanedHtml
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const excerpt = String(target?.excerpt || "").replace(/\s+/g, " ").trim();
+  if (!plain) return Boolean(excerpt);
+  if (!excerpt || plain.length < 150) return false;
+
+  const strippedPlain = plain.replace(/[.…]+$/, "").trim();
+  const strippedExcerpt = excerpt.replace(/[.…]+$/, "").trim();
+  const endsWithEllipsis = plain.endsWith("...") || plain.endsWith("…");
+  const endsWithPunct = /[。！？.!?…）」』】"”'’]$/.test(plain);
+
+  if (strippedPlain === strippedExcerpt && (endsWithEllipsis || !endsWithPunct)) {
+    return true;
+  }
+  if (
+    plain.length <= 250 &&
+    endsWithEllipsis &&
+    strippedExcerpt.length >= 50 &&
+    strippedPlain.slice(0, 50) === strippedExcerpt.slice(0, 50)
+  ) {
+    return true;
+  }
+  if (
+    plain.length >= 170 &&
+    plain.length <= 235 &&
+    !endsWithPunct &&
+    strippedExcerpt.length >= 50 &&
+    strippedPlain.slice(0, 50) === strippedExcerpt.slice(0, 50)
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export async function runUpvotesScraper() {
   const browser = await setupBrowser();
   try {
@@ -1776,7 +1944,7 @@ export async function runUpvotesScraper() {
 async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
   console.log("🚀 开始同步你的赞同记录...");
   
-  const context = await browser.newContext();
+  const context = await createStealthContext(browser);
   await context.addCookies(getCookiesArray());
 
   // 断点续传游标上报：moments 按 paging.next（before_id 游标）向更旧翻页。
@@ -1863,7 +2031,24 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
         continue; // skip other types for now
       }
 
-      const voteupCount = target.voteup_count || target.reaction?.statistics?.like_count || 0;
+      let contentHtml = cleanHtml(target.content);
+      let effectiveExcerpt = target.excerpt || "";
+      let voteupCount = target.voteup_count || target.reaction?.statistics?.like_count || 0;
+      let commentCount = target.comment_count || 0;
+      let favoriteCount = target.favorite_count ?? target.reaction?.statistics?.favorites ?? 0;
+      let visitCount = target.visit_count ?? 0;
+
+      if (isUpvotesTargetTruncated(target, contentHtml) && !stats.riskExhausted) {
+        const detail = await fetchFullContentForUpvote(context, sourceType, sourceId);
+        if (detail) {
+          contentHtml = detail.contentHtml;
+          if (detail.excerpt) effectiveExcerpt = detail.excerpt;
+          if (typeof detail.voteupCount === "number" && detail.voteupCount > 0) voteupCount = detail.voteupCount;
+          if (typeof detail.commentCount === "number" && detail.commentCount > 0) commentCount = detail.commentCount;
+          if (typeof detail.favoriteCount === "number" && detail.favoriteCount > 0) favoriteCount = detail.favoriteCount;
+          if (typeof detail.visitCount === "number" && detail.visitCount > 0) visitCount = detail.visitCount;
+        }
+      }
       
       const contentInput = {
         sourceType,
@@ -1872,15 +2057,15 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
         sourceUrl,
         author: { name: target.author?.name, urlToken: target.author?.url_token, avatarUrl: target.author?.avatar_url, headline: target.author?.headline },
         question: target.question ? { id: String(target.question.id), title: target.question.title } : undefined,
-        contentHtml: cleanHtml(target.content),
+        contentHtml,
         contentMd: "",
-        excerpt: target.excerpt || "",
+        excerpt: effectiveExcerpt,
         voteupCount,
-        commentCount: target.comment_count || 0,
+        commentCount,
         // 动态 target 不返回收藏数（reaction.statistics 也不存在）；thanks_count 是感谢数，
         // 不能混写成收藏数。缺失时写 0，Worker 侧 contents.ts 会保留既有非零真值。
-        favoriteCount: target.favorite_count ?? target.reaction?.statistics?.favorites ?? 0,
-        visitCount: target.visit_count ?? 0,
+        favoriteCount,
+        visitCount,
         isCollapsed: target.is_collapsed,
         isLabeled: target.is_labeled,
         labelInfo: target.label_info ? JSON.stringify(target.label_info) : "",
@@ -2053,6 +2238,7 @@ async function evaluateFollowingCandidatesWithAI(
 
   try {
     const res = await post("/api/recommend/evaluate-following", {
+      sensitivity: cfg.followingSensitivity,
       items: capped.map(c => ({
         sourceId: c.sourceId,
         sourceType: c.sourceType,
@@ -2120,7 +2306,7 @@ export async function runFollowingScraper(onlyList = false) {
 async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>, onlyList: boolean) {
   console.log("🚀 开始同步你关注的人...");
 
-  const context = await browser.newContext();
+  const context = await createStealthContext(browser);
   await context.addCookies(getCookiesArray());
 
   const followedUsers: Array<{
@@ -2387,9 +2573,9 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
       const plans: Array<{ sortBy: "created" | "voteups"; startOffset: number; maxScan: number; earlyStop: number; trackResume: boolean }> =
         onlyIncrementalNow
           ? [
-              // 有标记点时按它继续翻到撞见为止：两次同步之间新增 >40 篇也不能漏；
+              // 有标记点时限制单次增量翻页上限（最多扫 400 条），避免标记点被删或遗漏时拖出 10 万条全扫；
               // 没有标记点时仍限 40 条（首次增量摸底）。
-              { sortBy: "created", startOffset: 0, maxScan: lastMarkAnswerId ? 100000 : 40, earlyStop: 5, trackResume: false },
+              { sortBy: "created", startOffset: 0, maxScan: lastMarkAnswerId ? 400 : 40, earlyStop: 5, trackResume: false },
               // 补一轮「最热 20」：后来涨赞或被折叠的内容早已沉出 created 最新 40 条，
               // 只有按 voteups 重扫才能捞进规则/AI 候选池；不做早停、不跟踪断点
               { sortBy: "voteups", startOffset: 0, maxScan: 20, earlyStop: 999999, trackResume: false }
@@ -2641,7 +2827,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               cfg.commentsFollowing !== "none" &&
               await shouldSyncCommentsDeep(
                 `answer:${cand.sourceId}`,
-                cand.commentCount,
+                Number(cand.contentInput.commentCount ?? cand.commentCount) || 0,
                 dbRes?.prevCommentCount,
                 cfg.commentsFollowing
               ) &&
@@ -2666,6 +2852,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
     // 2. 抓取专栏文章（全量模式下抓全部文章；智能模式下扫描最新 40 篇文章并只自动备份高危/高质文章）
     // 回答列表已 410（账号注销/不可见）时直接跳过文章扫描，避免再白打一次必然失败的请求
     if (u.articlesCount > 0 && !userGone410 && !stats.circuitBroken && !stats.riskExhausted) {
+      let savedForUser = 0;
       let artOffset = 0;
       let artIsEnd = false;
       let unchanged = 0;
@@ -2793,6 +2980,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             ) {
               await syncHotCommentsForContent(context, "article", articleIdStr, cfg.commentsFollowing);
             }
+            savedForUser++;
             if (!dbRes.created && !dbRes.changed) {
               unchanged++;
               if (unchanged >= artEarlyStop) {
@@ -2828,13 +3016,30 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
         for (const cand of aiKept) {
           if (stats.circuitBroken) break;
           try {
-            await sendContent(cand.contentInput);
+            const dbRes = await sendContent(cand.contentInput);
+            if (
+              cfg.commentsFollowing !== "none" &&
+              await shouldSyncCommentsDeep(
+                `article:${cand.sourceId}`,
+                Number(cand.contentInput.commentCount ?? cand.commentCount) || 0,
+                dbRes?.prevCommentCount,
+                cfg.commentsFollowing
+              ) &&
+              !stats.circuitBroken &&
+              !stats.riskExhausted
+            ) {
+              await syncHotCommentsForContent(context, "article", cand.sourceId, cfg.commentsFollowing);
+            }
+            savedForUser++;
           } catch (err) {
             completedAllPlans = false;
             console.error(`❌ 保存 AI 判定文章失败: ${sanitizeErrorForLog(err)}`);
             if (stats.circuitBroken) break;
           }
         }
+      }
+      if (!isUserFull && savedForUser > 0) {
+        console.log(`  ✅ [${u.name}] 智能风险抢救共入库 ${savedForUser} 篇高危/精品文章`);
       }
     }
 

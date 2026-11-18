@@ -1,5 +1,6 @@
 import { db } from "../db.js";
 import { buildChangeStatement } from "./changes.js";
+import { hasOffloadedComments } from "./comments.js";
 import { normalizeForHash, sha256 } from "../utils/hash.js";
 import { withKeyLock } from "./lock.js";
 import { buildSearchText, safeTruncate } from "shared";
@@ -37,12 +38,12 @@ function hasPlaceholderPathSegment(url: string): boolean {
   }
 }
 
-export function upsertContent(input: IngestContentInput) {
+export function upsertContent(input: IngestContentInput, bucket?: R2Bucket) {
   // 同 pk 写串行化：消除读-比-写的并发覆盖窗口（详见 lock.ts）
-  return withKeyLock(`${input.sourceType}:${input.sourceId}`, () => upsertContentInner(input));
+  return withKeyLock(`${input.sourceType}:${input.sourceId}`, () => upsertContentInner(input, bucket));
 }
 
-async function upsertContentInner(input: IngestContentInput) {
+async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) {
   const now = new Date().toISOString();
   const pk = `${input.sourceType}:${input.sourceId}`;
   // 保存原始正文：清空入库前，版本快照必须留有真实内容
@@ -104,13 +105,13 @@ async function upsertContentInner(input: IngestContentInput) {
       input.sourceUrl,
       input.title,
       input.author?.name ?? "",
-      input.author?.urlToken ?? null,
+      input.author?.urlToken || null,
       // 空串头像/简介存 null 而不是 ""：UPDATE 路径的 safe* 会把空串折叠成
       // null，首存 "" 与后续 null 比较恒不等，每次重同步都发一条假"头像更新"事件
       input.author?.avatarUrl || null,
       input.author?.headline || null,
-      input.question?.id ?? null,
-      input.question?.title ?? null,
+      input.question?.id || null,
+      input.question?.title || null,
       "",           // content_html 清空，原文在 R2
       searchText,   // content_md 存纯文本，供检索
       input.excerpt,
@@ -183,10 +184,10 @@ async function upsertContentInner(input: IngestContentInput) {
     ? (existing.source_url || input.sourceUrl)
     : input.sourceUrl;
   const safeExcerpt = input.excerpt || existing.excerpt || "";
-  const safeQuestionId = input.question?.id || existing.question_id;
-  const safeQuestionTitle = input.question?.title || existing.question_title;
-  const safeUrlToken = input.author?.urlToken || existing.author_url_token;
-  const safeLabelInfo = input.labelInfo || existing.label_info;
+  const safeQuestionId = (input.question?.id || existing.question_id) || null;
+  const safeQuestionTitle = (input.question?.title || existing.question_title) || null;
+  const safeUrlToken = (input.author?.urlToken || existing.author_url_token) || null;
+  const safeLabelInfo = (input.labelInfo || existing.label_info) || null;
   const safeCreatedTime = isRealTime(input.createdTime) ? input.createdTime : existing.created_time;
   const safeUpdatedTime = isRealTime(input.updatedTime) ? input.updatedTime : existing.updated_time;
 
@@ -244,11 +245,29 @@ async function upsertContentInner(input: IngestContentInput) {
   if (existing.visit_count !== safeVisitCount) {
     counterChanges.push(`浏览量(${existing.visit_count} -> ${safeVisitCount})`);
   }
-  if (existing.author_avatar !== safeAuthorAvatar) {
+  if ((existing.author_avatar || null) !== safeAuthorAvatar) {
     profileChanges.push("作者头像更新");
   }
-  if (existing.author_headline !== safeAuthorHeadline) {
+  if ((existing.author_headline || null) !== safeAuthorHeadline) {
     profileChanges.push("作者简介更新");
+  }
+  if ((existing.author_name || "") !== safeAuthorName) {
+    profileChanges.push("作者名更新");
+  }
+  if ((existing.author_url_token || null) !== safeUrlToken) {
+    profileChanges.push("作者标识更新");
+  }
+  if ((existing.source_url || "") !== safeSourceUrl) {
+    profileChanges.push("来源链接更新");
+  }
+  if ((existing.question_id || null) !== safeQuestionId) {
+    profileChanges.push("问题ID更新");
+  }
+  if ((existing.question_title || null) !== safeQuestionTitle) {
+    profileChanges.push("问题标题更新");
+  }
+  if ((existing.label_info || null) !== safeLabelInfo) {
+    profileChanges.push("标签详情更新");
   }
   // 未传（弱数据源）时保留库里的既有值；显式 false 才置 0
   const nextCollapsed = input.isCollapsed !== undefined ? (input.isCollapsed ? 1 : 0) : existing.is_collapsed;
@@ -260,8 +279,8 @@ async function upsertContentInner(input: IngestContentInput) {
     bodyChanges.push("标签更新");
   }
 
-  // comments 表尚无评论时强制返回 0，触发爬虫补抓；
-  // 两条「无 body 变更」的返回路径都必须带上这个修正
+  // comments 表尚无评论时先查外部评论分流库，仍无评论才强制返回 0 触发爬虫补抓；
+  // 两条「无 body 变更」的返回路径与有变更路径共用同一逻辑。
   const resolvePrevCommentCount = async () => {
     let prevCommentCount = existing.comment_count;
     if (prevCommentCount > 0) {
@@ -273,7 +292,10 @@ async function upsertContentInner(input: IngestContentInput) {
       // 「旧格式未迁移」，但知乎匿名/注销用户的头像本来就是空，导致这些内容
       // 永远被判为未抓全、每轮全量重抓评论，早停被反复清零。
       if (!cStat) {
-        prevCommentCount = 0;
+        const hasRemote = bucket ? await hasOffloadedComments(bucket, pk).catch(() => false) : false;
+        if (!hasRemote) {
+          prevCommentCount = 0;
+        }
       }
     }
     return prevCommentCount;
@@ -352,46 +374,53 @@ async function upsertContentInner(input: IngestContentInput) {
 
     await db.batch(stmts);
 
-    let prevCommentCount = existing.comment_count;
-    if (prevCommentCount > 0) {
-      // 与 resolvePrevCommentCount 保持一致：只用「一条评论都没入库」判定补抓。
-      // 早前这里还检查 author_avatar IS NULL（旧格式未迁移），但匿名/注销用户的
-      // 头像本来就是 NULL，会让每次正文变更都强制整篇重抓评论、早停反复清零。
-      const cStat = await db.prepare(
-        `SELECT 1 AS has_any FROM comments WHERE content_pk = ? LIMIT 1`
-      ).get<{ has_any: number }>(pk);
-      if (!cStat) {
-        prevCommentCount = 0; // comments 表中尚无评论，强制返回 0 触发爬虫补抓
-      }
-    }
-
+    const prevCommentCount = await resolvePrevCommentCount();
     return { pk, changed: true, created: false, prevCommentCount, hash: contentHash };
   } else if (profileChanges.length > 0 && counterChanges.length === 0) {
-    // 仅作者资料（头像/简介）变化：轻量更新两列，不写版本、不发事件、
+    // 仅作者资料/元数据变化：轻量更新，不写版本、不发事件、
     // changed 保持 false，让爬虫的早停判定正常工作
     await db.prepare(`
       UPDATE contents
-      SET author_avatar = ?, author_headline = ?, last_seen_at = ?
+      SET author_name = ?, author_url_token = ?, author_avatar = ?, author_headline = ?,
+          source_url = ?, question_id = ?, question_title = ?, label_info = ?, last_seen_at = ?
       WHERE pk = ?
-    `).run(safeAuthorAvatar, safeAuthorHeadline, now, pk);
+    `).run(
+      safeAuthorName,
+      safeUrlToken ?? null,
+      safeAuthorAvatar,
+      safeAuthorHeadline,
+      safeSourceUrl,
+      safeQuestionId ?? null,
+      safeQuestionTitle ?? null,
+      safeLabelInfo ?? null,
+      now,
+      pk
+    );
 
     return { pk, changed: false, created: false, prevCommentCount: await resolvePrevCommentCount(), hash: contentHash };
   } else if (counterChanges.length > 0) {
     // 只更新计数字段：单条 UPDATE（4 个数字 + last_seen_at），不写版本、不发事件、
     // changed 保持 false，让爬虫的早停判定生效。
-    // 若同时有 profileChanges，在同一句里顺带写作者资料两列，避免头像永远不更新
+    // 若同时有 profileChanges，在同一句里顺带写作者与元数据列，避免资料或修复字段不落库
     await db.prepare(`
       UPDATE contents
       SET voteup_count = ?, comment_count = ?, favorite_count = ?, visit_count = ?,
-          author_avatar = ?, author_headline = ?, last_seen_at = ?
+          author_name = ?, author_url_token = ?, author_avatar = ?, author_headline = ?,
+          source_url = ?, question_id = ?, question_title = ?, label_info = ?, last_seen_at = ?
       WHERE pk = ?
     `).run(
       safeVoteupCount,
       safeCommentCount,
       safeFavoriteCount,
       safeVisitCount,
+      safeAuthorName,
+      safeUrlToken ?? null,
       safeAuthorAvatar,
       safeAuthorHeadline,
+      safeSourceUrl,
+      safeQuestionId ?? null,
+      safeQuestionTitle ?? null,
+      safeLabelInfo ?? null,
       now,
       pk
     );

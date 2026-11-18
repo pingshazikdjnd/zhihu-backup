@@ -569,7 +569,9 @@ function RootCommentList({
       if (reqPk !== resolvedPkRef.current) return;
       setLoadError(e?.message || "加载更多评论失败");
     } finally {
-      setLoadingMore(false);
+      if (reqPk === resolvedPkRef.current) {
+        setLoadingMore(false);
+      }
     }
   };
 

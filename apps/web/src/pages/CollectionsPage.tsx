@@ -18,6 +18,18 @@ export default function CollectionsPage() {
   const observer = useRef<IntersectionObserver | null>(null);
   // 切换排序会让在途的旧排序分页请求过期，回包后不得再写入列表
   const itemsSeqRef = useRef(0);
+  const aliveRef = useRef(true);
+
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      if (observer.current) {
+        observer.current.disconnect();
+        observer.current = null;
+      }
+    };
+  }, []);
 
   // Scroll restoration
   useEffect(() => {
@@ -42,10 +54,14 @@ export default function CollectionsPage() {
   const loadCollections = () => {
     api<{ data: any[] }>("/api/collections")
       .then(res => {
+        if (!aliveRef.current) return;
         setCollections(res.data);
         allCollectionsStore.collections = res.data;
       })
-      .catch(e => setError(e?.message || "收藏夹列表加载失败"));
+      .catch(e => {
+        if (!aliveRef.current) return;
+        setError(e?.message || "收藏夹列表加载失败");
+      });
   };
 
   useEffect(() => {
@@ -106,10 +122,10 @@ export default function CollectionsPage() {
   }, [activeTab]);
 
   const lastElementRef = useCallback((node: HTMLElement | null) => {
+    if (observer.current) observer.current.disconnect();
     // 上一次请求失败时不能再挂 observer：哨兵元素持续可见会形成
     // 失败 -> 重挂 -> 再失败的无限请求风暴
     if (isLoading || error) return;
-    if (observer.current) observer.current.disconnect();
     observer.current = new IntersectionObserver(entries => {
       if (entries[0].isIntersecting && !isLoading && !error && hasMoreItems) {
         fetchItems(itemsPage + 1);
@@ -209,7 +225,14 @@ export default function CollectionsPage() {
                 <span className="stat">⭐ <span className="stat-num">{fmtNum(item.favorite_count)}</span></span>
                 {Number(item.visit_count) > 0 && <span className="stat">👁 <span className="stat-num">{fmtNum(item.visit_count)}</span></span>}
                 <span className="stat">{item.source_type === "answer" ? "回答" : item.source_type === "article" ? "文章" : item.source_type}</span>
-                <span className="footer-right">收藏于 {new Date(item.created_time).toLocaleDateString()}</span>
+                <span className="footer-right">
+                  {item.created_time
+                    ? (() => {
+                        const d = new Date(item.created_time);
+                        return Number.isNaN(d.getTime()) ? "收藏时间未知" : `收藏于 ${d.toLocaleDateString()}`;
+                      })()
+                    : "收藏时间未知"}
+                </span>
               </div>
             </>
           );

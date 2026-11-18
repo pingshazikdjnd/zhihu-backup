@@ -1,10 +1,11 @@
-import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
+import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import type { ReactNode } from "react";
-import { useState, useCallback, useEffect, type FormEvent } from "react";
+import { useState, useCallback, useEffect, useRef, type FormEvent } from "react";
 
 export default function Layout({ children }: { children: ReactNode }) {
   const [toast, setToast] = useState("");
   const [searchKw, setSearchKw] = useState("");
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -16,6 +17,10 @@ export default function Layout({ children }: { children: ReactNode }) {
     }
   }, [location.pathname, location.search]);
 
+  useEffect(() => () => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+  }, []);
+
   const submitSearch = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const kw = searchKw.trim();
@@ -24,7 +29,11 @@ export default function Layout({ children }: { children: ReactNode }) {
 
   const notify = useCallback((msg: string) => {
     setToast(msg);
-    setTimeout(() => setToast(""), 2600);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => {
+      setToast("");
+      toastTimerRef.current = null;
+    }, 2600);
   }, []);
 
   const trigger = (path: string, label: string) => {

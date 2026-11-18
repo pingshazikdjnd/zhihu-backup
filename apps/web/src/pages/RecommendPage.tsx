@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { api } from "../lib/api.js";
 import { recommendStore } from "../lib/store.js";
 
@@ -19,6 +19,7 @@ const stripHtml = (html: string) =>
   html ? html.replace(/<[^>]+>/g, "").substring(0, 160) + "..." : "";
 
 export default function RecommendPage() {
+  const navigate = useNavigate();
   const [channel, setChannel] = useState<"mix" | "risk" | "authors" | "classic">(recommendStore.channel);
   const [items, setItems] = useState<any[]>(recommendStore.items);
   const [stats, setStats] = useState<any>(recommendStore.stats);
@@ -101,7 +102,7 @@ export default function RecommendPage() {
     } catch (err: any) {
       alert(`AI 风险鉴定失败: ${err?.message || err}`);
     } finally {
-      setAiLoadingPk(null);
+      setAiLoadingPk(prev => (prev === pk ? null : prev));
     }
   };
 
@@ -287,18 +288,34 @@ export default function RecommendPage() {
                     <div style={{ color: "var(--zhihu-meta)" }}>未找到其他相似回答</div>
                   ) : (
                     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                      {similarMap[item.pk].map((s: any) => (
-                        <Link
-                          key={s.pk}
-                          to={`/contents/${encodeURIComponent(s.pk)}`}
-                          style={{ color: "var(--zhihu-blue)", textDecoration: "none", display: "flex", justifyContent: "space-between", gap: 8 }}
-                        >
-                          <span>
-                            [{s.relation_type}] {s.question_title || s.title} — {s.author_name || "匿名"}
-                          </span>
-                          <span style={{ color: "var(--zhihu-meta)", flexShrink: 0 }}>▲ {fmtNum(s.voteup_count)}</span>
-                        </Link>
-                      ))}
+                      {similarMap[item.pk].map((s: any) => {
+                        const targetTo = `/contents/${encodeURIComponent(s.pk)}`;
+                        return (
+                          <div
+                            key={s.pk}
+                            role="link"
+                            tabIndex={0}
+                            onClick={e => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              navigate(targetTo);
+                            }}
+                            onKeyDown={e => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                navigate(targetTo);
+                              }
+                            }}
+                            style={{ color: "var(--zhihu-blue)", cursor: "pointer", display: "flex", justifyContent: "space-between", gap: 8 }}
+                          >
+                            <span>
+                              [{s.relation_type}] {s.question_title || s.title} — {s.author_name || "匿名"}
+                            </span>
+                            <span style={{ color: "var(--zhihu-meta)", flexShrink: 0 }}>▲ {fmtNum(s.voteup_count)}</span>
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
                 </div>

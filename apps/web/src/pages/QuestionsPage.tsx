@@ -44,7 +44,7 @@ function SourceTags({ upvoted, faved }: { upvoted: number; faved: number }) {
 export default function QuestionsPage() {
   const { id: routeId } = useParams();
 
-  if (routeId) return <QuestionDetail questionId={routeId} />;
+  if (routeId) return <QuestionDetail key={routeId} questionId={routeId} />;
   return <QuestionList />;
 }
 

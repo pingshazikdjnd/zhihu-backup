@@ -41,8 +41,8 @@ jobs:
           VITE_ZHIHU_USERNAME: ci-placeholder
         run: pnpm --filter web build
 
-      - name: Run DB write regression tests
-        run: node --test scripts/db-write-regression.test.mjs
+      - name: Run regression tests
+        run: node --test scripts/db-write-regression.test.mjs scripts/script-safety-regression.test.mjs scripts/web-safety-regression.test.mjs
 
   # 端到端接口冒烟：起本地 Worker + 本地 D1，跑真实请求
   smoke:

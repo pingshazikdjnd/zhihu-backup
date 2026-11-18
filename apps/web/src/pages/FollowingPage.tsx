@@ -211,7 +211,7 @@ function FollowingHome() {
     } catch (err: any) {
       alert(`AI 评估失败: ${err?.message || err}`);
     } finally {
-      setAiLoadingPk(null);
+      setAiLoadingPk(prev => (prev === pk ? null : prev));
     }
   };
 

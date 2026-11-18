@@ -1,7 +1,7 @@
 import { db, FAV_JOIN_SQL } from "../db.js";
 import { evaluateContentRisk } from "./risk.js";
 import { getFollowedUsersMap } from "./following.js";
-import { getSyncConfig, getFallbackAiConfig } from "../routes/auth.js";
+import { getSyncConfig, getFallbackAiConfig, listReadableContentOffloadTargets, readOffloadedContentHtml } from "../routes/auth.js";
 import { sha256 } from "../utils/hash.js";
 import type { Bindings } from "../types.js";
 
@@ -649,18 +649,27 @@ export async function assessContentWithWorkersAI(env: Bindings, pk: string) {
   const buildRuleFallbackAnalysis = () =>
     `1. 【和谐风险鉴定】：风险评分 ${staticRisk.risk_score}/100（${staticRisk.risk_level === "high" ? "高危易和谐" : staticRisk.risk_level === "medium" ? "中度敏感" : "低风险"}），命中特征：${staticRisk.risk_tags.join("、") || "常规内容"}。\n2. 【核心看点提炼】：获 ${row.voteup_count} 赞同与 ${row.favorite_count} 收藏（含金量评分 ${staticRisk.value_score}/100），建议重点留存全文快照。`;
 
-  // 正文纯文本前 1200 字：Workers AI 与反代兜底共用，最多读一次 R2
+  // 正文纯文本前 1200 字：Workers AI 与反代兜底共用，主 R2 未命中时回源外部存储
   let bodySnippetCache: string | null = null;
   const getBodySnippet = async (): Promise<string> => {
     if (bodySnippetCache !== null) return bodySnippetCache;
     let bodySnippet = row.excerpt || "";
     if (env.BUCKET && row.content_hash) {
       try {
+        let html: string | null = null;
         const obj =
           (await env.BUCKET.get(`html/${pk}/${row.content_hash}`)) ||
           (await env.BUCKET.get(`html/${pk}`));
         if (obj) {
-          const html = await obj.text();
+          html = await obj.text();
+        } else {
+          const targets = await listReadableContentOffloadTargets(env.BUCKET).catch(() => []);
+          for (const target of targets) {
+            html = await readOffloadedContentHtml(target, pk, row.content_hash).catch(() => null);
+            if (html) break;
+          }
+        }
+        if (html) {
           bodySnippet = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 1200);
         }
       } catch { /* ignore */ }
@@ -1073,10 +1082,10 @@ ${JSON.stringify(promptItems)}
             const adopted = await adoptParsedRows(parsed, m);
             adoptedTotal += adopted;
             if (adopted > 0) model = m;
+            // 模型返回了可解析的 JSON（哪怕 adopted 为空）就不再换模型；
+            // 非 JSON 输出或调用异常 / 非 2xx 才继续尝试下一个兜底模型
+            break;
           }
-          // 模型返回了可解析的 JSON（哪怕 adopted 为空）就不再换模型；
-          // 只有调用异常 / 非 2xx 才会走到下面的 catch 换兜底模型
-          break;
         } catch {
           // 调用异常 / 非 2xx：尝试下一个兜底模型
         }
