@@ -353,7 +353,7 @@ async function postCommentsByRoot(
   }
 
   for (let i = 0; i < rootComments.length; i += BATCH) {
-    if (stats.riskExhausted || stats.circuitBroken) {
+    if (stats.circuitBroken) {
       aborted = true;
       break;
     }
@@ -433,7 +433,9 @@ async function fetchStoredCommentState(contentPk: string): Promise<StoredComment
     let incompleteRoots = 0;
     let storedComments = rows.length;
     for (const row of rows) {
-      if (Number(row.is_complete ?? 0) !== 1) incompleteRoots++;
+      // 0 子评论且走 partial 批入库的根不会写 comment_threads，此时 listRootComments 固定返回 is_complete=0；
+      // 只有真正存在子评论（child_count > 0）且尚未完整落盘时，才判定楼中楼不完整
+      if (Number(row.child_count) > 0 && Number(row.is_complete ?? 0) !== 1) incompleteRoots++;
       storedComments += Number(row.child_count) || 0;
     }
     return { roots: rows.length, storedComments, incompleteRoots };
@@ -468,6 +470,8 @@ async function shouldSyncCommentsDeep(
   if (state.incompleteRoots > 0) return true;
   // 只读到 50 根时无法判断根评论是否抓全，不做「明显偏少」推断
   if (state.roots >= 50) return false;
+  // 已入库（根+子）总数已达到站点预期时不再仅凭 roots*3<expected 反复重抓
+  if (state.storedComments >= expected) return false;
   // 根评论数本身明显不足：知乎 v4 answers/root_comments 对高评论回答会假 is_end，
   // 把根评论截断在第一页（20 根），但这些根的子评论往往已抓全。仅看 storedComments
   // （根+子）会把这类截断误判为「够完整」而永久跳过。评论 = 根 + 子，正常根数极少
@@ -915,8 +919,14 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
             label: `回答 ${task.answerId} 根评论`
           })).json;
         } catch (e: any) {
+          const errMsg = sanitizeErrorForLog(e);
+          if (/已关闭评论/.test(errMsg)) {
+            console.log(`ℹ️ 回答 ${task.answerId} 评论区已关闭，跳过`);
+            rootEnded = true;
+            break;
+          }
           // 401/403/429/5xx/风控空页都已在 zhihuJson 内重试并计入终态统计
-          console.warn(`⚠️ 回答 ${task.answerId} 根评论中断: ${sanitizeErrorForLog(e)}`);
+          console.warn(`⚠️ 回答 ${task.answerId} 根评论中断: ${errMsg}`);
           cIncomplete = true;
           cFailed = true;
           break;
@@ -1300,11 +1310,15 @@ export async function syncHotCommentsForContent(
       const batch = rootsBuffer;
       rootsBuffer = [];
       const canReconcile = isLast && mode === "full" && !cIncomplete;
-      await postCommentsByRoot(
+      const res = await postCommentsByRoot(
         contentPk,
         batch,
         canReconcile ? { partial: false, allRootIds } : { partial: true }
       );
+      if (res.aborted) {
+        cIncomplete = true;
+        cFailed = true;
+      }
     };
 
     while (!cIsEnd && pagesFetched < maxPages && !stats.circuitBroken && !stats.riskExhausted) {
@@ -1532,10 +1546,19 @@ export async function syncHotCommentsForContent(
   if (cFailed) {
     commentSyncIncomplete.add(contentPk);
     return "failed";
-  } else if (!cIncomplete) {
+  }
+  if (cClosed && pagesFetched === 0) {
+    commentSyncIncomplete.delete(contentPk);
+    return "closed";
+  }
+  if (mode === "full" && cIncomplete) {
+    commentSyncIncomplete.add(contentPk);
+    return "failed";
+  }
+  if (!cIncomplete) {
     commentSyncIncomplete.delete(contentPk);
   }
-  return cClosed && pagesFetched === 0 ? "closed" : "ok";
+  return "ok";
 }
 
 /**
@@ -1601,10 +1624,17 @@ async function runCommentRepairScraperBody(browser: Awaited<ReturnType<typeof se
       syncOutcome = "failed";
     }
     const failureAfter = stats.authRejected + stats.riskEmpty + stats.zhihuRejected + stats.failed;
-    if (failureAfter > failureBefore || syncOutcome === "failed") failed++;
-    else if (syncOutcome === "closed") skipped++;
-    else ok++;
-    console.log(`🩹 评论补采进度 ${ok + skipped + failed}/${uniqueTargets.length}（${pk}）`);
+    let itemStatus: "ok" | "closed" | "failed" = "ok";
+    if (failureAfter > failureBefore || syncOutcome === "failed") {
+      failed++;
+      itemStatus = "failed";
+    } else if (syncOutcome === "closed") {
+      skipped++;
+      itemStatus = "closed";
+    } else {
+      ok++;
+    }
+    console.log(`🩹 评论补采进度 ${ok + skipped + failed}/${uniqueTargets.length}（${pk}）[status=${itemStatus}]`);
     // 页内与楼中楼已自带均匀节流，条间保留温和抖动避免长间隔空耗
     await jitterSleep(650, 1150);
   }
@@ -2828,8 +2858,19 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
           }
 
           if (!aIsEnd) aIsEnd = Boolean(aJson.paging?.is_end);
-          // 按实际返回条数推进（服务端忽略 limit 时避免与上一页大面积重叠），seenAnswerIds 兜底去重
-          aOffset += (aJson.data?.length || batchLimit);
+          // 服务端虽可能忽略 limit 返回 ~37 条，但分页坐标系仍按 offset=20 步进（详见 runScraperBody）；
+          // 优先读取 paging.next 的 offset，否则按 batchLimit 步进，seenAnswerIds 负责去重
+          const nextFromApi = typeof aJson.paging?.next === "string" ? aJson.paging.next : "";
+          let nextOffset = aOffset + batchLimit;
+          if (nextFromApi) {
+            try {
+              const o = new URL(nextFromApi, "https://www.zhihu.com").searchParams.get("offset");
+              if (o !== null && Number.isFinite(Number(o)) && Number(o) > aOffset) {
+                nextOffset = Number(o);
+              }
+            } catch { /* ignore invalid paging.next */ }
+          }
+          aOffset = nextOffset;
           if (plan.trackResume && !aIsEnd) {
             await reportUserProgress(u.urlToken, aOffset, false);
           }

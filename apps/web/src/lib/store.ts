@@ -3,6 +3,7 @@ export const contentsStore = {
   upvotesData: [] as any[],
   answersPage: 1,
   upvotesPage: 1,
+  answersTotal: null as number | null,
   hasMoreAnswers: true,
   hasMoreUpvotes: true,
   activeTab: "answers" as "answers" | "upvotes",

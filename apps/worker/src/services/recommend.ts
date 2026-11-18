@@ -657,9 +657,7 @@ export async function assessContentWithWorkersAI(env: Bindings, pk: string) {
     if (env.BUCKET && row.content_hash) {
       try {
         let html: string | null = null;
-        const obj =
-          (await env.BUCKET.get(`html/${pk}/${row.content_hash}`)) ||
-          (await env.BUCKET.get(`html/${pk}`));
+        const obj = await env.BUCKET.get(`html/${pk}/${row.content_hash}`);
         if (obj) {
           html = await obj.text();
         } else {
@@ -667,6 +665,10 @@ export async function assessContentWithWorkersAI(env: Bindings, pk: string) {
           for (const target of targets) {
             html = await readOffloadedContentHtml(target, pk, row.content_hash).catch(() => null);
             if (html) break;
+          }
+          if (!html) {
+            const legacyObj = await env.BUCKET.get(`html/${pk}`);
+            if (legacyObj) html = await legacyObj.text();
           }
         }
         if (html) {

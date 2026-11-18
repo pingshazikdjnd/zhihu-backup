@@ -30,9 +30,12 @@ if (!hookInstalled) {
       node.setAttribute("referrerpolicy", "no-referrer");
     }
     if (node.tagName === "A") {
-      const href = node.getAttribute("href") || "";
-      if (href.startsWith("http://") || href.startsWith("https://")) {
+      const href = (node.getAttribute("href") || "").trim();
+      const isExternal = /^(https?:)?\/\//i.test(href);
+      if (isExternal) {
         node.setAttribute("target", "_blank");
+      }
+      if (isExternal || node.getAttribute("target") === "_blank") {
         node.setAttribute("rel", "noopener noreferrer nofollow");
       }
     }

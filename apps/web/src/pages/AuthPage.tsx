@@ -1,6 +1,22 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api.js";
 
+function safeGetStorage(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function safeSetStorage(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* 无痕模式或禁用存储时忽略持久化失败 */
+  }
+}
+
 type CommentSyncMode = "full" | "hot" | "none";
 // 图片备份质量：original=原图，high=图床 1440w 官方尺寸，compressed=图床 720w 官方尺寸
 type ImageQuality = "original" | "high" | "compressed";
@@ -108,6 +124,7 @@ export default function AuthPage() {
   // 用 ref 而不是 state 做闸门：8 秒轮询的闭包永远读不到最新的 state
   const cfgInitRef = useRef(false);
   const cfgDirtyRef = useRef(false);
+  const resetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [savingCfg, setSavingCfg] = useState(false);
   const [cfgMsg, setCfgMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   // 替补引擎 Key 只写不读：明文绝不进 state 之外的地方，保存后立即清空输入框
@@ -116,7 +133,7 @@ export default function AuthPage() {
 
   const [cookieInput, setCookieInput] = useState("");
   const [token, setToken] = useState(
-    () => localStorage.getItem("cookie_write_token") || localStorage.getItem("zhihu_write_token") || ""
+    () => safeGetStorage("cookie_write_token") || safeGetStorage("zhihu_write_token") || ""
   );
   const [showToken, setShowToken] = useState(false);
   const [needToken, setNeedToken] = useState(true);
@@ -165,9 +182,9 @@ export default function AuthPage() {
       .then(s => {
         setStatus(s);
         setNeedToken(!!s.writeTokenRequired);
-        // 只有首次初始化，或用户主动保存后（且当前没有未保存的修改）才回写表单，
-        // 后台每 8 秒轮询绝不能把用户改了一半的下拉框刷回旧值
-        if (s.syncConfig && (!cfgInitRef.current || (syncForm && !cfgDirtyRef.current))) {
+        // 只有首次初始化或用户主动保存且当前没有未保存修改时才回写表单；
+        // 若用户在首轮响应到达前已开始编辑（cfgDirtyRef=true），同样绝不覆盖用户输入
+        if (s.syncConfig && ((!cfgInitRef.current || syncForm) && !cfgDirtyRef.current)) {
           setCfg({ ...DEFAULT_CFG, ...s.syncConfig });
           cfgInitRef.current = true;
         }
@@ -184,7 +201,13 @@ export default function AuthPage() {
   useEffect(() => {
     load(true);
     const t = setInterval(() => load(false), 8000);
-    return () => clearInterval(t);
+    return () => {
+      clearInterval(t);
+      if (resetTimerRef.current) {
+        clearTimeout(resetTimerRef.current);
+        resetTimerRef.current = null;
+      }
+    };
   }, []);
 
   const buildHeaders = () => {
@@ -199,7 +222,7 @@ export default function AuthPage() {
       setMsg({ type: "err", text: "请先在密码框中输入操作密码" });
       return;
     }
-    localStorage.setItem("cookie_write_token", t);
+    safeSetStorage("cookie_write_token", t);
     setMsg({ type: "ok", text: "已在本浏览器记住操作密码，保存设置或更新 Cookie 时将自动验证。" });
   };
 
@@ -222,7 +245,7 @@ export default function AuthPage() {
         headers: buildHeaders(),
         body: JSON.stringify({ ...cfg, ...keyPatch })
       });
-      if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
+      if (token.trim()) safeSetStorage("cookie_write_token", token.trim());
       if (res.syncConfig) setCfg(res.syncConfig);
       setFallbackKeyInput("");
       setClearFallbackKey(false);
@@ -255,7 +278,7 @@ export default function AuthPage() {
         headers: buildHeaders(),
         body: JSON.stringify({ cookieString: value })
       });
-      if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
+      if (token.trim()) safeSetStorage("cookie_write_token", token.trim());
       setMsg({ type: "ok", text: `已保存 ${r.cookieCount} 项 cookie，下次同步就会用它。` });
       setCookieInput("");
       load(false);
@@ -280,7 +303,7 @@ export default function AuthPage() {
     if (!window.confirm("确定清除已保存的知乎 cookie？（环境变量里的不受影响）")) return;
     try {
       await api("/api/auth/zhihu-cookie/clear", { method: "POST", headers: buildHeaders() });
-      if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
+      if (token.trim()) safeSetStorage("cookie_write_token", token.trim());
       setMsg({ type: "ok", text: "已清除。" });
       load(false);
     } catch (e: any) {
@@ -312,7 +335,7 @@ export default function AuthPage() {
         })
       });
       setToken(nextPwd);
-      localStorage.setItem("cookie_write_token", nextPwd);
+      safeSetStorage("cookie_write_token", nextPwd);
       setCurrentPwdInput("");
       setNewPwdInput("");
       setNeedToken(true);
@@ -325,7 +348,15 @@ export default function AuthPage() {
     }
   };
 
+  const clearResetTimer = () => {
+    if (resetTimerRef.current) {
+      clearTimeout(resetTimerRef.current);
+      resetTimerRef.current = null;
+    }
+  };
+
   const resetTargetForm = () => {
+    clearResetTimer();
     setShowTargetForm(false);
     setEditingTargetId(null);
     setTargetName("");
@@ -346,6 +377,7 @@ export default function AuthPage() {
   };
 
   const openEditTargetForm = (t: ClientExternalStorageTarget) => {
+    clearResetTimer();
     setEditingTargetId(t.id);
     setTargetName(t.name);
     setTargetProvider(t.provider);
@@ -421,10 +453,12 @@ export default function AuthPage() {
           enabled: targetEnabled
         })
       });
-      if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
+      if (token.trim()) safeSetStorage("cookie_write_token", token.trim());
       setTargets(res.targets || []);
       setTargetActionMsg({ type: "ok", text: "外部存储源保存成功！" });
-      setTimeout(() => {
+      clearResetTimer();
+      resetTimerRef.current = setTimeout(() => {
+        resetTimerRef.current = null;
         resetTargetForm();
       }, 1000);
       load(false);
@@ -479,7 +513,7 @@ export default function AuthPage() {
         }
       );
 
-      if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
+      if (token.trim()) safeSetStorage("cookie_write_token", token.trim());
 
       const msgText = `${res.ok ? "🟢 连接成功" : "🔴 连接失败"} (${res.latencyMs}ms): ${res.message}`;
       if (targetId) {
@@ -523,7 +557,7 @@ export default function AuthPage() {
           enabled: !t.enabled
         })
       });
-      if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
+      if (token.trim()) safeSetStorage("cookie_write_token", token.trim());
       setTargets(res.targets || []);
       load(false);
     } catch (e: any) {
@@ -543,7 +577,7 @@ export default function AuthPage() {
         headers: buildHeaders(),
         body: JSON.stringify({ id: t.id })
       });
-      if (token.trim()) localStorage.setItem("cookie_write_token", token.trim());
+      if (token.trim()) safeSetStorage("cookie_write_token", token.trim());
       setTargets(res.targets || []);
       if (editingTargetId === t.id) resetTargetForm();
       load(false);

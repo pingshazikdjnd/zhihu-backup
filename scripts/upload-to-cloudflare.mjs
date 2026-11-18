@@ -644,6 +644,9 @@ if (opts.exportOnly) {
           (chunkRows >= opts.chunkRows || flushedStatementBytes + pendingBytes > CHUNK_BYTES)
         ) {
           flushChunk();
+          // 前面积累在 stmtText 里的行已由 flushChunk 写入上一分片，下一分片只留当前行
+          pendingText = rowSql;
+          pendingBytes = Buffer.byteLength(prefix) + Buffer.byteLength(pendingText) + 1;
         }
 
         stmtText = pendingText;

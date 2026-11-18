@@ -56,6 +56,7 @@ export function upsertContent(input: IngestContentInput, bucket?: R2Bucket) {
 async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) {
   const now = new Date().toISOString();
   const pk = `${input.sourceType}:${input.sourceId}`;
+  const isRealTime = (s?: string | null) => !!s && !s.startsWith("1970-01-01");
   // 保存原始正文：清空入库前，版本快照必须留有真实内容
   const rawHtml = input.contentHtml ?? "";
   const rawMd = input.contentMd ?? "";
@@ -132,8 +133,8 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
       input.isCollapsed ? 1 : 0,
       input.isLabeled ? 1 : 0,
       input.labelInfo || null,
-      input.createdTime || null,
-      input.updatedTime || null,
+      isRealTime(input.createdTime) ? input.createdTime : null,
+      isRealTime(input.updatedTime) ? input.updatedTime : null,
       rawContentHash,
       now,
       now
@@ -182,7 +183,6 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
   // 弱数据源（赞同动态等）常缺 question / 时间戳，且抓取端缺字段时会写
   // 1970-01-01 哨兵：空值与哨兵都不得覆盖库里的旧值（同 safeVoteupCount 思路）。
   // 1970 哨兵还会让 ORDER BY COALESCE(updated_time, ...) 恒命中假时间、排序跌底。
-  const isRealTime = (s?: string | null) => !!s && !s.startsWith("1970-01-01");
   // moments 等弱载荷缺 question 时会带非空占位串（"未知问题"、/question/undefined/）：
   // 非空但错误，同样不能覆盖库里的真实值，且这三个字段不参与 changes[] 比较、
   // 后续正确数据不会主动修复，必须在写入侧挡住
@@ -290,6 +290,15 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
   }
   if ((existing.label_info || null) !== safeLabelInfo) {
     profileChanges.push("标签详情更新");
+  }
+  if ((existing.created_time || null) !== (safeCreatedTime || null)) {
+    profileChanges.push("创建时间修复");
+  }
+  if ((existing.updated_time || null) !== (safeUpdatedTime || null)) {
+    profileChanges.push("更新时间修复");
+  }
+  if ((existing.excerpt || "") !== safeExcerpt) {
+    profileChanges.push("摘要更新");
   }
   // 未传（弱数据源）时保留库里的既有值；显式 false 才置 0
   const nextCollapsed = input.isCollapsed !== undefined ? (input.isCollapsed ? 1 : 0) : existing.is_collapsed;
@@ -404,7 +413,8 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
     await db.prepare(`
       UPDATE contents
       SET author_name = ?, author_url_token = ?, author_avatar = ?, author_headline = ?,
-          source_url = ?, question_id = ?, question_title = ?, label_info = ?, last_seen_at = ?
+          source_url = ?, question_id = ?, question_title = ?, label_info = ?,
+          excerpt = ?, created_time = ?, updated_time = ?, last_seen_at = ?
       WHERE pk = ?
     `).run(
       safeAuthorName,
@@ -415,6 +425,9 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
       safeQuestionId ?? null,
       safeQuestionTitle ?? null,
       safeLabelInfo ?? null,
+      safeExcerpt,
+      safeCreatedTime ?? null,
+      safeUpdatedTime ?? null,
       now,
       pk
     );
@@ -428,7 +441,8 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
       UPDATE contents
       SET voteup_count = ?, comment_count = ?, favorite_count = ?, visit_count = ?,
           author_name = ?, author_url_token = ?, author_avatar = ?, author_headline = ?,
-          source_url = ?, question_id = ?, question_title = ?, label_info = ?, last_seen_at = ?
+          source_url = ?, question_id = ?, question_title = ?, label_info = ?,
+          excerpt = ?, created_time = ?, updated_time = ?, last_seen_at = ?
       WHERE pk = ?
     `).run(
       safeVoteupCount,
@@ -443,6 +457,9 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
       safeQuestionId ?? null,
       safeQuestionTitle ?? null,
       safeLabelInfo ?? null,
+      safeExcerpt,
+      safeCreatedTime ?? null,
+      safeUpdatedTime ?? null,
       now,
       pk
     );

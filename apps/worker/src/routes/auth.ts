@@ -115,16 +115,21 @@ export async function getExternalTargetsRaw(bucket?: any): Promise<ExternalStora
   }
 
   let targets: any[] = [];
+  let d1Found = false;
   try {
     const row = await db.prepare(
       `SELECT value FROM app_settings WHERE key = ?`
     ).get<{ value: string }>(EXTERNAL_TARGETS_KEY);
     if (row?.value) {
-      targets = JSON.parse(row.value);
+      const parsed = JSON.parse(row.value);
+      if (Array.isArray(parsed)) {
+        d1Found = true;
+        targets = parsed;
+      }
     }
   } catch { /* ignore D1 read error */ }
 
-  if ((!targets || !targets.length) && bucket) {
+  if (!d1Found && bucket) {
     try {
       const obj = await bucket.get(R2_EXTERNAL_TARGETS_KEY);
       if (obj) {
@@ -1471,8 +1476,15 @@ authRoutes.post("/external-targets/test", async c => {
       });
       clearTimeout(timer);
       if (res.ok) {
-        testOk = true;
-        testMsg = `Turso HTTP 探测成功 (${res.status} OK)`;
+        const json = await res.json().catch(() => null) as any;
+        const sqlErr = Array.isArray(json?.results) ? json.results.find((r: any) => r?.type === "error") : null;
+        if (sqlErr) {
+          testOk = false;
+          testMsg = `Turso SQL 错误: ${JSON.stringify(sqlErr.error ?? sqlErr).slice(0, 120)}`;
+        } else {
+          testOk = true;
+          testMsg = `Turso HTTP 探测成功 (${res.status} OK)`;
+        }
       } else {
         const text = await res.text().catch(() => "");
         testOk = false;

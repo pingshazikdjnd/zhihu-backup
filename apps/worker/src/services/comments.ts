@@ -479,7 +479,11 @@ async function replaceCommentsByRootInner(
   // 主 D1 的 comments / comment_threads / change_events 与主 R2 的 childcomments/* 全部跳过。
   const offloadTarget = await resolveActiveOffloadTarget(env.BUCKET, "comments").catch(() => null);
   if (offloadTarget && (offloadTarget.provider === "turso" || offloadTarget.provider === "cloudflare_d1")) {
-    return await replaceCommentsByRootOffloaded(input, offloadTarget, env);
+    try {
+      return await replaceCommentsByRootOffloaded(input, offloadTarget, env);
+    } catch (err) {
+      console.warn(`[comments] 外部扩容库写入失败 (${offloadTarget.name})，降级写回主库:`, err);
+    }
   }
 
   const now = new Date().toISOString();
@@ -501,12 +505,13 @@ async function replaceCommentsByRootInner(
   `).bind(input.contentPk).all<ExistingThreadRow>();
   const existingThreads = new Map((threadResult.results ?? []).map(row => [row.root_id, row]));
 
-  // partial 合并只读 R2 会把迁移前写在 D1 的旧扁平子评论弄丢（R2 404 时尤其明显）。
-  // 按 content_pk 一次批量取出本内容 is_deleted=0 的旧子评论行，再按 parent 分组；
-  // 不在每根循环里发 SQL，避免 N+1。只有 partial 才需要这份数据。
+  // 合并只读 R2 会把迁移前写在 D1 的旧扁平子评论弄丢（R2 404 时尤其明显）。
+  // 无论整批 partial 还是单根 isChildrenComplete=false，都需要一次批量取出本内容 is_deleted=0 的旧子评论行。
   const legacyChildrenByRoot = new Map<string, ChildCommentRecord[]>();
   let legacyChildrenReadFailed = false;
-  if (input.partial) {
+  const needLegacyChildMerge =
+    Boolean(input.partial) || input.roots.some(root => !root.isChildrenComplete);
+  if (needLegacyChildMerge) {
     try {
       const legacyResult = await database.prepare(`
         SELECT id, parent_comment_id, author_name, author_avatar, be_replied, content_md,

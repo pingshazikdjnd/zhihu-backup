@@ -286,7 +286,7 @@ export function createZhihuJson(stats: ZhihuRiskStats, deps: ZhihuFetchDeps = {}
                     0,
                     label,
                     `知乎请求网络错误 (${label})${isLastAttempt ? `（已重试 ${attempt} 次仍失败）` : ""}: ${reason}`,
-                    false,
+                    isLastAttempt,
                     countStats
                 );
             }

@@ -190,36 +190,60 @@ async function runMain() {
   //    apiSecret 与 cookieString）。只删不读，杜绝凭据进入日志或任何处理路径。
   fs.rmSync(INPUT_JSON_PATH, { force: true });
 
-  // 2. 自动探测本地代理端口是否存活，若存活且尚未带 --use-env-proxy 则重启自身
-  if (process.env.HTTPS_PROXY && !process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED) {
-    const proxyOk = await isProxyReachable(process.env.HTTPS_PROXY);
-    if (proxyOk) {
-      const code = await new Promise(resolve => {
-        const child = spawn(
-          process.execPath,
-          ["--use-env-proxy", fileURLToPath(import.meta.url), ...process.argv.slice(2)],
-          {
-            cwd: ROOT,
-            stdio: "inherit",
-            env: {
-              ...process.env,
-              NODE_USE_ENV_PROXY: "1",
-              __LOCAL_SYNC_PROXY_BOOTSTRAPPED: "1",
-              ...(ownsLocalLock ? { __LOCAL_SYNC_LOCK_INHERITED: "1" } : {})
-            }
-          }
-        );
-        child.on("close", exitCode => resolve(exitCode ?? 0));
-      });
-      process.exitCode = code;
-      return;
-    } else {
-      console.warn(`⚠️ 本地代理 ${process.env.HTTPS_PROXY} 未启动，已自动回退为直连模式`);
-      delete process.env.HTTPS_PROXY;
-      delete process.env.HTTP_PROXY;
-      delete process.env.NODE_USE_ENV_PROXY;
+  let activeChild = null;
+  let signalHandled = false;
+  const handleSignal = async signal => {
+    if (signalHandled) return;
+    signalHandled = true;
+    console.warn(`\n⚠️ 收到 ${signal}，正在清理凭据并释放同步锁...`);
+    if (activeChild && activeChild.exitCode === null && activeChild.signalCode === null) {
+      try { activeChild.kill("SIGTERM"); } catch { /* ignore */ }
     }
-  }
+    try { fs.rmSync(INPUT_JSON_PATH, { force: true }); } catch { /* ignore */ }
+    if (ownsLocalLock) releaseLocalLock();
+    if (emergencyReleaseCloudLock) {
+      try { await emergencyReleaseCloudLock(); } catch { /* ignore */ }
+    }
+    process.exit(130);
+  };
+  process.once("SIGINT", handleSignal);
+  process.once("SIGTERM", handleSignal);
+
+  try {
+    // 2. 自动探测本地代理端口是否存活，若存活且尚未带 --use-env-proxy 则重启自身
+    if (process.env.HTTPS_PROXY && !process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED) {
+      const proxyOk = await isProxyReachable(process.env.HTTPS_PROXY);
+      if (proxyOk) {
+        const code = await new Promise(resolve => {
+          const child = spawn(
+            process.execPath,
+            ["--use-env-proxy", fileURLToPath(import.meta.url), ...process.argv.slice(2)],
+            {
+              cwd: ROOT,
+              stdio: "inherit",
+              env: {
+                ...process.env,
+                NODE_USE_ENV_PROXY: "1",
+                __LOCAL_SYNC_PROXY_BOOTSTRAPPED: "1",
+                ...(ownsLocalLock ? { __LOCAL_SYNC_LOCK_INHERITED: "1" } : {})
+              }
+            }
+          );
+          activeChild = child;
+          child.on("close", exitCode => {
+            activeChild = null;
+            resolve(exitCode ?? 0);
+          });
+        });
+        process.exitCode = code;
+        return;
+      } else {
+        console.warn(`⚠️ 本地代理 ${process.env.HTTPS_PROXY} 未启动，已自动回退为直连模式`);
+        delete process.env.HTTPS_PROXY;
+        delete process.env.HTTP_PROXY;
+        delete process.env.NODE_USE_ENV_PROXY;
+      }
+    }
 
   // 解析命令行参数
   const args = process.argv.slice(2);
@@ -436,7 +460,11 @@ async function runMain() {
             CRAWLEE_STORAGE_DIR: STORAGE_DIR
           }
         });
-        runProc.on("close", c => resolve(c ?? 0));
+        activeChild = runProc;
+        runProc.on("close", c => {
+          activeChild = null;
+          resolve(c ?? 0);
+        });
       });
 
       if (code === 0) {
@@ -455,6 +483,10 @@ async function runMain() {
     // 主动释放云端租约：不释放就要等 15 分钟自然过期，期间所有同步都会被 409 拒绝。
     // 放在最外层 finally，保证 sync-state 网络错误 / JSON 解析异常也一定会释放。
     await releaseCloudLock();
+  }
+  } finally {
+    process.off("SIGINT", handleSignal);
+    process.off("SIGTERM", handleSignal);
   }
 }
 

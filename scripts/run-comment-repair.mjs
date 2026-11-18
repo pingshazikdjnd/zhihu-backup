@@ -371,7 +371,8 @@ function runCrawlerBatch(batchPks, { baseUrl, secret, username, cookie, onItemDo
     const completedOrder = [];
     const closedOrder = [];
     let haltedByRisk = false;
-    let buffer = "";
+    let stdoutBuf = "";
+    let stderrBuf = "";
 
     const handleLine = (line) => {
       if (!haltedByRisk && isRiskText(line)) {
@@ -385,11 +386,19 @@ function runCrawlerBatch(batchPks, { baseUrl, secret, username, cookie, onItemDo
       if (warnMatch) {
         warnedPks.add(warnMatch[1]);
       }
-      const progMatch = /🩹\s*评论补采进度\s*\d+\/\d+（((?:answer|article):[^）]+)）/.exec(line);
+      const progMatch = /🩹\s*评论补采进度\s*\d+\/\d+（((?:answer|article):[^）]+)）(?:\[status=(ok|closed|failed)\])?/.exec(line);
       if (progMatch && !haltedByRisk) {
         const pk = progMatch[1];
+        const explicitStatus = progMatch[2] || "";
+        if (explicitStatus === "failed") {
+          warnedPks.add(pk);
+          return;
+        }
+        if (explicitStatus === "closed") {
+          closedPks.add(pk);
+        }
         if (!warnedPks.has(pk)) {
-          const kind = closedPks.has(pk) ? "closed" : "completed";
+          const kind = explicitStatus === "closed" || closedPks.has(pk) ? "closed" : "completed";
           if (kind === "closed") closedOrder.push(pk);
           else completedOrder.push(pk);
           if (typeof onItemDone === "function") onItemDone(kind, pk);
@@ -397,19 +406,22 @@ function runCrawlerBatch(batchPks, { baseUrl, secret, username, cookie, onItemDo
       }
     };
 
-    const processLines = (chunkStr, streamOut) => {
+    const processLines = (chunkStr, streamOut, isStderr) => {
       streamOut.write(chunkStr);
       allText = (allText + chunkStr).slice(-256 * 1024);
-      buffer += chunkStr;
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() ?? "";
+      const combined = (isStderr ? stderrBuf : stdoutBuf) + chunkStr;
+      const lines = combined.split(/\r?\n/);
+      const tail = lines.pop() ?? "";
+      if (isStderr) stderrBuf = tail;
+      else stdoutBuf = tail;
       for (const line of lines) handleLine(line);
     };
 
-    child.stdout.on("data", (d) => processLines(d.toString(), process.stdout));
-    child.stderr.on("data", (d) => processLines(d.toString(), process.stderr));
+    child.stdout.on("data", (d) => processLines(d.toString(), process.stdout, false));
+    child.stderr.on("data", (d) => processLines(d.toString(), process.stderr, true));
     child.on("close", (code) => {
-      if (buffer) handleLine(buffer);
+      if (stdoutBuf) handleLine(stdoutBuf);
+      if (stderrBuf) handleLine(stderrBuf);
       try {
         fs.rmSync(INPUT_JSON_PATH, { force: true });
       } catch {}

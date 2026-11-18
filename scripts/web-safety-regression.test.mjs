@@ -453,3 +453,32 @@ test("_worker.js：源码只允许 HTML 分支设置 CSP", () => {
   assert.doesNotMatch(workerSrc, /text\(\)|textContent|String\(res\.body\)/, "不得把二进制 body 转成字符串");
   assert.match(workerSrc, /url\.pathname\.startsWith\("\/ingest\/"\)[\s\S]{0,120}status: 404/);
 });
+
+test("前端边界与安全增强：ErrorBoundary 路由复位、sanitize 防御大小写与 //、存储/标签页/查询原子更新", () => {
+  const appSrc = read("apps/web/src/App.tsx");
+  const sanitizeSrc = read("apps/web/src/lib/sanitize.ts");
+  const collectionsSrc = read("apps/web/src/pages/CollectionsPage.tsx");
+  const authSrc = read("apps/web/src/pages/AuthPage.tsx");
+  const storeSrc = read("apps/web/src/lib/store.ts");
+
+  assert.match(appSrc, /<ErrorBoundary key=\{location\.pathname\}>/);
+  assert.match(sanitizeSrc, /\/\^\(https\?:\)\?\\\/\\\/\/i\.test\(href\)/);
+  assert.match(sanitizeSrc, /node\.getAttribute\("target"\) === "_blank"/);
+
+  assert.match(storeSrc, /answersTotal:\s*null as number \| null/);
+  assert.match(contentsSrc, /contentsStore\.answersTotal = res\.total/);
+  assert.match(contentsSrc, /useEffect\(\(\) => \(\) => \{\s*answersReqRef\.current\+\+;\s*upvotesReqRef\.current\+\+;\s*\}, \[\]\)/);
+
+  assert.match(collectionsSrc, /itemsSeqRef\.current\+\+;/);
+  assert.match(collectionsSrc, /if \(!aliveRef\.current \|\| seq !== itemsSeqRef\.current\) return;/);
+  assert.match(collectionsSrc, /setError\(""\); setActiveTab\("collections"\)/);
+  assert.match(collectionsSrc, /setError\(""\); setActiveTab\("items"\)/);
+
+  assert.match(authSrc, /function safeGetStorage\(/);
+  assert.match(authSrc, /function safeSetStorage\(/);
+  assert.match(authSrc, /\(!cfgInitRef\.current \|\| syncForm\) && !cfgDirtyRef\.current/);
+  assert.match(authSrc, /resetTimerRef\.current/);
+
+  assert.match(questionsSrc, /setActiveQ\(committedQ\);\s*questionsStore\.page = p;\s*questionsStore\.q = committedQ;/);
+  assert.doesNotMatch(questionsSrc, /const handleSearch[\s\S]{0,160}questionsStore\.q = trimmed;/);
+});

@@ -1,5 +1,6 @@
 import { db, FAV_JOIN_SQL } from "../db.js";
 import { evaluateContentRisk } from "./risk.js";
+import { withKeyLock } from "./lock.js";
 
 export type FollowedUserRecord = {
   url_token: string;
@@ -103,6 +104,7 @@ export async function getFollowedUsersMap(bucket: any): Promise<Record<string, F
           ...(d1Newer ? existing : r),
           ...(d1Newer ? r : existing),
           sync_mode: existing.sync_mode || r.sync_mode || "default",
+          last_synced_at: existing.last_synced_at || r.last_synced_at || null,
           mode_updated_at: existing.mode_updated_at,
           resume_offset: existing.resume_offset ?? 0,
           history_done: Boolean(existing.history_done),
@@ -133,124 +135,126 @@ export async function upsertFollowedUsersSnapshot(
   }>,
   incremental = false
 ) {
-  const now = new Date().toISOString();
-  const map = await getFollowedUsersMap(bucket);
-  const incomingTokens = new Set<string>();
-  // 只记录真正需要落库的 token：空集合时 D1/R2 都不写，避免数据没变也产生写入放大
-  const changedTokens = new Set<string>();
+  return withKeyLock("followed_users_map", async () => {
+    const now = new Date().toISOString();
+    const map = await getFollowedUsersMap(bucket);
+    const incomingTokens = new Set<string>();
+    // 只记录真正需要落库的 token：空集合时 D1/R2 都不写，避免数据没变也产生写入放大
+    const changedTokens = new Set<string>();
 
-  for (const u of users) {
-    const token = String(u.urlToken || "").trim();
-    if (!token) continue;
-    incomingTokens.add(token);
-    const prev = map[token];
-    const next: FollowedUserRecord = {
-      url_token: token,
-      user_id: u.userId || prev?.user_id || "",
-      name: u.name || prev?.name || token,
-      avatar_url: u.avatarUrl ?? prev?.avatar_url ?? "",
-      headline: u.headline ?? prev?.headline ?? "",
-      answer_count: Number(u.answerCount ?? prev?.answer_count ?? 0),
-      articles_count: Number(u.articlesCount ?? prev?.articles_count ?? 0),
-      follower_count: Number(u.followerCount ?? prev?.follower_count ?? 0),
-      sync_mode: prev?.sync_mode === "full" ? "full" : "default",
-      is_unfollowed: 0,
-      first_seen_at: prev?.first_seen_at || now,
-      // 先沿用旧的 last_seen_at；只有确认有变化时才在下面刷新为 now
-      last_seen_at: prev?.last_seen_at || now,
-      last_synced_at: prev?.last_synced_at ?? null,
-      mode_updated_at: prev?.mode_updated_at,
-      resume_offset: prev?.resume_offset ?? 0,
-      history_done: Boolean(prev?.history_done),
-      last_checked_answer_id: prev?.last_checked_answer_id || ""
-    };
-    if (hasSignificantChange(prev, next)) {
-      // 新用户或业务字段有变：才算一次真实写入，last_seen_at 随之刷新
-      next.last_seen_at = now;
-      changedTokens.add(token);
-    }
-    map[token] = next;
-  }
-
-  if (!incremental && incomingTokens.size > 0) {
-    for (const token of Object.keys(map)) {
-      if (!incomingTokens.has(token)) {
-        const rec = map[token];
-        // 已是取关状态的不重复标记、不重复写；「未取关 -> 取关」算一次真实变化
-        if (rec.is_unfollowed) continue;
-        rec.is_unfollowed = 1;
-        rec.last_seen_at = now;
+    for (const u of users) {
+      const token = String(u.urlToken || "").trim();
+      if (!token) continue;
+      incomingTokens.add(token);
+      const prev = map[token];
+      const next: FollowedUserRecord = {
+        url_token: token,
+        user_id: u.userId || prev?.user_id || "",
+        name: u.name || prev?.name || token,
+        avatar_url: u.avatarUrl ?? prev?.avatar_url ?? "",
+        headline: u.headline ?? prev?.headline ?? "",
+        answer_count: Number(u.answerCount ?? prev?.answer_count ?? 0),
+        articles_count: Number(u.articlesCount ?? prev?.articles_count ?? 0),
+        follower_count: Number(u.followerCount ?? prev?.follower_count ?? 0),
+        sync_mode: prev?.sync_mode === "full" ? "full" : "default",
+        is_unfollowed: 0,
+        first_seen_at: prev?.first_seen_at || now,
+        // 先沿用旧的 last_seen_at；只有确认有变化时才在下面刷新为 now
+        last_seen_at: prev?.last_seen_at || now,
+        last_synced_at: prev?.last_synced_at ?? null,
+        mode_updated_at: prev?.mode_updated_at,
+        resume_offset: prev?.resume_offset ?? 0,
+        history_done: Boolean(prev?.history_done),
+        last_checked_answer_id: prev?.last_checked_answer_id || ""
+      };
+      if (hasSignificantChange(prev, next)) {
+        // 新用户或业务字段有变：才算一次真实写入，last_seen_at 随之刷新
+        next.last_seen_at = now;
         changedTokens.add(token);
       }
+      map[token] = next;
     }
-  }
 
-  // 没有任何变化时直接返回：不写 R2（省 Class A）、不发 D1 batch（省每日行写入额度）
-  if (changedTokens.size === 0) {
+    if (!incremental && incomingTokens.size > 0) {
+      for (const token of Object.keys(map)) {
+        if (!incomingTokens.has(token)) {
+          const rec = map[token];
+          // 已是取关状态的不重复标记、不重复写；「未取关 -> 取关」算一次真实变化
+          if (rec.is_unfollowed) continue;
+          rec.is_unfollowed = 1;
+          rec.last_seen_at = now;
+          changedTokens.add(token);
+        }
+      }
+    }
+
+    // 没有任何变化时直接返回：不写 R2（省 Class A）、不发 D1 batch（省每日行写入额度）
+    if (changedTokens.size === 0) {
+      const allList = Object.values(map).filter(u => !u.is_unfollowed);
+      return {
+        ok: true,
+        totalFollowed: allList.length,
+        fullModeCount: allList.filter(u => u.sync_mode === "full").length
+      };
+    }
+
+    // 1. 先写 R2（不受 D1 每日 100K 行写入限制影响，100% 实时成功）
+    await writeR2Map(bucket, map);
+
+    // 2. 尝试同步写 D1（只写有变化的用户，迁移 0003 已建表，无需再执行 DDL）
+    try {
+      const stmts: any[] = [];
+      for (const token of changedTokens) {
+        const r = map[token];
+        stmts.push(
+          db.prepare(`
+            INSERT INTO followed_users (
+              url_token, user_id, name, avatar_url, headline,
+              answer_count, articles_count, follower_count,
+              sync_mode, is_unfollowed, first_seen_at, last_seen_at, last_synced_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(url_token) DO UPDATE SET
+              user_id = excluded.user_id,
+              name = excluded.name,
+              avatar_url = excluded.avatar_url,
+              headline = excluded.headline,
+              answer_count = excluded.answer_count,
+              articles_count = excluded.articles_count,
+              follower_count = excluded.follower_count,
+              sync_mode = excluded.sync_mode,
+              is_unfollowed = excluded.is_unfollowed,
+              last_seen_at = excluded.last_seen_at
+          `).raw(
+            r.url_token,
+            r.user_id || "",
+            r.name,
+            r.avatar_url || "",
+            r.headline || "",
+            r.answer_count,
+            r.articles_count,
+            r.follower_count,
+            r.sync_mode,
+            r.is_unfollowed,
+            r.first_seen_at,
+            r.last_seen_at,
+            r.last_synced_at ?? null
+          )
+        );
+      }
+      for (let i = 0; i < stmts.length; i += 50) {
+        await db.batch(stmts.slice(i, i + 50));
+      }
+    } catch {
+      // D1 配额满时静默跳过，R2 已完整保存
+    }
+
     const allList = Object.values(map).filter(u => !u.is_unfollowed);
     return {
       ok: true,
       totalFollowed: allList.length,
       fullModeCount: allList.filter(u => u.sync_mode === "full").length
     };
-  }
-
-  // 1. 先写 R2（不受 D1 每日 100K 行写入限制影响，100% 实时成功）
-  await writeR2Map(bucket, map);
-
-  // 2. 尝试同步写 D1（只写有变化的用户，迁移 0003 已建表，无需再执行 DDL）
-  try {
-    const stmts: any[] = [];
-    for (const token of changedTokens) {
-      const r = map[token];
-      stmts.push(
-        db.prepare(`
-          INSERT INTO followed_users (
-            url_token, user_id, name, avatar_url, headline,
-            answer_count, articles_count, follower_count,
-            sync_mode, is_unfollowed, first_seen_at, last_seen_at, last_synced_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(url_token) DO UPDATE SET
-            user_id = excluded.user_id,
-            name = excluded.name,
-            avatar_url = excluded.avatar_url,
-            headline = excluded.headline,
-            answer_count = excluded.answer_count,
-            articles_count = excluded.articles_count,
-            follower_count = excluded.follower_count,
-            sync_mode = excluded.sync_mode,
-            is_unfollowed = excluded.is_unfollowed,
-            last_seen_at = excluded.last_seen_at
-        `).raw(
-          r.url_token,
-          r.user_id || "",
-          r.name,
-          r.avatar_url || "",
-          r.headline || "",
-          r.answer_count,
-          r.articles_count,
-          r.follower_count,
-          r.sync_mode,
-          r.is_unfollowed,
-          r.first_seen_at,
-          r.last_seen_at,
-          r.last_synced_at ?? null
-        )
-      );
-    }
-    for (let i = 0; i < stmts.length; i += 50) {
-      await db.batch(stmts.slice(i, i + 50));
-    }
-  } catch {
-    // D1 配额满时静默跳过，R2 已完整保存
-  }
-
-  const allList = Object.values(map).filter(u => !u.is_unfollowed);
-  return {
-    ok: true,
-    totalFollowed: allList.length,
-    fullModeCount: allList.filter(u => u.sync_mode === "full").length
-  };
+  });
 }
 
 /**
@@ -261,41 +265,44 @@ export async function setFollowedUserSyncMode(
   urlToken: string,
   syncMode: "default" | "full"
 ) {
-  const map = await getFollowedUsersMap(bucket);
-  const target = map[urlToken];
-  if (!target) {
-    return { ok: false, error: "未找到该关注用户" };
-  }
-  const now = new Date().toISOString();
-  const modeChanged = target.sync_mode !== syncMode;
-  target.sync_mode = syncMode;
-  target.mode_updated_at = now;
-  if (modeChanged && syncMode === "full") {
-    // 从默认模式切换为全量模式时，重置该答主的 history_done 标记，触发全量历史补抓
-    target.history_done = false;
-    target.resume_offset = 0;
-  }
-  map[urlToken] = target;
+  return withKeyLock("followed_users_map", async () => {
+    const map = await getFollowedUsersMap(bucket);
+    const target = map[urlToken];
+    if (!target) {
+      return { ok: false, error: "未找到该关注用户" };
+    }
+    const now = new Date().toISOString();
+    const modeChanged = target.sync_mode !== syncMode;
+    target.sync_mode = syncMode;
+    target.mode_updated_at = now;
+    target.last_seen_at = now;
+    if (modeChanged && syncMode === "full") {
+      // 从默认模式切换为全量模式时，重置该答主的 history_done 标记，触发全量历史补抓
+      target.history_done = false;
+      target.resume_offset = 0;
+    }
+    map[urlToken] = target;
 
-  await writeR2Map(bucket, map);
+    await writeR2Map(bucket, map);
 
-  try {
-    // 迁移 0003 已建表，这里直接 UPDATE；D1 配额满时由 R2 持久化
-    await db.prepare(
-      `UPDATE followed_users SET sync_mode = ?, last_seen_at = ? WHERE url_token = ?`
-    ).run(syncMode, now, urlToken);
-  } catch {
-    // D1 配额满时由 R2 持久化
-  }
+    try {
+      // 迁移 0003 已建表，这里直接 UPDATE；D1 配额满时由 R2 持久化
+      await db.prepare(
+        `UPDATE followed_users SET sync_mode = ?, last_seen_at = ? WHERE url_token = ?`
+      ).run(syncMode, now, urlToken);
+    } catch {
+      // D1 配额满时由 R2 持久化
+    }
 
-  const totalZhihu = (target.answer_count || 0) + (target.articles_count || 0);
-  return {
-    ok: true,
-    url_token: urlToken,
-    sync_mode: syncMode,
-    total_zhihu_items: totalZhihu,
-    planned_backup_items: syncMode === "full" ? totalZhihu : Math.min(totalZhihu, 50)
-  };
+    const totalZhihu = (target.answer_count || 0) + (target.articles_count || 0);
+    return {
+      ok: true,
+      url_token: urlToken,
+      sync_mode: syncMode,
+      total_zhihu_items: totalZhihu,
+      planned_backup_items: syncMode === "full" ? totalZhihu : Math.min(totalZhihu, 50)
+    };
+  });
 }
 
 /**
@@ -306,18 +313,20 @@ export async function updateFollowedUserProgress(
   urlToken: string,
   progress: { resumeOffset: number; historyDone: boolean; lastCheckedAnswerId?: string }
 ) {
-  const map = await getFollowedUsersMap(bucket);
-  const target = map[urlToken];
-  if (!target) return { ok: false };
-  target.resume_offset = Math.max(0, Math.trunc(Number(progress.resumeOffset) || 0));
-  target.history_done = Boolean(progress.historyDone);
-  if (progress.lastCheckedAnswerId) {
-    target.last_checked_answer_id = String(progress.lastCheckedAnswerId);
-  }
-  target.last_synced_at = new Date().toISOString();
-  map[urlToken] = target;
-  await writeR2Map(bucket, map);
-  return { ok: true };
+  return withKeyLock("followed_users_map", async () => {
+    const map = await getFollowedUsersMap(bucket);
+    const target = map[urlToken];
+    if (!target) return { ok: false };
+    target.resume_offset = Math.max(0, Math.trunc(Number(progress.resumeOffset) || 0));
+    target.history_done = Boolean(progress.historyDone);
+    if (progress.lastCheckedAnswerId) {
+      target.last_checked_answer_id = String(progress.lastCheckedAnswerId);
+    }
+    target.last_synced_at = new Date().toISOString();
+    map[urlToken] = target;
+    await writeR2Map(bucket, map);
+    return { ok: true };
+  });
 }
 
 /**

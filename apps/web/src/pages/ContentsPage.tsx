@@ -42,8 +42,13 @@ export default function ContentsPage() {
   const [searchResults, setSearchResults] = useState<any[] | null>(null);
   const [searchTotal, setSearchTotal] = useState(0);
   const [searchError, setSearchError] = useState("");
-  const [answersTotal, setAnswersTotal] = useState<number | null>(null);
+  const [answersTotal, setAnswersTotal] = useState<number | null>(contentsStore.answersTotal);
   const searchSeqRef = useRef(0);
+
+  useEffect(() => () => {
+    answersReqRef.current++;
+    upvotesReqRef.current++;
+  }, []);
 
   // 顶部搜索框提交 / 浏览器前进后退导致 ?q= 变化时，同步到页内 keyword 触发搜索。
   // 本页自己回写的 URL 直接跳过，避免与输入框状态互相覆盖
@@ -140,7 +145,10 @@ export default function ContentsPage() {
       if (!isCurrentRequest(seq, answersReqRef, "answers")) return;
       const myAnswers = res.data;
 
-      if (typeof res.total === "number") setAnswersTotal(res.total);
+      if (typeof res.total === "number") {
+        setAnswersTotal(res.total);
+        contentsStore.answersTotal = res.total;
+      }
 
       if (res.data.length < 50) {
         setHasMoreAnswers(false);

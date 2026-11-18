@@ -1218,4 +1218,44 @@ test("crawler 与补抓脚本统一过滤无效 question.id 并处理楼中楼�
   const childLoop = syncBody.slice(0, syncBody.indexOf("rootsBuffer.push("));
   assert.match(childLoop, /\/已关闭评论\/\.test\(errMsg\)/);
   assert.match(childLoop, /if \(!chIsEnd\) cIncomplete = true;/);
+
+  // 1) fetchStoredCommentState + shouldSyncCommentsDeep：0 子评论根与足够评论总量不反复重抓
+  assert.match(crawlerSrc, /Number\(row\.child_count\) > 0 && Number\(row\.is_complete \?\? 0\) !== 1/);
+  assert.match(crawlerSrc, /if \(state\.storedComments >= expected\) return false;/);
+
+  // 2) postCommentsByRoot 只因 circuitBroken 中断，不在 riskExhausted 时丢弃内存已抓批次
+  const postRootBlock = crawlerSrc.slice(
+    crawlerSrc.indexOf("async function postCommentsByRoot("),
+    crawlerSrc.indexOf("function shouldSyncComments(")
+  );
+  assert.match(postRootBlock, /if \(stats\.circuitBroken\)/);
+  assert.ok(!postRootBlock.includes("stats.riskExhausted"));
+
+  // 3) 关注答主分页跟随 paging.next 或步长 batchLimit，不再按 data.length 跃迁
+  const followAnswersSection = crawlerSrc.slice(crawlerSrc.indexOf("async function runFollowingScraperBody("));
+  assert.ok(!followAnswersSection.includes("aOffset += (aJson.data?.length"), "不得再用 data.length 推进服务端分页 offset");
+
+  // 4) zhihu-fetch 网络重试耗尽必须传 isLastAttempt 计入 riskExhausted
+  const fetchSrc = readScript("apps/apify-crawler/src/zhihu-fetch.ts");
+  assert.match(fetchSrc, /throw recordFailure\(\s*"network",\s*0,\s*label,[\s\S]{0,120}\bisLastAttempt\b/);
+});
+
+test("upload / local-sync / repair-comments / download-images 安全回归", () => {
+  // 1) upload-to-cloudflare 分片切换后必须重置 pendingText，避免跨分片重复行
+  assert.match(uploadSrc, /flushChunk\(\);\s*\/\/[^\n]*\n\s*pendingText = rowSql;\s*pendingBytes =/);
+
+  // 2) local-sync runMain 内注册 SIGINT/SIGTERM 清理并在 finally 解绑
+  assert.match(localSyncSrc, /process\.once\("SIGINT", handleSignal\)/);
+  assert.match(localSyncSrc, /process\.once\("SIGTERM", handleSignal\)/);
+  assert.match(localSyncSrc, /process\.off\("SIGINT", handleSignal\)/);
+
+  // 3) run-comment-repair 分离 stdout/stderr 行缓冲并解析显式 status 标签
+  const repairCommentsSrc = readScript("scripts/run-comment-repair.mjs");
+  assert.match(repairCommentsSrc, /let stdoutBuf = "";\s*let stderrBuf = "";/);
+  assert.match(repairCommentsSrc, /\\\[status=\(ok\|closed\|failed\)\\\]/);
+
+  // 4) download-images-direct 对 --retry-failed 重置起点 attempts=0 并写回 nextAttempts
+  const dlDirectSrc = readScript("scripts/download-images-direct.mjs");
+  assert.match(dlDirectSrc, /row\.status === "failed"\s*\?\s*0\s*:/);
+  assert.match(dlDirectSrc, /const nextAttempts = t\.attempts \+ 1;/);
 });

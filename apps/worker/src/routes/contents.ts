@@ -39,7 +39,20 @@ contentRoutes.get("/", async c => {
   const q = c.req.query("q");
   const mine = c.req.query("mine");
   const isMine = mine === "1" || mine === "true";
-  const author = c.req.query("author") || (isMine ? c.env.ZHIHU_USERNAME : undefined);
+  let author = c.req.query("author");
+  if (!author && isMine) {
+    let owner = (c.env.ZHIHU_USERNAME || "").trim();
+    if (!owner && c.env.DB) {
+      try {
+        const row = await c.env.DB.prepare(
+          `SELECT value FROM app_settings WHERE key = 'zhihu_username'`
+        ).first<{ value?: string }>();
+        owner = String(row?.value || "").trim();
+      } catch { /* ignore */ }
+    }
+    // 未配置 ZHIHU_USERNAME 时传哨兵作者名，绝不退化成全量返回他人内容
+    author = owner || "__unconfigured_owner__";
+  }
   const sort = c.req.query("sort");
   const page = parseInt(c.req.query("page") || "1", 10);
   const { rows, total } = await listContents({ type, q, author, sort, page });
@@ -55,24 +68,30 @@ contentRoutes.get("/:pk", async c => {
     let htmlFound = false;
 
     if (c.env.BUCKET) {
-      // 带 content_hash 的正文对象不可变：边缘缓存一年（immutable）；
-      // 旧 key html/{pk} 会被同 key 覆盖，只缓存 1 小时，写入方负责失效。
+      // 带 content_hash 的正文对象不可变：边缘缓存一年（immutable）
       const hashedHtml = hash
         ? await getR2TextWithEdgeCache(c.env.BUCKET, `html/${pk}/${hash}`, { immutable: true })
         : null;
-      const html =
-        hashedHtml ?? (await getR2TextWithEdgeCache(c.env.BUCKET, `html/${pk}`, { ttlSeconds: 3600 }));
-      if (html !== null) {
-        detail.content.content_html = html;
+      if (hashedHtml !== null) {
+        detail.content.content_html = hashedHtml;
         htmlFound = true;
       }
     }
 
-    // 主 R2 没有：正文可能被 offload 到外部扩容库（content_blobs / 外部 S3）
+    // 主 R2 新 key 未命中时先查外部扩容库（content_blobs / 外部 S3），避免主 R2 旧 key html/{pk} 遮蔽新版 offload 正文
     if (!htmlFound) {
       const remoteHtml = await readOffloadedHtml(pk, hash, c.env.BUCKET);
       if (remoteHtml) {
         detail.content.content_html = remoteHtml;
+        htmlFound = true;
+      }
+    }
+
+    // 外部扩容库仍未命中时再回落主 R2 旧 key html/{pk}（兼容历史未加 hash 数据）
+    if (!htmlFound && c.env.BUCKET) {
+      const legacyHtml = await getR2TextWithEdgeCache(c.env.BUCKET, `html/${pk}`, { ttlSeconds: 3600 });
+      if (legacyHtml !== null) {
+        detail.content.content_html = legacyHtml;
         htmlFound = true;
       }
     }

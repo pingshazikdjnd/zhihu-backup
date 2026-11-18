@@ -419,7 +419,7 @@ async function main() {
       : "status = 'pending' OR (status = 'processing' AND updated_at < ?)";
 
     const taskRows = d1
-      .prepare(`SELECT id, image_url, object_key, attempts FROM image_tasks WHERE ${whereClause} ORDER BY id`)
+      .prepare(`SELECT id, image_url, object_key, status, attempts FROM image_tasks WHERE ${whereClause} ORDER BY id`)
       .all(staleBefore);
 
     const existingR2Rows = r2
@@ -456,7 +456,12 @@ async function main() {
         group = { objectKey: row.object_key, tasks: [], urls: [] };
         groupsMap.set(row.object_key, group);
       }
-      group.tasks.push({ id: row.id, attempts: Number(row.attempts) || 0 });
+      // --retry-failed 重试历史失败行时重置起点 attempts，确保仍享有完整 3 次重试预算
+      const startAttempts =
+        row.status === "failed"
+          ? 0
+          : Math.min(Math.max(0, Number(row.attempts) || 0), MAX_IMAGE_TASK_ATTEMPTS - 1);
+      group.tasks.push({ id: row.id, attempts: startAttempts });
       if (row.image_url && !group.urls.includes(row.image_url)) {
         group.urls.push(row.image_url);
       }
@@ -499,13 +504,13 @@ async function main() {
         (@key, @blob_id, @version, @size, @etag, @uploaded, @checksums, @http_metadata, @custom_metadata)
     `);
     const stmtMarkDone = d1.prepare(
-      "UPDATE image_tasks SET status = 'done', attempts = attempts + 1, last_error = NULL, updated_at = ? WHERE id = ?"
+      "UPDATE image_tasks SET status = 'done', attempts = ?, last_error = NULL, updated_at = ? WHERE id = ?"
     );
     const stmtMarkRetry = d1.prepare(
-      "UPDATE image_tasks SET status = 'pending', attempts = attempts + 1, last_error = ?, updated_at = ? WHERE id = ?"
+      "UPDATE image_tasks SET status = 'pending', attempts = ?, last_error = ?, updated_at = ? WHERE id = ?"
     );
     const stmtMarkFailed = d1.prepare(
-      "UPDATE image_tasks SET status = 'failed', attempts = attempts + 1, last_error = ?, updated_at = ? WHERE id = ?"
+      "UPDATE image_tasks SET status = 'failed', attempts = ?, last_error = ?, updated_at = ? WHERE id = ?"
     );
 
     const pendingR2Commits = [];
@@ -525,12 +530,13 @@ async function main() {
         const txD1 = d1.transaction((ops) => {
           for (const op of ops) {
             for (const t of op.tasks) {
+              const nextAttempts = t.attempts + 1;
               if (op.ok) {
-                stmtMarkDone.run(op.now, t.id);
-              } else if (t.attempts + 1 >= MAX_IMAGE_TASK_ATTEMPTS) {
-                stmtMarkFailed.run(op.reason, op.now, t.id);
+                stmtMarkDone.run(nextAttempts, op.now, t.id);
+              } else if (nextAttempts >= MAX_IMAGE_TASK_ATTEMPTS) {
+                stmtMarkFailed.run(nextAttempts, op.reason, op.now, t.id);
               } else {
-                stmtMarkRetry.run(op.reason, op.now, t.id);
+                stmtMarkRetry.run(nextAttempts, op.reason, op.now, t.id);
               }
             }
           }

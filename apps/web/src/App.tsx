@@ -1,4 +1,4 @@
-import { Routes, Route } from "react-router-dom";
+import { Routes, Route, useLocation } from "react-router-dom";
 import Layout from "./components/Layout.js";
 import ErrorBoundary from "./components/ErrorBoundary.js";
 import DashboardPage from "./pages/DashboardPage.js";
@@ -13,9 +13,10 @@ import FollowingPage from "./pages/FollowingPage.js";
 import RecommendPage from "./pages/RecommendPage.js";
 
 export default function App() {
+  const location = useLocation();
   return (
     <Layout>
-      <ErrorBoundary>
+      <ErrorBoundary key={location.pathname}>
         <Routes>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/recommend" element={<RecommendPage />} />

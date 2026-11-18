@@ -2775,3 +2775,221 @@ test("offload：listRootComments 混合分页跨页去重、getChildComments 不
     auth.invalidateExternalTargetsCache();
   }
 });
+
+test("main comments：partial=false + isChildrenComplete=false 保留旧扁平 D1 子评论，且外部库失败时降级回写主库", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.invalidateMainCommentCountCache();
+
+  // 插入迁移前旧扁平 D1 子评论
+  sqlite.prepare(`
+    INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+    VALUES ('legacy_d1_child', ?, 'r_incomplete', 'OldUser', 'old flat reply', 1, 'h', ?, ?, 0)
+  `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+
+  // 配置一个启用 offload 但端点不可达的外部库，触发降级回写主 D1/R2
+  const r2Store = new Map([
+    [auth.R2_EXTERNAL_TARGETS_KEY, JSON.stringify([{
+      id: "ext-down",
+      name: "Down Turso",
+      provider: "turso",
+      enabled: true,
+      syncScopes: ["comments"],
+      storageRole: "offload",
+      overflowThresholdRows: 1500000,
+      endpointUrl: "https://down-turso.example.com",
+      authToken: "tok",
+      createdAt: NOW_ISO,
+      updatedAt: NOW_ISO
+    }])]
+  ]);
+  const bucket = {
+    async get(key) {
+      const value = r2Store.get(key);
+      return value === undefined ? null : { async text() { return value; } };
+    },
+    async put(key, value) { r2Store.set(key, String(value)); },
+    async delete(key) { r2Store.delete(key); }
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("network outage"); };
+  try {
+    const res = await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        allRootIds: ["r_incomplete"],
+        roots: [{
+          id: "r_incomplete",
+          author: "Root",
+          authorAvatar: "",
+          content: "root",
+          img: "",
+          time: NOW_ISO,
+          location: "",
+          likes: 5,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 2,
+          isChildrenComplete: false,
+          children: [{ id: "preview_child", parentId: "r_incomplete", author: "Preview", content: "new preview", likes: 2 }]
+        }]
+      }, { DB: d1, BUCKET: bucket })
+    );
+    assert.equal(res.added, 1, "外部库写入失败时必须降级写入主 D1/R2 而不抛 500");
+    const stored = JSON.parse(r2Store.get("childcomments/r_incomplete.json"));
+    assert.deepEqual(
+      stored.children.map(c => c.id),
+      ["legacy_d1_child", "preview_child"],
+      "partial=false 时单根 isChildrenComplete=false 必须合并保留旧扁平 D1 子评论"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    auth.invalidateExternalTargetsCache();
+  }
+});
+
+test("collections：incremental 快照保留真实 item_count、支持无变更 0 写，且 getCollectionDetail 不覆盖 ci.author_name", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  const baseCollection = { id: "col_inc", title: "测试收藏", ownerToken: "me", updatedTime: NOW_ISO };
+  const twoItems = [
+    { sourceType: "answer", sourceId: "1", title: "Q1", authorName: "Author1", sourceUrl: "https://www.zhihu.com/question/10/answer/1" },
+    { sourceType: "article", sourceId: "2", title: "A2", authorName: "Author2", sourceUrl: "https://zhuanlan.zhihu.com/p/2" }
+  ];
+
+  // 先全量写入 2 条，contents 表中故意不放 article:2（模拟内容尚未抓全）
+  await runWithDb(d1, () =>
+    collectionsModule.upsertCollectionSnapshot({ collection: baseCollection, incremental: false, items: twoItems })
+  );
+
+  // 1) incremental 只传第 1 条且无新增删除：item_count 仍保持 2 且 0 写快路径生效
+  d1.writes.length = 0;
+  const incSame = await runWithDb(d1, () =>
+    collectionsModule.upsertCollectionSnapshot({ collection: baseCollection, incremental: true, items: [twoItems[0]] })
+  );
+  assert.equal(incSame.unchanged, true);
+  assert.equal(d1.writes.length, 0, "incremental 分片完全无变化时应命中 0 写快路径");
+
+  // 2) incremental 新增第 3 条：快照 item_count 应为总有效数 3（而非本次传入数 2）
+  const newItem = { sourceType: "answer", sourceId: "3", title: "Q3", authorName: "Author3", sourceUrl: "https://www.zhihu.com/question/30/answer/3" };
+  const incAdd = await runWithDb(d1, () =>
+    collectionsModule.upsertCollectionSnapshot({ collection: baseCollection, incremental: true, items: [twoItems[0], newItem] })
+  );
+  assert.equal(incAdd.added, 1);
+  assert.equal(incAdd.count, 3);
+  const latestSnap = sqlite.prepare(`SELECT item_count FROM collection_snapshots WHERE collection_id = 'col_inc' ORDER BY id DESC LIMIT 1`).get();
+  assert.equal(latestSnap.item_count, 3, "incremental 快照记录的 item_count 必须反映全量有效条目数");
+
+  // 3) getCollectionDetail 在 contents 无对应行时不得用 null 覆盖 ci.author_name
+  const detail = await runWithDb(d1, () => collectionsModule.getCollectionDetail("col_inc"));
+  const articleRow = detail.items.find(i => i.source_id === "2");
+  assert.equal(articleRow.author_name, "Author2");
+});
+
+test("contents / following / auth / schema：1970 时间戳过滤、last_synced_at 保留、空 [] 不复活及 null 载荷校验", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  const auth = workerModules.auth;
+  const followingModule = await loadTs(path.join(workerSrc, "services", "following.ts"));
+  auth.invalidateExternalTargetsCache();
+
+  // 1) IngestContentSchema 接受 author/question/time/boolean 为 null
+  const parsedNulls = workerModules.schemas.IngestContentSchema.parse({
+    sourceType: "answer",
+    sourceId: "88",
+    sourceUrl: "https://www.zhihu.com/answer/88",
+    title: null,
+    author: { name: null, urlToken: null, avatarUrl: null, headline: null },
+    question: null,
+    isCollapsed: null,
+    isLabeled: null,
+    createdTime: null,
+    updatedTime: null
+  });
+  assert.equal(parsedNulls.author.name, "");
+  assert.equal(parsedNulls.isCollapsed, undefined);
+
+  // 2) upsertContent 首次 INSERT 不写入 1970-01-01 哨兵，后续真实时间与摘要可通过轻量 UPDATE 修复
+  await runWithDb(d1, () =>
+    contentsModule.upsertContent({
+      sourceType: "answer",
+      sourceId: "88",
+      title: "Title",
+      sourceUrl: "https://www.zhihu.com/answer/88",
+      contentHtml: "",
+      contentMd: "",
+      excerpt: "",
+      voteupCount: 1,
+      commentCount: 0,
+      createdTime: "1970-01-01T00:00:00.000Z",
+      updatedTime: "1970-01-01T00:00:00.000Z"
+    })
+  );
+  const inserted = sqlite.prepare(`SELECT created_time, updated_time FROM contents WHERE pk = 'answer:88'`).get();
+  assert.equal(inserted.created_time, null);
+  assert.equal(inserted.updated_time, null);
+
+  await runWithDb(d1, () =>
+    contentsModule.upsertContent({
+      sourceType: "answer",
+      sourceId: "88",
+      title: "Title",
+      sourceUrl: "https://www.zhihu.com/answer/88",
+      contentHtml: "",
+      contentMd: "",
+      excerpt: "Real excerpt",
+      voteupCount: 1,
+      commentCount: 0,
+      createdTime: NOW_ISO,
+      updatedTime: NOW_ISO
+    })
+  );
+  const repaired = sqlite.prepare(`SELECT excerpt, created_time, updated_time FROM contents WHERE pk = 'answer:88'`).get();
+  assert.equal(repaired.excerpt, "Real excerpt");
+  assert.equal(repaired.created_time, NOW_ISO);
+  assert.equal(repaired.updated_time, NOW_ISO);
+
+  // 3) getExternalTargetsRaw：D1 明确存 "[]" 时不得从 R2 复活已删目标
+  sqlite.prepare(
+    `INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, '[]', ?)`
+  ).run("external_storage_targets", NOW_ISO);
+  const staleR2Bucket = {
+    async get(key) {
+      if (key === auth.R2_EXTERNAL_TARGETS_KEY) {
+        return { async text() { return JSON.stringify([{ id: "ghost", name: "Ghost", provider: "webhook", enabled: true, endpointUrl: "https://example.com" }]); } };
+      }
+      return null;
+    }
+  };
+  const targetsAfterClear = await runWithDb(d1, () => auth.getExternalTargetsRaw(staleR2Bucket));
+  assert.deepEqual(targetsAfterClear, []);
+  auth.invalidateExternalTargetsCache();
+
+  // 4) following：setFollowedUserSyncMode 后不得因 D1 last_seen_at 更晚而丢掉 last_synced_at
+  const followBucket = (() => {
+    const store = new Map();
+    return {
+      async get(key) {
+        const val = store.get(key);
+        return val === undefined ? null : { async text() { return val; } };
+      },
+      async put(key, value) { store.set(key, String(value)); }
+    };
+  })();
+  await runWithDb(d1, () =>
+    followingModule.upsertFollowedUsersSnapshot(followBucket, [{ urlToken: "u1", name: "User 1", answerCount: 10, articlesCount: 1 }], true)
+  );
+  await runWithDb(d1, () =>
+    followingModule.updateFollowedUserProgress(followBucket, "u1", { resumeOffset: 20, historyDone: true, lastCheckedAnswerId: "a1" })
+  );
+  const beforeSwitch = await runWithDb(d1, () => followingModule.getFollowedUsersMap(followBucket));
+  const savedSyncedAt = beforeSwitch.u1.last_synced_at;
+  assert.ok(savedSyncedAt);
+  await runWithDb(d1, () => followingModule.setFollowedUserSyncMode(followBucket, "u1", "full"));
+  const afterSwitch = await runWithDb(d1, () => followingModule.getFollowedUsersMap(followBucket));
+  assert.equal(afterSwitch.u1.last_synced_at, savedSyncedAt);
+  assert.equal(afterSwitch.u1.sync_mode, "full");
+});

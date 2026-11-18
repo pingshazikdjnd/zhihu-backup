@@ -21,35 +21,38 @@ const HttpUrl = z.string().url().refine(
   { message: "sourceUrl must be an http(s) URL without undefined/null path segments" }
 );
 
+const NullableStringToEmpty = z.string().nullable().optional().transform(v => v ?? "");
+const NullableOptionalBool = z.boolean().nullable().optional().transform(v => (v === null ? undefined : v));
+
 export const IngestContentSchema = z.object({
   sourceType: ContentTypeSchema,
   sourceId: z.string(),
-  title: z.string().optional().default(""),
+  title: NullableStringToEmpty,
   sourceUrl: HttpUrl,
   author: z.object({
-    name: z.string().optional().default(""),
+    name: NullableStringToEmpty,
     urlToken: z.string().nullable().optional().default(null),
-    avatarUrl: z.string().optional().default(""),
-    headline: z.string().optional().default("")
+    avatarUrl: NullableStringToEmpty,
+    headline: NullableStringToEmpty
   }).optional().default({ name: "", urlToken: null, avatarUrl: "", headline: "" }),
   question: z.object({
-    id: z.string().optional().default(""),
-    title: z.string().optional().default("")
-  }).optional(),
-  contentHtml: z.string().optional().default(""),
-  contentMd: z.string().optional().default(""),
-  excerpt: z.string().optional().default(""),
+    id: NullableStringToEmpty,
+    title: NullableStringToEmpty
+  }).nullable().optional().transform(v => (v === null ? undefined : v)),
+  contentHtml: NullableStringToEmpty,
+  contentMd: NullableStringToEmpty,
+  excerpt: NullableStringToEmpty,
   voteupCount: z.number().int().optional().default(0),
   commentCount: z.number().int().optional().default(0),
   favoriteCount: z.number().int().optional().default(0),
   visitCount: z.number().int().optional().default(0),
   // 不给默认值：弱数据源（赞同/收藏动态）常不带这两个字段，
   // 默认 false 会在更新路径把库里已有的折叠/黄标状态冲成 0
-  isCollapsed: z.boolean().optional(),
-  isLabeled: z.boolean().optional(),
-  labelInfo: z.string().optional().default(""),
-  createdTime: z.string().optional().default(""),
-  updatedTime: z.string().optional().default("")
+  isCollapsed: NullableOptionalBool,
+  isLabeled: NullableOptionalBool,
+  labelInfo: NullableStringToEmpty,
+  createdTime: NullableStringToEmpty,
+  updatedTime: NullableStringToEmpty
 });
 
 export const IngestCommentSchema = z.object({

@@ -79,11 +79,12 @@ function QuestionList() {
 
   const fetchPage = async (p: number, queryStr = activeQ) => {
     const seq = ++reqIdRef.current;
+    const committedQ = queryStr.trim();
     setIsLoading(true);
     setError("");
     try {
       const qs = new URLSearchParams({ page: String(p) });
-      if (queryStr.trim()) qs.set("q", queryStr.trim());
+      if (committedQ) qs.set("q", committedQ);
       const res = await api<{ data: QuestionRow[]; total?: number }>(`/api/questions?${qs.toString()}`);
       if (!aliveRef.current || seq !== reqIdRef.current) return;
       setRows(prev => {
@@ -93,7 +94,9 @@ function QuestionList() {
         return next;
       });
       setPage(p);
+      setActiveQ(committedQ);
       questionsStore.page = p;
+      questionsStore.q = committedQ;
       if (typeof res.total === "number") {
         setTotal(res.total);
         questionsStore.total = res.total;
@@ -107,14 +110,12 @@ function QuestionList() {
   };
 
   useEffect(() => {
-    if (rows.length === 0) fetchPage(1, activeQ);
+    if (rows.length === 0 || activeQ !== questionsStore.q) fetchPage(1, activeQ);
   }, []);
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = qInput.trim();
-    setActiveQ(trimmed);
-    questionsStore.q = trimmed;
     questionsStore.scrollPosition = 0;
     window.scrollTo(0, 0);
     fetchPage(1, trimmed);
@@ -122,8 +123,6 @@ function QuestionList() {
 
   const handleClearSearch = () => {
     setQInput("");
-    setActiveQ("");
-    questionsStore.q = "";
     questionsStore.scrollPosition = 0;
     window.scrollTo(0, 0);
     fetchPage(1, "");

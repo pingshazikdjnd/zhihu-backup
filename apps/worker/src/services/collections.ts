@@ -83,19 +83,21 @@ async function upsertCollectionSnapshotInner(input: IngestCollectionSnapshotInpu
 
     if (latestSnapshot) {
       const activeItems = existingItems.filter(i => i.is_removed === 0);
-      // uniqueItems 必须与当前有效条目集合完全一致：
-      // 数量相同且每个有效条目都能在输入中找到，才算“本次快照覆盖全部有效条目”。
-      // 增量分片若只带了部分条目，数量/覆盖条件不满足，仍会走原修复流程。
-      const itemsUnchanged =
-        latestSnapshot.item_count === activeItems.length &&
-        uniqueItems.size === activeItems.length &&
-        activeItems.every(row => {
-          const item = uniqueItems.get(`${row.source_type}:${row.source_id}`);
-          if (!item) return false;
-          return (row.title || "") === (item.title || "") &&
-            (row.author_name || "") === (item.authorName || "") &&
-            (row.source_url || "") === (item.sourceUrl || "");
-        });
+      const activeByKey = new Map(activeItems.map(i => [`${i.source_type}:${i.source_id}`, i]));
+      // incremental 分片只要入参全命中既有未删条目且字段完全一致即可 0 写；
+      // 全量快照还必须覆盖全部当前有效条目且与最近一次快照数量一致（遗漏则进入删除对账）。
+      const allIncomingUnchanged = Array.from(uniqueItems.entries()).every(([key, item]) => {
+        const row = activeByKey.get(key);
+        if (!row) return false;
+        return (row.title || "") === (item.title || "") &&
+          (row.author_name || "") === (item.authorName || "") &&
+          (row.source_url || "") === (item.sourceUrl || "");
+      });
+      const itemsUnchanged = input.incremental
+        ? (uniqueItems.size > 0 && allIncomingUnchanged)
+        : (latestSnapshot.item_count === activeItems.length &&
+           uniqueItems.size === activeItems.length &&
+           allIncomingUnchanged);
 
       // 爬虫通常拿不到收藏夹 updated_time（输入固定为空串），而库里是每次保存时的历史时间：
       // 只有本次输入明确给出非空可信值时才比较，空值不得否定完全重复，也不能因此写库。
@@ -236,18 +238,21 @@ async function upsertCollectionSnapshotInner(input: IngestCollectionSnapshotInpu
     }
   }
 
+  const finalActiveCount = input.incremental
+    ? existingItems.filter(i => i.is_removed === 0 && !uniqueItems.has(`${i.source_type}:${i.source_id}`)).length + uniqueItems.size
+    : uniqueItems.size;
+
   stmts.push(db.prepare(`
     INSERT INTO collection_snapshots (
       collection_id, snapshot_at, item_count, added_count, removed_count
     ) VALUES (?, ?, ?, ?, ?)
-  `).raw(collectionId, now, uniqueItems.size, added, removed));
+  `).raw(collectionId, now, finalActiveCount, added, removed));
 
   for (let i = 0; i < stmts.length; i += BATCH_SIZE) {
     await db.batch(stmts.slice(i, i + BATCH_SIZE));
   }
 
-  // 计数口径与快路径一致：payload 里重复出现的条目只算一条（uniqueItems）
-  return { added, removed, count: uniqueItems.size };
+  return { added, removed, count: finalActiveCount };
 }
 
 export async function listCollections() {
@@ -300,7 +305,7 @@ export async function getCollectionDetail(collectionId: string) {
              WHEN c.content_md IS NOT NULL AND c.content_md != '' THEN SUBSTR(c.content_md, 1, 300) 
              ELSE SUBSTR(c.content_html, 1, 300) 
            END as excerpt,
-           c.author_name, c.voteup_count, c.comment_count, c.favorite_count, c.visit_count
+           COALESCE(NULLIF(c.author_name, ''), ci.author_name) as author_name, c.voteup_count, c.comment_count, c.favorite_count, c.visit_count
     FROM collection_items ci
     LEFT JOIN contents c ON ci.content_pk = c.pk
     WHERE ci.collection_id = ?

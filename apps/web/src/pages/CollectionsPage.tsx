@@ -24,6 +24,7 @@ export default function CollectionsPage() {
     aliveRef.current = true;
     return () => {
       aliveRef.current = false;
+      itemsSeqRef.current++;
       if (observer.current) {
         observer.current.disconnect();
         observer.current = null;
@@ -76,7 +77,7 @@ export default function CollectionsPage() {
     setError("");
     try {
       const res = await api<{ data: any[] }>(`/api/collections/items?page=${page}&sort=${sort}`);
-      if (seq !== itemsSeqRef.current) return;
+      if (!aliveRef.current || seq !== itemsSeqRef.current) return;
 
       if (res.data.length < 50) {
         setHasMoreItems(false);
@@ -87,6 +88,7 @@ export default function CollectionsPage() {
       }
 
       setItems(prev => {
+        if (!aliveRef.current || seq !== itemsSeqRef.current) return prev;
         const next = page === 1 ? res.data : [...prev, ...res.data];
         allCollectionsStore.items = next;
         return next;
@@ -94,9 +96,9 @@ export default function CollectionsPage() {
       setItemsPage(page);
       allCollectionsStore.itemsPage = page;
     } catch (e: any) {
-      if (seq === itemsSeqRef.current) setError(e?.message || "收藏条目加载失败");
+      if (aliveRef.current && seq === itemsSeqRef.current) setError(e?.message || "收藏条目加载失败");
     } finally {
-      if (seq === itemsSeqRef.current) setIsLoading(false);
+      if (aliveRef.current && seq === itemsSeqRef.current) setIsLoading(false);
     }
   };
 
@@ -164,13 +166,13 @@ export default function CollectionsPage() {
       <div className="tab-bar">
         <button 
           className={`tab ${activeTab === "collections" ? "active" : ""}`}
-          onClick={() => setActiveTab("collections")} 
+          onClick={() => { setError(""); setActiveTab("collections"); }} 
         >
           按收藏夹
         </button>
         <button 
           className={`tab ${activeTab === "items" ? "active" : ""}`}
-          onClick={() => setActiveTab("items")} 
+          onClick={() => { setError(""); setActiveTab("items"); }} 
         >
           按内容
         </button>
