@@ -335,6 +335,9 @@ async function postCommentsByRoot(
   // 清零 contents.comment_count 与线程索引，否则列表页会永远显示旧评论。
   if (rootComments.length === 0) {
     if (!partial) {
+      if (stats.circuitBroken) {
+        return { batches, roots, children, aborted: true };
+      }
       const payload = {
         contentPk,
         roots: [] as RootCommentGroup[],
@@ -922,7 +925,11 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           const errMsg = sanitizeErrorForLog(e);
           if (/已关闭评论/.test(errMsg)) {
             console.log(`ℹ️ 回答 ${task.answerId} 评论区已关闭，跳过`);
-            rootEnded = true;
+            if (rootPages === 0) {
+              rootEnded = true;
+            } else {
+              cIncomplete = true;
+            }
             break;
           }
           // 401/403/429/5xx/风控空页都已在 zhihuJson 内重试并计入终态统计
@@ -1534,7 +1541,11 @@ export async function syncHotCommentsForContent(
       await flushRoots(true);
     } else if (mode === "full" && !cIncomplete && allRootIds.length > 0) {
       // 根评论恰好是 20 的整数倍：最后一批已作为中间批发出，这里补一次空 roots 的全量对账
-      await postCommentsByRoot(contentPk, [], { partial: false, allRootIds });
+      const res = await postCommentsByRoot(contentPk, [], { partial: false, allRootIds });
+      if (res.aborted) {
+        cIncomplete = true;
+        cFailed = true;
+      }
     }
   } catch (e: any) {
     console.warn(`⚠️ 抓取评论跳过 (${sourceType}:${sourceId}): ${sanitizeErrorForLog(e)}`);

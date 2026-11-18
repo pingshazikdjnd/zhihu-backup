@@ -197,13 +197,30 @@ async function runMain() {
     signalHandled = true;
     console.warn(`\n⚠️ 收到 ${signal}，正在清理凭据并释放同步锁...`);
     if (activeChild && activeChild.exitCode === null && activeChild.signalCode === null) {
-      try { activeChild.kill("SIGTERM"); } catch { /* ignore */ }
+      const childToStop = activeChild;
+      await new Promise(resolve => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          childToStop.off("close", finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, 5000);
+        childToStop.once("close", finish);
+        try {
+          childToStop.kill("SIGTERM");
+        } catch {
+          finish();
+        }
+      });
     }
     try { fs.rmSync(INPUT_JSON_PATH, { force: true }); } catch { /* ignore */ }
-    if (ownsLocalLock) releaseLocalLock();
     if (emergencyReleaseCloudLock) {
       try { await emergencyReleaseCloudLock(); } catch { /* ignore */ }
     }
+    if (ownsLocalLock) releaseLocalLock();
     process.exit(130);
   };
   process.once("SIGINT", handleSignal);
@@ -428,7 +445,11 @@ async function runMain() {
       if (fs.existsSync(tscBin)) {
         const buildCode = await new Promise(resolve => {
           const p = spawn(process.execPath, [tscBin], { cwd: CRAWLER_DIR, stdio: "inherit" });
-          p.on("close", c => resolve(c ?? 0));
+          activeChild = p;
+          p.on("close", c => {
+            activeChild = null;
+            resolve(c ?? 0);
+          });
         });
         if (buildCode !== 0) {
           console.error(`❌ 编译 apps/apify-crawler 失败 (退出码 ${buildCode})`);
