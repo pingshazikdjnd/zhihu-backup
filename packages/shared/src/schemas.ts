@@ -34,7 +34,7 @@ export const IngestContentSchema = z.object({
     urlToken: z.string().nullable().optional().default(null),
     avatarUrl: NullableStringToEmpty,
     headline: NullableStringToEmpty
-  }).optional().default({ name: "", urlToken: null, avatarUrl: "", headline: "" }),
+  }).nullable().optional().transform(v => v ?? { name: "", urlToken: null, avatarUrl: "", headline: "" }),
   question: z.object({
     id: NullableStringToEmpty,
     title: NullableStringToEmpty

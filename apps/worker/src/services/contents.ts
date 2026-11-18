@@ -197,7 +197,13 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
       !isCanonicalQuestionAnswerUrl(input.sourceUrl))
       ? (existing.source_url || input.sourceUrl)
       : input.sourceUrl;
-  const safeExcerpt = input.excerpt || existing.excerpt || "";
+  // 摘要在不同接口/兜底截断下长度可能略有差异：仅当库里摘要为空，或正文/标题确实更新时才覆盖摘要，
+  // 避免未改动的同一条内容在不同抓取通道间来回覆盖摘要并触发无效 profileChanges UPDATE。
+  const isContentOrTitleChanged = existing.content_hash !== contentHash || existing.title !== safeTitle;
+  const safeExcerpt =
+    (!existing.excerpt || isContentOrTitleChanged)
+      ? (input.excerpt || existing.excerpt || "")
+      : existing.excerpt;
   const safeQuestionId = (input.question?.id || existing.question_id) || null;
   const incomingQuestionTitle =
     input.question?.title && !PLACEHOLDER_TITLES.has(input.question.title)
@@ -206,8 +212,23 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
   const safeQuestionTitle = (incomingQuestionTitle || existing.question_title) || null;
   const safeUrlToken = (input.author?.urlToken || existing.author_url_token) || null;
   const safeLabelInfo = (input.labelInfo || existing.label_info) || null;
-  const safeCreatedTime = isRealTime(input.createdTime) ? input.createdTime : existing.created_time;
-  const safeUpdatedTime = isRealTime(input.updatedTime) ? input.updatedTime : existing.updated_time;
+  const isLaterTime = (candidate?: string | null, baseline?: string | null) => {
+    if (!isRealTime(candidate)) return false;
+    if (!isRealTime(baseline)) return true;
+    const candidateMs = Date.parse(candidate!);
+    const baselineMs = Date.parse(baseline!);
+    if (Number.isFinite(candidateMs) && Number.isFinite(baselineMs)) {
+      return candidateMs > baselineMs;
+    }
+    return candidate! > baseline!;
+  };
+  // 创建时间一旦为真实时间则锁定，更新时间只向前推进（或修复缺失/1970 哨兵），避免弱数据源/旧缓存回退
+  const safeCreatedTime = isRealTime(existing.created_time)
+    ? existing.created_time
+    : (isRealTime(input.createdTime) ? input.createdTime : existing.created_time);
+  const safeUpdatedTime = isLaterTime(input.updatedTime, existing.updated_time)
+    ? input.updatedTime
+    : existing.updated_time;
 
   // Preserve existing stats if incoming are 0 to prevent data loss from faulty API responses.
   const safeVoteupCount = (input.voteupCount === 0 && existing.voteup_count > 0) ? existing.voteup_count : input.voteupCount;

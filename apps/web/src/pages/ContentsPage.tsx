@@ -158,15 +158,16 @@ export default function ContentsPage() {
         contentsStore.hasMoreAnswers = true;
       }
 
+      const nextAnswers = page === 1 ? myAnswers : [...contentsStore.answersData, ...myAnswers];
+      contentsStore.answersData = nextAnswers;
+      contentsStore.answersPage = page;
+
       setAnswersData(prev => {
         if (!isCurrentRequest(seq, answersReqRef, "answers")) return prev;
-        const next = page === 1 ? myAnswers : [...prev, ...myAnswers];
-        contentsStore.answersData = next;
-        return next;
+        return page === 1 ? myAnswers : [...prev, ...myAnswers];
       });
 
       setAnswersPage(page);
-      contentsStore.answersPage = page;
     } catch (e: any) {
       if (!isCurrentRequest(seq, answersReqRef, "answers")) return;
       setError(e?.message || "内容列表加载失败");
@@ -195,15 +196,16 @@ export default function ContentsPage() {
         contentsStore.hasMoreUpvotes = true;
       }
 
+      const nextUpvotes = page === 1 ? res.data : [...contentsStore.upvotesData, ...res.data];
+      contentsStore.upvotesData = nextUpvotes;
+      contentsStore.upvotesPage = page;
+
       setUpvotesData(prev => {
         if (!isCurrentRequest(seq, upvotesReqRef, "upvotes")) return prev;
-        const next = page === 1 ? res.data : [...prev, ...res.data];
-        contentsStore.upvotesData = next;
-        return next;
+        return page === 1 ? res.data : [...prev, ...res.data];
       });
 
       setUpvotesPage(page);
-      contentsStore.upvotesPage = page;
     } catch (e: any) {
       if (!isCurrentRequest(seq, upvotesReqRef, "upvotes")) return;
       setError(e?.message || "赞同列表加载失败");

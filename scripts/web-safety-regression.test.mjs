@@ -467,10 +467,13 @@ test("前端边界与安全增强：ErrorBoundary 路由复位、sanitize 防御
 
   assert.match(storeSrc, /answersTotal:\s*null as number \| null/);
   assert.match(contentsSrc, /contentsStore\.answersTotal = res\.total/);
+  assert.match(contentsSrc, /contentsStore\.answersData = nextAnswers;\s*contentsStore\.answersPage = page;/);
+  assert.match(contentsSrc, /contentsStore\.upvotesData = nextUpvotes;\s*contentsStore\.upvotesPage = page;/);
   assert.match(contentsSrc, /useEffect\(\(\) => \(\) => \{\s*answersReqRef\.current\+\+;\s*upvotesReqRef\.current\+\+;\s*\}, \[\]\)/);
 
   assert.match(collectionsSrc, /itemsSeqRef\.current\+\+;/);
   assert.match(collectionsSrc, /if \(!aliveRef\.current \|\| seq !== itemsSeqRef\.current\) return;/);
+  assert.match(collectionsSrc, /allCollectionsStore\.items = nextItems;\s*allCollectionsStore\.itemsPage = page;/);
   assert.match(collectionsSrc, /setError\(""\); setActiveTab\("collections"\)/);
   assert.match(collectionsSrc, /setError\(""\); setActiveTab\("items"\)/);
 
@@ -479,6 +482,7 @@ test("前端边界与安全增强：ErrorBoundary 路由复位、sanitize 防御
   assert.match(authSrc, /\(!cfgInitRef\.current \|\| syncForm\) && !cfgDirtyRef\.current/);
   assert.match(authSrc, /resetTimerRef\.current/);
 
+  assert.match(questionsSrc, /questionsStore\.list = nextRows;/);
   assert.match(questionsSrc, /setActiveQ\(committedQ\);\s*questionsStore\.page = p;\s*questionsStore\.q = committedQ;/);
   assert.doesNotMatch(questionsSrc, /const handleSearch[\s\S]{0,160}questionsStore\.q = trimmed;/);
 });

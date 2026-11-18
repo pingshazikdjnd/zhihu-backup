@@ -87,11 +87,12 @@ function QuestionList() {
       if (committedQ) qs.set("q", committedQ);
       const res = await api<{ data: QuestionRow[]; total?: number }>(`/api/questions?${qs.toString()}`);
       if (!aliveRef.current || seq !== reqIdRef.current) return;
+      const nextRows = p === 1 ? res.data : [...questionsStore.list, ...res.data];
+      questionsStore.list = nextRows;
+
       setRows(prev => {
         if (!aliveRef.current || seq !== reqIdRef.current) return prev;
-        const next = p === 1 ? res.data : [...prev, ...res.data];
-        questionsStore.list = next;
-        return next;
+        return p === 1 ? res.data : [...prev, ...res.data];
       });
       setPage(p);
       setActiveQ(committedQ);

@@ -87,14 +87,15 @@ export default function CollectionsPage() {
         allCollectionsStore.hasMoreItems = true;
       }
 
+      const nextItems = page === 1 ? res.data : [...allCollectionsStore.items, ...res.data];
+      allCollectionsStore.items = nextItems;
+      allCollectionsStore.itemsPage = page;
+
       setItems(prev => {
         if (!aliveRef.current || seq !== itemsSeqRef.current) return prev;
-        const next = page === 1 ? res.data : [...prev, ...res.data];
-        allCollectionsStore.items = next;
-        return next;
+        return page === 1 ? res.data : [...prev, ...res.data];
       });
       setItemsPage(page);
-      allCollectionsStore.itemsPage = page;
     } catch (e: any) {
       if (aliveRef.current && seq === itemsSeqRef.current) setError(e?.message || "收藏条目加载失败");
     } finally {

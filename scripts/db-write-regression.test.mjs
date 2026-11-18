@@ -2912,6 +2912,15 @@ test("contents / following / auth / schema：1970 时间戳过滤、last_synced_
   assert.equal(parsedNulls.author.name, "");
   assert.equal(parsedNulls.isCollapsed, undefined);
 
+  const parsedNullAuthor = workerModules.schemas.IngestContentSchema.parse({
+    sourceType: "answer",
+    sourceId: "88",
+    sourceUrl: "https://www.zhihu.com/answer/88",
+    title: null,
+    author: null
+  });
+  assert.deepEqual(parsedNullAuthor.author, { name: "", urlToken: null, avatarUrl: "", headline: "" });
+
   // 2) upsertContent 首次 INSERT 不写入 1970-01-01 哨兵，后续真实时间与摘要可通过轻量 UPDATE 修复
   await runWithDb(d1, () =>
     contentsModule.upsertContent({
@@ -2951,6 +2960,59 @@ test("contents / following / auth / schema：1970 时间戳过滤、last_synced_
   assert.equal(repaired.excerpt, "Real excerpt");
   assert.equal(repaired.created_time, NOW_ISO);
   assert.equal(repaired.updated_time, NOW_ISO);
+
+  // 2b) 未改动正文/标题时，另一通道发来的不同摘要与更早时间戳不得触发无效 UPDATE 或回退
+  let updateContentsCount = 0;
+  const countingD1 = {
+    prepare(sql) {
+      if (/^\s*UPDATE\s+contents\b/i.test(sql)) {
+        updateContentsCount++;
+      }
+      return d1.prepare(sql);
+    },
+    batch: d1.batch.bind(d1)
+  };
+  await runWithDb(countingD1, () =>
+    contentsModule.upsertContent({
+      sourceType: "answer",
+      sourceId: "88",
+      title: "Title",
+      sourceUrl: "https://www.zhihu.com/answer/88",
+      contentHtml: "",
+      contentMd: "",
+      excerpt: "Different channel excerpt",
+      voteupCount: 1,
+      commentCount: 0,
+      createdTime: "2020-01-01T00:00:00.000Z",
+      updatedTime: "2020-01-01T00:00:00.000Z"
+    })
+  );
+  assert.equal(updateContentsCount, 0);
+  const afterStaleSync = sqlite.prepare(`SELECT excerpt, created_time, updated_time FROM contents WHERE pk = 'answer:88'`).get();
+  assert.equal(afterStaleSync.excerpt, "Real excerpt");
+  assert.equal(afterStaleSync.created_time, NOW_ISO);
+  assert.equal(afterStaleSync.updated_time, NOW_ISO);
+
+  // 更晚的 updatedTime 允许向前推进，同时 created_time 保持锁定
+  const LATER_ISO = "2099-01-01T00:00:00.000Z";
+  await runWithDb(d1, () =>
+    contentsModule.upsertContent({
+      sourceType: "answer",
+      sourceId: "88",
+      title: "Title",
+      sourceUrl: "https://www.zhihu.com/answer/88",
+      contentHtml: "",
+      contentMd: "",
+      excerpt: "Real excerpt",
+      voteupCount: 1,
+      commentCount: 0,
+      createdTime: LATER_ISO,
+      updatedTime: LATER_ISO
+    })
+  );
+  const afterLaterUpdate = sqlite.prepare(`SELECT created_time, updated_time FROM contents WHERE pk = 'answer:88'`).get();
+  assert.equal(afterLaterUpdate.created_time, NOW_ISO);
+  assert.equal(afterLaterUpdate.updated_time, LATER_ISO);
 
   // 3) getExternalTargetsRaw：D1 明确存 "[]" 时不得从 R2 复活已删目标
   sqlite.prepare(
