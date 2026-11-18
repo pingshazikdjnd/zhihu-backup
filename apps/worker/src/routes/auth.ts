@@ -196,6 +196,7 @@ export async function saveExternalTargetsRaw(bucket: any, targets: ExternalStora
     d1Err = err;
   }
   if (d1Err && (!bucket || !r2Ok)) {
+    cachedExternalTargets = null;
     throw d1Err instanceof Error ? d1Err : (r2Err instanceof Error ? r2Err : new Error("保存外部存储目标失败"));
   }
 }

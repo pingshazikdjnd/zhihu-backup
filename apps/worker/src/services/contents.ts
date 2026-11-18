@@ -38,6 +38,16 @@ function hasPlaceholderPathSegment(url: string): boolean {
   }
 }
 
+/** 判断 URL 是否为规范的 /question/<qid>/answer/<aid> 回答链接，避免弱载荷降级成 /answer/<aid> */
+function isCanonicalQuestionAnswerUrl(url: string): boolean {
+  if (hasPlaceholderPathSegment(url)) return false;
+  try {
+    return /\/question\/[^/]+\/answer\/[^/]+/.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
+
 export function upsertContent(input: IngestContentInput, bucket?: R2Bucket) {
   // 同 pk 写串行化：消除读-比-写的并发覆盖窗口（详见 lock.ts）
   return withKeyLock(`${input.sourceType}:${input.sourceId}`, () => upsertContentInner(input, bucket));
@@ -180,12 +190,20 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
   const safeTitle = (input.title && !PLACEHOLDER_TITLES.has(input.title))
     ? input.title
     : (existing.title || input.title || "");
-  const safeSourceUrl = hasPlaceholderPathSegment(input.sourceUrl)
-    ? (existing.source_url || input.sourceUrl)
-    : input.sourceUrl;
+  const safeSourceUrl =
+    hasPlaceholderPathSegment(input.sourceUrl) ||
+    (existing.source_url &&
+      isCanonicalQuestionAnswerUrl(existing.source_url) &&
+      !isCanonicalQuestionAnswerUrl(input.sourceUrl))
+      ? (existing.source_url || input.sourceUrl)
+      : input.sourceUrl;
   const safeExcerpt = input.excerpt || existing.excerpt || "";
   const safeQuestionId = (input.question?.id || existing.question_id) || null;
-  const safeQuestionTitle = (input.question?.title || existing.question_title) || null;
+  const incomingQuestionTitle =
+    input.question?.title && !PLACEHOLDER_TITLES.has(input.question.title)
+      ? input.question.title
+      : "";
+  const safeQuestionTitle = (incomingQuestionTitle || existing.question_title) || null;
   const safeUrlToken = (input.author?.urlToken || existing.author_url_token) || null;
   const safeLabelInfo = (input.labelInfo || existing.label_info) || null;
   const safeCreatedTime = isRealTime(input.createdTime) ? input.createdTime : existing.created_time;
@@ -207,7 +225,11 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
 
   const safeAuthorAvatar = (input.author?.avatarUrl || existing.author_avatar) || null;
   const safeAuthorHeadline = (input.author?.headline || existing.author_headline) || null;
-  const safeAuthorName = (input.author?.name || existing.author_name) || "";
+  const rawAuthorName = input.author?.name || "";
+  const safeAuthorName =
+    rawAuthorName === "匿名" && existing.author_name && existing.author_name !== "匿名"
+      ? existing.author_name
+      : (rawAuthorName || existing.author_name) || "";
   // D1 不存正文原文（原文在 R2），只保留历史行里可能存在的旧值
   const safeContentHtml = existing.content_html || "";
   // 优先用本次生成的可搜索正文，否则保留库里的旧值

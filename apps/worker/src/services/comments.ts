@@ -1049,18 +1049,23 @@ export async function listRootComments(
         (mainIdsResult.results ?? []).map(r => r.id).filter(Boolean)
       );
       if (mainIds.size > 0) {
-        // 混合过渡态：主 D1 有旧根、外部库可能重存过同一根；先去重再按外部序列真实偏移切片
+        // 混合过渡态：主 D1 有旧根、外部库可能重存过同一根；跨目标累积去重后再按真实偏移切片
         const priorRemoteNeeded = Math.max(0, offset - mainIds.size);
-        const fetchLimit = limit + priorRemoteNeeded + mainIds.size;
+        const targetRemoteTotal = priorRemoteNeeded + limit;
+        const fetchLimit = targetRemoteTotal + mainIds.size;
+        const seen = new Set(mainIds);
+        const dedupedRemote: RootCommentRow[] = [];
         for (const target of offloadTargets) {
           const remoteRows = await fetchOffloadRootComments(target, contentPk, fetchLimit, 0);
-          if (remoteRows.length > 0) {
-            return remoteRows
-              .filter(row => !mainIds.has(row.id))
-              .slice(priorRemoteNeeded, priorRemoteNeeded + limit);
+          for (const row of remoteRows) {
+            if (seen.has(row.id)) continue;
+            seen.add(row.id);
+            dedupedRemote.push(row);
+            if (dedupedRemote.length >= targetRemoteTotal) break;
           }
+          if (dedupedRemote.length >= targetRemoteTotal) break;
         }
-        return rows;
+        return dedupedRemote.slice(priorRemoteNeeded, targetRemoteTotal);
       }
     }
     for (const target of offloadTargets) {

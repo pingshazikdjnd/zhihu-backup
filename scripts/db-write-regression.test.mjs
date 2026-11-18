@@ -2499,6 +2499,84 @@ test("upsertContent：历史空串元数据与 null 比较不产生伪写入，�
   );
   assert.equal(thirdRes.changed, false);
   assert.equal(d1.writes.length, 0, "修复后同输入再次写入必须 0 写");
+
+  // 4) 弱载荷带回退链接/匿名作者/占位问题标题时，不得降级覆盖既有规范元数据且应 0 写
+  d1.writes.length = 0;
+  const downgradeRes = await runWithDb(d1, () =>
+    contentsModule.upsertContent({
+      sourceType: "answer",
+      sourceId: "1",
+      title: "未知问题",
+      sourceUrl: "https://www.zhihu.com/answer/1",
+      author: { name: "匿名", urlToken: null, avatarUrl: "", headline: "" },
+      question: { id: "999", title: "未知问题" },
+      contentHtml: "",
+      contentMd: "",
+      excerpt: "existing excerpt",
+      voteupCount: 5,
+      commentCount: 0,
+      favoriteCount: 1,
+      visitCount: 2,
+      labelInfo: "",
+      createdTime: NOW_ISO,
+      updatedTime: NOW_ISO
+    })
+  );
+  assert.equal(downgradeRes.changed, false);
+  assert.equal(d1.writes.length, 0, "回退/占位元数据不得降级覆盖或触发伪 UPDATE");
+  const preservedRow = sqlite.prepare(
+    `SELECT author_name, source_url, question_title FROM contents WHERE pk = ?`
+  ).get(CONTENT_PK);
+  assert.equal(preservedRow.author_name, "FixedAuthor");
+  assert.equal(preservedRow.source_url, "https://www.zhihu.com/question/999/answer/1");
+  assert.equal(preservedRow.question_title, "Fixed Question Title");
+});
+
+test("saveExternalTargetsRaw：D1 与 R2 全失败时不残留错误内存缓存", async () => {
+  const { d1 } = createMemoryDb();
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+
+  const failingD1 = {
+    prepare() {
+      return {
+        bind() { return this; },
+        async run() { throw new Error("D1 write outage"); },
+        async first() { return null; },
+        async all() { return { results: [] }; }
+      };
+    },
+    async batch() { throw new Error("D1 write outage"); }
+  };
+  const failingBucket = {
+    async put() { throw new Error("R2 write outage"); },
+    async get() { return null; }
+  };
+
+  await assert.rejects(
+    () =>
+      runWithDb(failingD1, () =>
+        auth.saveExternalTargetsRaw(failingBucket, [{
+          id: "ext-fail",
+          name: "Bad",
+          provider: "turso",
+          enabled: true,
+          syncScopes: ["comments"],
+          storageRole: "offload",
+          overflowThresholdRows: 1500000,
+          endpointUrl: "https://fail.example.com",
+          authToken: "tok",
+          createdAt: NOW_ISO,
+          updatedAt: NOW_ISO
+        }])
+      ),
+    /D1 write outage/
+  );
+
+  // D1 为空但缓存必须已失效，不得返回刚才失败写入的 ext-fail
+  const after = await runWithDb(d1, () => auth.getExternalTargetsRaw(null));
+  assert.deepEqual(after, []);
+  auth.invalidateExternalTargetsCache();
 });
 
 test("offload：listRootComments 混合分页跨页去重、getChildComments 不完整空快照与 partial=false 不完整楼中楼合并旧扁平行", async () => {

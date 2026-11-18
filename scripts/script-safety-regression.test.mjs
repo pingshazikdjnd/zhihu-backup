@@ -1205,11 +1205,13 @@ test("crawler 与补抓脚本统一过滤无效 question.id 并处理楼中楼�
   const validMeta = metaFns.resolveAnswerQuestionMeta({ id: 456, title: "有效问题" }, "123");
   assert.equal(validMeta.sourceUrl, "https://www.zhihu.com/question/456/answer/123");
   assert.equal(validMeta.question.id, "456");
+  assert.equal(metaFns.resolveAnswerQuestionMeta({ id: 456, title: null }, "123").question.title, "");
 
   // 确认不再残留裸拼 /question/${...question?.id}/answer/
   assert.ok(!crawlerSrc.includes("${item.question?.id}/answer/"));
   assert.ok(!crawlerSrc.includes("${target.question?.id}/answer/"));
   assert.match(gapRepairSrc, /qId !== "undefined" && qId !== "null"/);
+  assert.match(gapRepairSrc, /typeof item\.question\?\.title === "string"/);
 
   // syncHotCommentsForContent 楼中楼需识别闭评错误且在非 is_end 空页置位 cIncomplete
   const syncBody = crawlerSrc.slice(crawlerSrc.indexOf("export async function syncHotCommentsForContent("));

@@ -294,7 +294,7 @@ function buildContentPayloadFromDetail(sourceType, sourceId, item) {
     },
     question:
       sourceType === "answer" && hasQuestionId
-        ? { id: qId, title: item.question?.title }
+        ? { id: qId, title: typeof item.question?.title === "string" ? item.question.title : "" }
         : undefined,
     contentHtml: cleanHtml(item.content),
     contentMd: "",

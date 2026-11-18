@@ -607,7 +607,9 @@ function resolveAnswerQuestionMeta(question: any, answerId: string | number) {
     sourceUrl: hasQuestionId
       ? `https://www.zhihu.com/question/${qId}/answer/${answerId}`
       : `https://www.zhihu.com/answer/${answerId}`,
-    question: hasQuestionId ? { id: qId, title: question?.title } : undefined
+    question: hasQuestionId
+      ? { id: qId, title: typeof question?.title === "string" ? question.title : "" }
+      : undefined
   };
 }
 
