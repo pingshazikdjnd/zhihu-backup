@@ -18,6 +18,22 @@ const fmtDate = (val: any) => {
 const stripHtml = (html: string) =>
   html ? html.replace(/<[^>]+>/g, "").substring(0, 160) + "..." : "";
 
+function safeGetWriteToken(): string {
+  try {
+    return localStorage.getItem("cookie_write_token") || "";
+  } catch {
+    return "";
+  }
+}
+
+function safeSetWriteToken(token: string) {
+  try {
+    localStorage.setItem("cookie_write_token", token);
+  } catch {
+    // 禁用存储/隐私模式不阻断当前请求
+  }
+}
+
 export default function RecommendPage() {
   const navigate = useNavigate();
   const [channel, setChannel] = useState<"mix" | "risk" | "authors" | "classic">(recommendStore.channel);
@@ -86,12 +102,29 @@ export default function RecommendPage() {
     e.stopPropagation();
     if (aiResults[pk]) return;
     setAiLoadingPk(pk);
-    try {
-      const res = await api<any>(`/api/recommend/ai-assess`, {
+    const callAssess = (tokenStr: string) => {
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (tokenStr.trim()) headers.authorization = `Bearer ${tokenStr.trim()}`;
+      return api<any>(`/api/recommend/ai-assess`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers,
         body: JSON.stringify({ pk })
       });
+    };
+    try {
+      let res: any;
+      try {
+        res = await callAssess(safeGetWriteToken());
+      } catch (err: any) {
+        const msg = String(err?.message || "");
+        const needAuth = msg.startsWith("401") || (msg.startsWith("403") && !/Forbidden origin/i.test(msg));
+        if (!needAuth) throw err;
+        const input = window.prompt("AI 风险鉴定需验证操作密码（验证后本浏览器自动记住）：", "");
+        if (!input) return;
+        const trimmed = input.trim();
+        res = await callAssess(trimmed);
+        safeSetWriteToken(trimmed);
+      }
       if (res?.ai) {
         setAiResults(prev => {
           const next = { ...prev, [pk]: res.ai };

@@ -536,8 +536,10 @@ function RootCommentList({
   );
   const [offset, setOffset] = useState(initialComments.length);
   const [loadError, setLoadError] = useState("");
+  const loadMoreSeqRef = useRef(0);
 
   useEffect(() => {
+    loadMoreSeqRef.current++;
     setRootComments(initialComments);
     setOffset(initialComments.length);
     setHasMore(initialHasMore !== undefined ? initialHasMore : initialComments.length >= 20);
@@ -553,23 +555,27 @@ function RootCommentList({
   const handleLoadMore = async () => {
     if (loadingMore || !resolvedPk) return;
     const reqPk = resolvedPk;
+    const reqSeq = ++loadMoreSeqRef.current;
     setLoadingMore(true);
     setLoadError("");
     try {
       const limit = 20;
       const res = await fetchRootComments(reqPk, { limit, offset });
-      if (reqPk !== resolvedPkRef.current) return;
+      if (reqPk !== resolvedPkRef.current || reqSeq !== loadMoreSeqRef.current) return;
       const newItems: RootComment[] = res.data || [];
-      setRootComments(prev => [...prev, ...newItems]);
+      setRootComments(prev => {
+        const seen = new Set(prev.map(item => item.id));
+        return [...prev, ...newItems.filter(item => !seen.has(item.id))];
+      });
       setOffset(prev => prev + newItems.length);
       if (newItems.length < limit) {
         setHasMore(false);
       }
     } catch (e: any) {
-      if (reqPk !== resolvedPkRef.current) return;
+      if (reqPk !== resolvedPkRef.current || reqSeq !== loadMoreSeqRef.current) return;
       setLoadError(e?.message || "加载更多评论失败");
     } finally {
-      if (reqPk === resolvedPkRef.current) {
+      if (reqPk === resolvedPkRef.current && reqSeq === loadMoreSeqRef.current) {
         setLoadingMore(false);
       }
     }

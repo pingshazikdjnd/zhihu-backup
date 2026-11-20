@@ -61,8 +61,24 @@ export default function FollowingPage() {
   return <FollowingHome />;
 }
 
+function safeGetWriteToken(): string {
+  try {
+    return localStorage.getItem("cookie_write_token") || "";
+  } catch {
+    return "";
+  }
+}
+
+function safeSetWriteToken(token: string) {
+  try {
+    localStorage.setItem("cookie_write_token", token);
+  } catch {
+    // 禁用存储/隐私模式不阻断当前请求
+  }
+}
+
 async function postUserModeWithAuth(urlToken: string, syncMode: "default" | "full") {
-  let pwd = localStorage.getItem("cookie_write_token") || "";
+  let pwd = safeGetWriteToken();
   const doCall = (tokenStr: string) => {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (tokenStr.trim()) headers.authorization = `Bearer ${tokenStr.trim()}`;
@@ -78,8 +94,9 @@ async function postUserModeWithAuth(urlToken: string, syncMode: "default" | "ful
     if (String(e?.message || "").startsWith("401")) {
       const input = window.prompt("切换全量/精选备份模式需验证操作密码（验证后本浏览器自动记住）：", "");
       if (!input) throw new Error("已取消密码验证");
-      const res = await doCall(input.trim());
-      localStorage.setItem("cookie_write_token", input.trim());
+      const trimmed = input.trim();
+      const res = await doCall(trimmed);
+      safeSetWriteToken(trimmed);
       return res;
     }
     throw e;
@@ -159,9 +176,26 @@ function FollowingHome() {
   };
 
   useEffect(() => {
-    if (activeTab === "users" && users.length === 0) loadUsers();
-    if (activeTab === "feed" && feed.length === 0) loadFeed(false);
-    if (activeTab === "risk" && riskFeed.length === 0) loadFeed(true);
+    if (activeTab === "users") {
+      if (users.length === 0) {
+        loadUsers();
+        return;
+      }
+    } else if (activeTab === "feed") {
+      if (feed.length === 0) {
+        loadFeed(false);
+        return;
+      }
+    } else if (activeTab === "risk") {
+      if (riskFeed.length === 0) {
+        loadFeed(true);
+        return;
+      }
+    }
+    // 切回已缓存 Tab 时作废前 Tab 在途请求并清空残留 loading/error
+    listReqRef.current++;
+    setLoading(false);
+    setError("");
   }, [activeTab]);
 
   const handleToggleMode = async (u: any) => {
@@ -195,12 +229,29 @@ function FollowingHome() {
     e.stopPropagation();
     if (aiResults[pk]) return;
     setAiLoadingPk(pk);
-    try {
-      const res = await api<any>(`/api/recommend/ai-assess`, {
+    const callAssess = (tokenStr: string) => {
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (tokenStr.trim()) headers.authorization = `Bearer ${tokenStr.trim()}`;
+      return api<any>(`/api/recommend/ai-assess`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers,
         body: JSON.stringify({ pk })
       });
+    };
+    try {
+      let res: any;
+      try {
+        res = await callAssess(safeGetWriteToken());
+      } catch (err: any) {
+        const msg = String(err?.message || "");
+        const needAuth = msg.startsWith("401") || (msg.startsWith("403") && !/Forbidden origin/i.test(msg));
+        if (!needAuth) throw err;
+        const input = window.prompt("AI 风险鉴定需验证操作密码（验证后本浏览器自动记住）：", "");
+        if (!input) return;
+        const trimmed = input.trim();
+        res = await callAssess(trimmed);
+        safeSetWriteToken(trimmed);
+      }
       if (res?.ai) {
         setAiResults(prev => {
           const next = { ...prev, [pk]: res.ai };

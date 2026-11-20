@@ -3055,3 +3055,86 @@ test("contents / following / auth / schema：1970 时间戳过滤、last_synced_
   assert.equal(afterSwitch.u1.last_synced_at, savedSyncedAt);
   assert.equal(afterSwitch.u1.sync_mode, "full");
 });
+
+test("[P0-2][P1-8] crawler runScraper 与 syncHotCommentsForContent：子评论闭评不标记完整 + 首页 ts 空页回退 score", async () => {
+  const prevGet = globalThis.__crawlerContext.request.get;
+  const prevFetch = globalThis.fetch;
+  const prevInput = globalThis.__crawlerInput;
+  const recorded = [];
+
+  try {
+    globalThis.__crawlerInput = {
+      ...prevInput,
+      runType: "answers",
+      syncConfig: { commentsMyAnswers: "full" }
+    };
+    globalThis.__crawlerContext.request.get = async url => {
+      const target = String(url);
+      if (target.includes("/answers?")) {
+        return okJson({ data: [answerFixture], paging: { is_end: true } });
+      }
+      if (target.includes("/api/v4/answers/123?")) {
+        return okJson({ id: 123, voteup_count: 10, visit_count: 5, comment_count: 2 });
+      }
+      if (target.includes("/root_comment?") && target.includes("order_by=ts")) {
+        // 模拟 order_by=ts 首页假空页（is_end=false）
+        return okJson({ data: [], paging: { is_end: false } });
+      }
+      if (target.includes("/root_comment?") && target.includes("order_by=score")) {
+        return okJson({
+          data: [
+            {
+              id: "r-closed-1",
+              author: { name: "Ann", avatar_url: "" },
+              content: "<p>root</p>",
+              created_time: 1700000000,
+              vote_count: 1,
+              child_comment_count: 5,
+              child_comments: [
+                { id: "c-inline-1", author: { name: "B", avatar_url: "" }, content: "<p>inline</p>", created_time: 1700000001, vote_count: 0 }
+              ]
+            }
+          ],
+          paging: { is_end: true }
+        });
+      }
+      if (target.includes("/comments/r-closed-1/child_comments")) {
+        return {
+          ok: () => false,
+          status: () => 403,
+          json: async () => ({ error: { code: 106, message: "评论已关闭" } }),
+          text: async () => JSON.stringify({ error: { code: 106, message: "评论已关闭" } })
+        };
+      }
+      throw new Error(`unexpected URL in P0-2/P1-8 test: ${target}`);
+    };
+    globalThis.fetch = async (url, init) => {
+      const pathname = new URL(String(url)).pathname;
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      recorded.push({ pathname, body });
+      if (pathname === "/ingest/content") {
+        return okJson({ created: true, changed: false, prevCommentCount: 0, pk: CONTENT_PK });
+      }
+      return okJson({ added: 0, updated: 0, deleted: 0 });
+    };
+
+    await quietly(() => crawlerModule.runScraper());
+    await quietly(() => crawlerModule.syncHotCommentsForContent(globalThis.__crawlerContext, "answer", "123", "full"));
+
+    const commentReqs = recorded.filter(r => r.pathname === "/ingest/comments-by-root");
+    assert.equal(commentReqs.length, 2, "两条链路均应通过 order_by=score 回退提交评论");
+    for (const req of commentReqs) {
+      assert.equal(req.body.roots.length, 1);
+      assert.equal(req.body.roots[0].id, "r-closed-1");
+      assert.equal(
+        req.body.roots[0].isChildrenComplete,
+        false,
+        "子评论遇已关闭评论必须发送 isChildrenComplete=false，防止覆盖 R2 历史楼中楼"
+      );
+    }
+  } finally {
+    globalThis.__crawlerContext.request.get = prevGet;
+    globalThis.fetch = prevFetch;
+    globalThis.__crawlerInput = prevInput;
+  }
+});

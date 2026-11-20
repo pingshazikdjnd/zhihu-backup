@@ -181,24 +181,51 @@ function applySizeVariant(url, quality) {
 }
 
 function readImageQuality(d1, r2, blobDir) {
+  let r2Cfg = null;
+  let r2Ts = NaN;
   try {
-    const row = r2.prepare("SELECT blob_id FROM _mf_objects WHERE key = 'config/sync_config.json'").get();
+    const row = r2
+      .prepare("SELECT blob_id, uploaded FROM _mf_objects WHERE key = 'meta/sync_config.json'")
+      .get();
     if (row?.blob_id) {
-      const cfg = JSON.parse(fs.readFileSync(path.join(blobDir, row.blob_id), "utf8"));
-      if (VALID_IMAGE_QUALITIES.has(cfg?.imageQuality)) return cfg.imageQuality;
+      const parsed = JSON.parse(fs.readFileSync(path.join(blobDir, row.blob_id), "utf8"));
+      if (parsed && typeof parsed === "object") {
+        r2Cfg = parsed;
+        const parsedTs = parsed.updatedAt ? Date.parse(String(parsed.updatedAt)) : NaN;
+        const uploadedTs = Number(row.uploaded);
+        r2Ts = Number.isFinite(parsedTs) ? parsedTs : (Number.isFinite(uploadedTs) ? uploadedTs : NaN);
+      }
     }
   } catch {
     /* ignore */
   }
+
+  let d1Cfg = null;
+  let d1Ts = NaN;
   try {
-    const row = d1.prepare("SELECT value FROM app_settings WHERE key = 'sync_config'").get();
+    const row = d1
+      .prepare("SELECT value, updated_at FROM app_settings WHERE key = 'sync_config'")
+      .get();
     if (row?.value) {
-      const cfg = JSON.parse(row.value);
-      if (VALID_IMAGE_QUALITIES.has(cfg?.imageQuality)) return cfg.imageQuality;
+      const parsed = JSON.parse(row.value);
+      if (parsed && typeof parsed === "object") {
+        d1Cfg = parsed;
+        const rawTs = parsed.updatedAt || row.updated_at;
+        d1Ts = rawTs ? Date.parse(String(rawTs)) : NaN;
+      }
     }
   } catch {
     /* ignore */
   }
+
+  const r2Valid = VALID_IMAGE_QUALITIES.has(r2Cfg?.imageQuality);
+  const d1Valid = VALID_IMAGE_QUALITIES.has(d1Cfg?.imageQuality);
+  if (r2Valid && d1Valid) {
+    const preferD1 = Number.isFinite(d1Ts) && (!Number.isFinite(r2Ts) || d1Ts >= r2Ts);
+    return preferD1 ? d1Cfg.imageQuality : r2Cfg.imageQuality;
+  }
+  if (d1Valid) return d1Cfg.imageQuality;
+  if (r2Valid) return r2Cfg.imageQuality;
   return "original";
 }
 

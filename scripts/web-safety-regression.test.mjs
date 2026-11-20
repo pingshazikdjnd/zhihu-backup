@@ -395,24 +395,60 @@ test("_worker.js：API JSON 不追加 CSP，仍正常转发 /api/*", async () =>
   assert.equal(calls.assets, 0);
 });
 
-test("_worker.js：/ingest/* 返回 404 且不转发 Service Binding", async () => {
+test("_worker.js：/ingest/* 仅对携带非空 Bearer 的请求转发到 Service Binding，其余返回 404", async () => {
   const { env, calls } = makeEnv(
     async () => htmlResponse(),
-    async () => {
-      throw new Error("ingest must not be proxied");
+    async request => {
+      assert.equal(request.headers.get("authorization"), "Bearer secret-123");
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
     }
   );
-  const res = await worker.fetch(
+
+  // 1) 无 Authorization 头：直接 404 且不转发 Service Binding
+  const noAuthRes = await worker.fetch(
+    new Request("https://pages.example/ingest/sync-state", { method: "GET" }),
+    env
+  );
+  assert.equal(noAuthRes.status, 404);
+  assert.equal(calls.api, 0);
+  assert.equal(calls.assets, 0);
+
+  // 2) 空 Bearer：同样返回 404
+  const emptyBearerRes = await worker.fetch(
     new Request("https://pages.example/ingest/abc", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization: "Bearer   " },
       body: "{}"
     }),
     env
   );
-  assert.equal(res.status, 404);
+  assert.equal(emptyBearerRes.status, 404);
   assert.equal(calls.api, 0);
+
+  // 3) 携带有效 Bearer 头：透传至 env.API 并返回 200
+  const okRes = await worker.fetch(
+    new Request("https://pages.example/ingest/sync-state", {
+      method: "GET",
+      headers: { authorization: "Bearer secret-123" }
+    }),
+    env
+  );
+  assert.equal(okRes.status, 200);
+  assert.deepEqual(await okRes.json(), { ok: true });
+  assert.equal(calls.api, 1);
   assert.equal(calls.assets, 0);
+
+  // 4) env.API 缺失时 fail-closed 返回 404
+  const noBindingRes = await worker.fetch(
+    new Request("https://pages.example/ingest/sync-state", {
+      headers: { authorization: "Bearer secret-123" }
+    }),
+    { ASSETS: env.ASSETS }
+  );
+  assert.equal(noBindingRes.status, 404);
 });
 
 test("_worker.js：SPA fallback 返回 index.html 并补安全头，非 HTML 404 不强制 CSP", async () => {
@@ -446,12 +482,14 @@ test("_worker.js：SPA fallback 返回 index.html 并补安全头，非 HTML 404
   assert.equal(res2.headers.get("content-security-policy"), null);
 });
 
-test("_worker.js：源码只允许 HTML 分支设置 CSP", () => {
+test("_worker.js：源码只允许 HTML 分支设置 CSP，/ingest/* 校验 Bearer", () => {
   assert.match(workerSrc, /contentType\.toLowerCase\(\)\.includes\("text\/html"\)/);
   assert.match(workerSrc, /new Response\(res\.body, \{/);
   assert.match(workerSrc, /headers\.set\("content-security-policy", HTML_CSP\)/);
   assert.doesNotMatch(workerSrc, /text\(\)|textContent|String\(res\.body\)/, "不得把二进制 body 转成字符串");
-  assert.match(workerSrc, /url\.pathname\.startsWith\("\/ingest\/"\)[\s\S]{0,120}status: 404/);
+  assert.match(workerSrc, /url\.pathname\.startsWith\("\/ingest\/"\)[\s\S]{0,220}status: 404/);
+  assert.match(workerSrc, /if \(!\/\^Bearer\\s\+\\S\+\/i\.test\(auth\) \|\| !env\.API\)/);
+  assert.match(workerSrc, /return env\.API\.fetch\(request\);/);
 });
 
 test("前端边界与安全增强：ErrorBoundary 路由复位、sanitize 防御大小写与 //、存储/标签页/查询原子更新", () => {
@@ -485,4 +523,34 @@ test("前端边界与安全增强：ErrorBoundary 路由复位、sanitize 防御
   assert.match(questionsSrc, /questionsStore\.list = nextRows;/);
   assert.match(questionsSrc, /setActiveQ\(committedQ\);\s*questionsStore\.page = p;\s*questionsStore\.q = committedQ;/);
   assert.doesNotMatch(questionsSrc, /const handleSearch[\s\S]{0,160}questionsStore\.q = trimmed;/);
+});
+
+test("前端 P2-1 / P2-6 回归：AI 鉴权弹窗、FollowingPage 切 Tab 状态重置、localStorage 保护与 CommentTree 去重序号", () => {
+  const commentTreeSrc = read("apps/web/src/components/CommentTree.tsx");
+
+  // 1) FollowingPage & RecommendPage：安全读写 localStorage，且 handleAiAssess 携带 Bearer 与 401/403 弹窗重试
+  for (const [label, src] of [["FollowingPage", followingSrc], ["RecommendPage", recommendSrc]]) {
+    assert.match(src, /function safeGetWriteToken\(/, `${label} 必须使用 safeGetWriteToken`);
+    assert.match(src, /function safeSetWriteToken\(/, `${label} 必须使用 safeSetWriteToken`);
+    const directLsCalls = src.match(/\blocalStorage\.(getItem|setItem)/g) || [];
+    assert.equal(directLsCalls.length, 2, `${label} 只允许在 safeGet/Set helper 中调用 localStorage`);
+    assert.match(src, /headers\.authorization = `Bearer \$\{tokenStr\.trim\(\)\}`/);
+    assert.match(src, /window\.prompt\("AI 风险鉴定需验证操作密码/);
+  }
+
+  // 2) FollowingPage 切回已缓存 Tab 时递增 listReqRef 并清零 loading/error
+  assert.match(
+    followingSrc,
+    /\/\/ 切回已缓存 Tab 时作废前 Tab 在途请求并清空残留 loading\/error\s*listReqRef\.current\+\+;\s*setLoading\(false\);\s*setError\(""\);/
+  );
+
+  // 3) CommentTree RootCommentList 同 pk 翻页序号作废与 id 去重
+  assert.match(commentTreeSrc, /const loadMoreSeqRef = useRef\(0\);/);
+  assert.match(commentTreeSrc, /loadMoreSeqRef\.current\+\+;\s*setRootComments\(initialComments\);/);
+  assert.match(commentTreeSrc, /const reqSeq = \+\+loadMoreSeqRef\.current;/);
+  assert.match(commentTreeSrc, /reqPk !== resolvedPkRef\.current \|\| reqSeq !== loadMoreSeqRef\.current/);
+  assert.match(
+    commentTreeSrc,
+    /const seen = new Set\(prev\.map\(item => item\.id\)\);\s*return \[\.\.\.prev, \.\.\.newItems\.filter\(item => !seen\.has\(item\.id\)\)\];/
+  );
 });

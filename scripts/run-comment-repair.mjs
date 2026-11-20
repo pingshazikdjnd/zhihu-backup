@@ -142,7 +142,8 @@ function scanCandidates(d1) {
         c.pk,
         c.comment_count AS commentCount,
         COALESCE(cm.roots, 0) AS roots,
-        COALESCE(ct.children, 0) AS children
+        COALESCE(ct.children, 0) AS children,
+        COALESCE(ct.incompleteThreads, 0) AS incompleteThreads
       FROM contents c
       LEFT JOIN (
         SELECT content_pk,
@@ -151,9 +152,15 @@ function scanCandidates(d1) {
         GROUP BY content_pk
       ) cm ON cm.content_pk = c.pk
       LEFT JOIN (
-        SELECT content_pk, COALESCE(SUM(child_count), 0) AS children
-        FROM comment_threads
-        GROUP BY content_pk
+        SELECT ct.content_pk,
+               COALESCE(SUM(CASE WHEN ct.is_complete = 1 THEN ct.child_count ELSE 0 END), 0) AS children,
+               COALESCE(SUM(CASE WHEN ct.child_count > 0 AND COALESCE(ct.is_complete, 0) = 0 THEN 1 ELSE 0 END), 0) AS incompleteThreads
+        FROM comment_threads ct
+        JOIN comments r ON r.id = ct.root_id
+                       AND r.content_pk = ct.content_pk
+                       AND r.parent_comment_id IS NULL
+                       AND r.is_deleted = 0
+        GROUP BY ct.content_pk
       ) ct ON ct.content_pk = c.pk
       WHERE c.is_deleted = 0
         AND c.source_type IN ('answer', 'article')
@@ -176,7 +183,7 @@ function scanCandidates(d1) {
   let skippedAlreadyComplete = 0;
   const targets = [];
   for (const r of rows) {
-    if (Number(r.roots) + Number(r.children) >= Number(r.commentCount)) {
+    if (Number(r.incompleteThreads || 0) === 0 && Number(r.roots) + Number(r.children) >= Number(r.commentCount)) {
       skippedAlreadyComplete += 1;
       continue;
     }
@@ -281,7 +288,11 @@ async function startLocalWorker(port) {
 function stopLocalWorker(proc) {
   if (!proc?.pid) return;
   try {
-    execFileSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], { stdio: "ignore" });
+    if (process.platform === "win32") {
+      execFileSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      proc.kill("SIGTERM");
+    }
   } catch {}
 }
 

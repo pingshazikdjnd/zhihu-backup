@@ -914,17 +914,36 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       // answers/root_comment 才返回完整游标分页，与文章链路对齐。
       // full 必须用 order_by=ts：score 排序实测在约 200 根处同样假 is_end。
       // comment_v5 answers 每页固定 10 条，offset 是游标字符串，需跟随 paging.next。
-      const buildRootCommentsUrl = (offset: number) =>
-        `https://www.zhihu.com/api/v4/comment_v5/answers/${task.answerId}/root_comment?order_by=${
-          cfg.commentsMyAnswers === "full" ? "ts" : "score"
-        }&limit=20&offset=${offset === 0 ? "" : offset}`;
-      let cNextUrl = buildRootCommentsUrl(0);
+      const buildRootCommentsUrl = (offset: number, orderByOverride?: "ts" | "score") => {
+        const orderBy = orderByOverride ?? (cfg.commentsMyAnswers === "full" ? "ts" : "score");
+        return `https://www.zhihu.com/api/v4/comment_v5/answers/${task.answerId}/root_comment?order_by=${orderBy}&limit=20&offset=${offset === 0 ? "" : offset}`;
+      };
+      let currentOrderBy: "ts" | "score" = cfg.commentsMyAnswers === "full" ? "ts" : "score";
+      let cNextUrl = buildRootCommentsUrl(0, currentOrderBy);
       while (!cIsEnd && rootPages < MAX_COMMENT_PAGES && !stats.riskExhausted && !stats.circuitBroken) {
         let cJson: any;
+        const canFallbackScore = cfg.commentsMyAnswers === "full" && rootPages === 0 && currentOrderBy === "ts";
         try {
           cJson = (await zhihuJson(context, cNextUrl, {
-            label: `回答 ${task.answerId} 根评论`
+            label: `回答 ${task.answerId} 根评论`,
+            ...(canFallbackScore ? { allowEmptyPage: true } : {})
           })).json;
+          if (
+            canFallbackScore &&
+            Array.isArray(cJson?.data) &&
+            cJson.data.length === 0 &&
+            cJson.paging?.is_end !== true
+          ) {
+            console.log(`ℹ️ answer ${task.answerId} order_by=ts 首页空页（is_end=false），回退改用 order_by=score`);
+            await jitterSleep(400, 750);
+            currentOrderBy = "score";
+            cNextUrl = buildRootCommentsUrl(0, "score");
+            cJson = (
+              await zhihuJson(context, cNextUrl, {
+                label: `回答 ${task.answerId} 根评论(score)`
+              })
+            ).json;
+          }
         } catch (e: any) {
           const errMsg = sanitizeErrorForLog(e);
           if (/已关闭评论/.test(errMsg)) {
@@ -943,9 +962,30 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           break;
         }
         // 知乎风控会返回 200 + 空数组；该形态已在 zhihuJson 内重试并计数。
-        // 能走到这里的是 is_end 的合法空页。
+        // 能走到这里的是 is_end 的合法空页（或第 0 页空页）。
         if (!cJson.data || cJson.data.length === 0) {
-          rootEnded = true;
+          const emptyIsEnd = cJson.paging?.is_end === true;
+          if (rootPages === 0 && emptyIsEnd && cfg.commentsMyAnswers === "full") {
+            rootEnded = true;
+            cIsEnd = true;
+            try {
+              const res = await postCommentsByRoot(contentPk, [], { partial: false, allRootIds: [] });
+              if (res.aborted) {
+                cIncomplete = true;
+                cFailed = true;
+              }
+            } catch (e: any) {
+              cIncomplete = true;
+              cFailed = true;
+              console.warn(`⚠️ 回答 ${task.answerId} 空页清零对账失败: ${sanitizeErrorForLog(e)}`);
+            }
+          } else if (emptyIsEnd) {
+            rootEnded = true;
+            cIsEnd = true;
+          } else {
+            cIncomplete = true;
+            cFailed = true;
+          }
           break;
         }
         rootPages++;
@@ -980,6 +1020,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           if (childCount > children.length) {
             let chOffset = 0;
             let chIsEnd = false;
+            let chClosed = false;
             let chPages = 0;
               while (!chIsEnd && chPages < MAX_COMMENT_PAGES && !stats.riskExhausted && !stats.circuitBroken) {
                 // 必须复用带 cookie 的 context.request：裸 fetch 不带登录态，知乎直接 401，
@@ -995,7 +1036,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
                   const errMsg = sanitizeErrorForLog(e);
                   if (/已关闭评论/.test(errMsg)) {
                     console.log(`ℹ️ 评论 ${c.id} 子评论已关闭，跳过 (${errMsg})`);
-                    chIsEnd = true;
+                    chClosed = true;
                     break;
                   }
                   console.warn(`⚠️ 评论 ${c.id} 子评论中断: ${errMsg}`);
@@ -1017,12 +1058,12 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
                 chOffset += 20;
                 await jitterSleep(900, 1700);
               }
-            if (!chIsEnd && chPages >= MAX_COMMENT_PAGES) {
+            if (!chIsEnd && !chClosed && chPages >= MAX_COMMENT_PAGES) {
               cIncomplete = true;
               console.warn(`⚠️ 评论 ${c.id} 子评论达到 ${MAX_COMMENT_PAGES} 页上限，本轮标记 partial`);
             }
-            // 翻到 is_end 或已补齐 child_comment_count 才算子评论完整
-            childrenComplete = chIsEnd || children.length >= childCount;
+            // 翻到 is_end 或已补齐 child_comment_count 才算子评论完整；遇闭评一律不覆盖 R2 历史楼中楼
+            childrenComplete = !chClosed && (chIsEnd || children.length >= childCount);
           } else {
             childrenComplete = children.length >= childCount;
           }
@@ -1090,6 +1131,22 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           cIncomplete = true;
           cFailed = true;
           console.error(`❌ 保存评论失败: ${sanitizeErrorForLog(err)}`);
+          if (stats.circuitBroken) {
+            commentSyncIncomplete.add(contentPk);
+            break;
+          }
+        }
+      } else if (cfg.commentsMyAnswers === "full" && !cIncomplete && allRootIds.length > 0) {
+        try {
+          const res = await postCommentsByRoot(contentPk, [], { partial: false, allRootIds });
+          if (res.aborted) {
+            cIncomplete = true;
+            cFailed = true;
+          }
+        } catch (err: any) {
+          cIncomplete = true;
+          cFailed = true;
+          console.error(`❌ 评论全量对账失败: ${sanitizeErrorForLog(err)}`);
           if (stats.circuitBroken) {
             commentSyncIncomplete.add(contentPk);
             break;
@@ -1199,8 +1256,8 @@ async function runArticleScraperBody(browser: Awaited<ReturnType<typeof setupBro
         commentCount: Number(art.comment_count ?? 0) || 0,
         favoriteCount: Number(art.favorite_count ?? art.reaction?.statistics?.favorites ?? 0) || 0,
         visitCount: Number(art.visit_count ?? 0) || 0,
-        isCollapsed: false,
-        isLabeled: Boolean(art.is_labeled),
+        isCollapsed: typeof art.is_collapsed === "boolean" ? art.is_collapsed : undefined,
+        isLabeled: typeof art.is_labeled === "boolean" ? art.is_labeled : undefined,
         createdTime: toIsoOrNull(art.created ?? art.created_time),
         updatedTime: toIsoOrNull(art.updated ?? art.updated_time),
         sourceUrl: `https://zhuanlan.zhihu.com/p/${art.id}`
@@ -1425,6 +1482,7 @@ export async function syncHotCommentsForContent(
               : `https://www.zhihu.com/api/v4/comments/${c.id}/child_comments?offset=${offset}&limit=20`;
           let chOffset = 0;
           let chIsEnd = false;
+          let chClosed = false;
           let chPages = 0;
           let chNextUrl = buildChildUrl(chOffset);
           while (!chIsEnd && chPages < MAX_COMMENT_PAGES && !stats.riskExhausted && !stats.circuitBroken) {
@@ -1440,7 +1498,7 @@ export async function syncHotCommentsForContent(
               const errMsg = sanitizeErrorForLog(e);
               if (/已关闭评论/.test(errMsg)) {
                 console.log(`ℹ️ 评论 ${c.id} 楼中楼已关闭，跳过 (${errMsg})`);
-                chIsEnd = true;
+                chClosed = true;
                 break;
               }
               console.warn(
@@ -1487,12 +1545,12 @@ export async function syncHotCommentsForContent(
           if (chPages > 0 && chIsEnd && !stats.riskExhausted && !stats.circuitBroken) {
             await jitterSleep(550, 950);
           }
-          if (!chIsEnd && chPages >= MAX_COMMENT_PAGES) {
+          if (!chIsEnd && !chClosed && chPages >= MAX_COMMENT_PAGES) {
             cIncomplete = true;
             console.warn(`⚠️ 评论 ${c.id} 楼中楼达到 ${MAX_COMMENT_PAGES} 页上限，本轮标记 partial`);
           }
-          // 翻到 is_end 或已补齐 child_comment_count 才算子评论完整；中途异常/风控一律不完整
-          childrenComplete = chIsEnd || children.length >= childCount;
+          // 翻到 is_end 或已补齐 child_comment_count 才算子评论完整；遇闭评或中途异常一律不覆盖历史楼中楼
+          childrenComplete = !chClosed && (chIsEnd || children.length >= childCount);
         }
         rootsBuffer.push(toRootCommentGroup(c, children, childrenComplete));
         if (rootsBuffer.length >= 20) await flushRoots(false);
@@ -2030,12 +2088,15 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
     try {
       const u1 = new URL(candidateUrl);
       const u2 = new URL(savedCursor);
+      const o1 = Number(u1.searchParams.get("offset"));
+      const o2 = Number(u2.searchParams.get("offset"));
+      // 双方均含有效时间游标 offset 时只按时间维度判定；仅无 offset 时才退回比较相对页码 page_num
+      if (Number.isFinite(o1) && Number.isFinite(o2) && o1 > 0 && o2 > 0) {
+        return o1 <= o2;
+      }
       const p1 = Number(u1.searchParams.get("page_num"));
       const p2 = Number(u2.searchParams.get("page_num"));
       if (Number.isFinite(p1) && Number.isFinite(p2) && p1 > 0 && p2 > 0 && p1 >= p2) return true;
-      const o1 = Number(u1.searchParams.get("offset"));
-      const o2 = Number(u2.searchParams.get("offset"));
-      if (Number.isFinite(o1) && Number.isFinite(o2) && o1 > 0 && o2 > 0 && o1 <= o2) return true;
     } catch { /* ignore */ }
     return false;
   }
@@ -3006,8 +3067,9 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             commentCount: item.comment_count || 0,
             favoriteCount: item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0,
             visitCount: item.visit_count ?? 0,
-            // 与回答链路对齐补传：include 里已带 is_labeled，缺失时 Boolean(undefined)=false
-            isLabeled: Boolean(item.is_labeled),
+            // 仅在接口显式下发布尔值时透传；缺省保持 undefined，避免覆盖库中既有折叠/黄标标记
+            isCollapsed: typeof item.is_collapsed === "boolean" ? item.is_collapsed : undefined,
+            isLabeled: typeof item.is_labeled === "boolean" ? item.is_labeled : undefined,
             createdTime: toIsoOrNull(item.created || item.created_time),
             updatedTime: toIsoOrNull(item.updated || item.updated_time)
           };
@@ -3143,6 +3205,25 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
 }
 
 
+let syncLockReleased = false;
+async function releaseSyncLockBeforeExit(): Promise<void> {
+  if (!syncOwnerId || syncLockReleased) return;
+  syncLockReleased = true;
+  const base = apiUrl.endsWith("/") ? apiUrl.slice(0, -1) : apiUrl;
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (apiSecret) headers["authorization"] = `Bearer ${apiSecret}`;
+  try {
+    await fetch(`${base}/ingest/sync-lock/release`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ownerId: syncOwnerId }),
+      signal: AbortSignal.timeout(10_000)
+    });
+  } catch {
+    // 释放失败不阻塞退出，租约 15 分钟后自然过期
+  }
+}
+
 // --- Apify Entry Point ---
 // 失败必须让 run 状态可见。之前所有异常都被吞掉后正常 exit，
 // cookie 失效后 run 依然 SUCCEEDED，Worker /auth 页据此误报"一切正常"。
@@ -3195,6 +3276,7 @@ try {
 } catch (e) {
   const errMsg = sanitizeErrorForLog(e);
   log.error(errMsg);
+  await releaseSyncLockBeforeExit();
   await Actor.fail(`crawler_error: ${errMsg}`);
   process.exit(1);
 }
@@ -3207,11 +3289,13 @@ const savedForTerminal = repairSummary ? repairSummary.ok : stats.saved;
 
 if (stats.circuitBroken) {
   log.warning(`本轮触发连续失败断路器暂停（已保存 ${savedForTerminal} 条数据，失败 ${stats.failed} 次），断点已保留供下次继续`);
+  await releaseSyncLockBeforeExit();
   await Actor.exit({ exitCode: 2 });
   process.exit(2);
 }
 
 if ((stats.authRejected > 0 || stats.riskEmpty > 0 || stats.riskExhausted) && savedForTerminal === 0) {
+  await releaseSyncLockBeforeExit();
   await Actor.fail(
     `zhihu_auth_failed: 被知乎 401/403 拒绝 ${stats.authRejected} 次、疑似风控空页 ${stats.riskEmpty} 次、` +
       `风控暂停重试耗尽 ${stats.riskExhausted ? "是" : "否"}（cookie 可能已失效或被风控），本轮零数据入库`
@@ -3220,10 +3304,12 @@ if ((stats.authRejected > 0 || stats.riskEmpty > 0 || stats.riskExhausted) && sa
 }
 if (savedForTerminal === 0 && stats.failed > 0) {
   // failed 只统计 Worker 入库失败；知乎侧 429/5xx 已独立计入 zhihuRejected
+  await releaseSyncLockBeforeExit();
   await Actor.fail(`ingest_failed: Worker 回传 ${stats.failed} 次全部失败（检查 API_SECRET / WORKER_URL），本轮零数据入库`);
   process.exit(1);
 }
 if (savedForTerminal === 0 && stats.zhihuRejected > 0) {
+  await releaseSyncLockBeforeExit();
   await Actor.fail(`zhihu_request_failed: 知乎侧请求失败 ${stats.zhihuRejected} 次（429/5xx/非 JSON/网络错误），本轮零数据入库`);
   process.exit(1);
 }
@@ -3256,6 +3342,7 @@ if (stats.failed > 0 || stats.zhihuRejected > 0 || stats.riskExhausted) {
   );
 }
 
+await releaseSyncLockBeforeExit();
 if (finalStatusMessage) {
   await Actor.exit({ statusMessage: finalStatusMessage });
 } else {

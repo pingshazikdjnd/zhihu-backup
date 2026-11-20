@@ -1265,3 +1265,181 @@ test("upload / local-sync / repair-comments / download-images 安全回归", () 
   assert.match(dlDirectSrc, /row\.status === "failed"\s*\?\s*0\s*:/);
   assert.match(dlDirectSrc, /const nextAttempts = t\.attempts \+ 1;/);
 });
+
+// ---------------------------------------------------------------------------
+// 新增回归：P0-2 / P1-2 / P1-3 / P1-6 / P1-7 / P1-8 / P2-3 / P2-4 / P2-7
+// ---------------------------------------------------------------------------
+test("[P0-2][P1-8][P2-3][P2-4][P2-7] crawler/main.ts 与补抓脚本安全回归", () => {
+  const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");
+  const gapRepairSrc = readScript("scripts/repair-upvotes-and-gaps.mjs");
+
+  // P0-2：runScraperBody 与 syncHotCommentsForContent 子评论遇「已关闭评论」只置 chClosed=true，绝不置 chIsEnd=true
+  assert.equal(
+    (crawlerSrc.match(/childrenComplete = !chClosed && \(chIsEnd \|\| children\.length >= childCount\);/g) || []).length,
+    2,
+    "runScraperBody 与 syncHotCommentsForContent 必须统一使用 !chClosed 门控 childrenComplete"
+  );
+  assert.ok(
+    !/if\s*\(\/已关闭评论\/\.test\(errMsg\)\)\s*\{\s*console\.log\([^\n]*子评论[^\n]*\);\s*chIsEnd = true;/m.test(crawlerSrc),
+    "子评论闭评不得再置 chIsEnd = true"
+  );
+
+  // P1-8：runScraperBody 支持 order_by=ts 首页空页回退 order_by=score 与第 0 页空页清零对账
+  const scraperBody = crawlerSrc.slice(
+    crawlerSrc.indexOf("async function runScraperBody("),
+    crawlerSrc.indexOf("export async function runArticleScraper(")
+  );
+  assert.match(scraperBody, /const canFallbackScore = cfg\.commentsMyAnswers === "full" && rootPages === 0 && currentOrderBy === "ts";/);
+  assert.match(scraperBody, /\.\.\.\(canFallbackScore \? \{ allowEmptyPage: true \} : \{\}\)/);
+  assert.match(scraperBody, /currentOrderBy = "score";\s*cNextUrl = buildRootCommentsUrl\(0, "score"\);/);
+  assert.match(scraperBody, /if \(rootPages === 0 && emptyIsEnd && cfg\.commentsMyAnswers === "full"\)[\s\S]{0,200}postCommentsByRoot\(contentPk, \[\], \{ partial: false, allRootIds: \[\] \}\)/);
+
+  // P2-3：hasReachedCursor 优先时间维度 offset，不被浅层 page_num 误导
+  const cursorStart = crawlerSrc.indexOf("  function hasReachedCursor(");
+  assert.ok(cursorStart >= 0, "main.ts 缺少 hasReachedCursor");
+  const cursorEnd = crawlerSrc.indexOf("\n  }\n", cursorStart);
+  assert.ok(cursorEnd >= 0, "hasReachedCursor 缺少结束括号");
+  const cursorFnSrc = crawlerSrc
+    .slice(cursorStart, cursorEnd + 4)
+    .replace("function hasReachedCursor(candidateUrl: string, savedCursor?: string): boolean", "function hasReachedCursor(candidateUrl, savedCursor)");
+  const hasReachedCursor = vm.runInNewContext(`(${cursorFnSrc})`, { URL });
+  assert.equal(
+    hasReachedCursor(
+      "https://www.zhihu.com/api/v3/moments/u/activities?page_num=5&offset=1735000000000",
+      "https://www.zhihu.com/api/v3/moments/u/activities?page_num=3&offset=1700000000000"
+    ),
+    false,
+    "offset 仍比断点更晚时，不得因 page_num 较大而提前判追平"
+  );
+  assert.equal(
+    hasReachedCursor(
+      "https://www.zhihu.com/api/v3/moments/u/activities?page_num=2&offset=1690000000000",
+      "https://www.zhihu.com/api/v3/moments/u/activities?page_num=10&offset=1700000000000"
+    ),
+    true,
+    "offset 已追平/越过断点时必须返回 true"
+  );
+  assert.equal(
+    hasReachedCursor(
+      "https://www.zhihu.com/api/v3/moments/u/activities?page_num=4",
+      "https://www.zhihu.com/api/v3/moments/u/activities?page_num=3"
+    ),
+    true,
+    "无 offset 时退回比较 page_num"
+  );
+
+  // P2-4：缺省 is_collapsed / is_labeled 透传 undefined
+  assert.match(gapRepairSrc, /isCollapsed: typeof item\.is_collapsed === "boolean" \? item\.is_collapsed : undefined,/);
+  assert.match(gapRepairSrc, /isLabeled: typeof item\.is_labeled === "boolean" \? item\.is_labeled : undefined,/);
+  assert.match(crawlerSrc, /isCollapsed: typeof art\.is_collapsed === "boolean" \? art\.is_collapsed : undefined,/);
+  assert.match(crawlerSrc, /isLabeled: typeof art\.is_labeled === "boolean" \? art\.is_labeled : undefined,/);
+  assert.match(crawlerSrc, /isCollapsed: typeof item\.is_collapsed === "boolean" \? item\.is_collapsed : undefined,/);
+  assert.match(crawlerSrc, /isLabeled: typeof item\.is_labeled === "boolean" \? item\.is_labeled : undefined,/);
+
+  // P2-7：爬虫终态退出前调用 releaseSyncLockBeforeExit
+  assert.match(crawlerSrc, /async function releaseSyncLockBeforeExit\(\): Promise<void>/);
+  assert.ok(
+    (crawlerSrc.match(/await releaseSyncLockBeforeExit\(\);/g) || []).length >= 5,
+    "所有终态退出路径前必须尝试释放云端锁"
+  );
+});
+
+test("[P1-2][P1-3][P2-7] local-sync / full-local-harvest 信号退出码与 run-comment-repair 跨平台停机", () => {
+  // P1-2：local-sync close 回调不得把信号中止（null）归为 0，且 tsc 返回后及启动爬虫前检查 signalHandled
+  assert.ok(!localSyncSrc.includes("resolve(exitCode ?? 0)"));
+  assert.ok(!localSyncSrc.includes("resolve(c ?? 0)"));
+  assert.equal((localSyncSrc.match(/if \(signalHandled\) return;/g) || []).length, 5);
+  assert.match(localSyncSrc, /const isProxyParent = !emergencyReleaseCloudLock;/);
+
+  // P1-3：full-local-harvest runChild 信号中止不得返回 0，且仅 !signal 时才标 completed
+  assert.ok(!harvestSrc.includes("resolve({ code: code ?? 0"));
+  assert.match(harvestSrc, /code: code !== null \? code : \(signal \? 128 : 1\),\s*signal: signal \|\| null,/);
+  assert.match(harvestSrc, /if \(code === 0 && !signal && cursorSettled && !riskTerminal\)/);
+
+  // P2-7：run-comment-repair stopLocalWorker 跨平台停机
+  const repairCommentsSrc = readScript("scripts/run-comment-repair.mjs");
+  assert.match(repairCommentsSrc, /process\.platform === "win32"/);
+  assert.match(repairCommentsSrc, /proc\.kill\("SIGTERM"\)/);
+});
+
+test("[P1-6] download-images-direct 读取 meta/sync_config.json 并与 D1 按时间戳择新", () => {
+  const dlDirectSrc = readScript("scripts/download-images-direct.mjs");
+  assert.ok(!dlDirectSrc.includes("config/sync_config.json"), "不得再查错误键 config/sync_config.json");
+  assert.match(dlDirectSrc, /meta\/sync_config\.json/);
+
+  const validConst = extractConstSource(dlDirectSrc, "VALID_IMAGE_QUALITIES");
+  // 注入真实 fs/path 到沙箱以读取隔离临时目录下的 blob
+  const sandbox = { fs, path };
+  const context = vm.createContext(sandbox);
+  vm.runInContext(
+    `${validConst}\n${extractFunction(dlDirectSrc, "readImageQuality")}\nglobalThis.__read = readImageQuality;`,
+    context
+  );
+  const readFn = context.__read;
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-dl-cfg-"));
+  const d1 = new Database(":memory:");
+  const r2 = new Database(":memory:");
+  try {
+    d1.exec("CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);");
+    r2.exec("CREATE TABLE _mf_objects (key TEXT PRIMARY KEY, blob_id TEXT, uploaded INTEGER);");
+
+    // 1) R2 更新时间较新（模拟 D1 满额写入失败后仅写到 R2）→ 必须采用 R2 配置
+    fs.writeFileSync(path.join(tmpDir, "blob-r2"), JSON.stringify({ imageQuality: "compressed", updatedAt: "2026-11-20T10:00:00.000Z" }));
+    r2.prepare("INSERT INTO _mf_objects VALUES (?, ?, ?)").run("meta/sync_config.json", "blob-r2", Date.parse("2026-11-20T10:00:00.000Z"));
+    d1.prepare("INSERT INTO app_settings VALUES (?, ?, ?)").run("sync_config", JSON.stringify({ imageQuality: "original", updatedAt: "2026-11-19T10:00:00.000Z" }), "2026-11-19T10:00:00.000Z");
+    assert.equal(readFn(d1, r2, tmpDir), "compressed");
+
+    // 2) D1 更新时间较新 → 采用 D1 配置
+    d1.prepare("UPDATE app_settings SET value = ?, updated_at = ? WHERE key = 'sync_config'").run(
+      JSON.stringify({ imageQuality: "high", updatedAt: "2026-11-21T10:00:00.000Z" }),
+      "2026-11-21T10:00:00.000Z"
+    );
+    assert.equal(readFn(d1, r2, tmpDir), "high");
+  } finally {
+    d1.close();
+    r2.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("[P1-7] run-comment-repair scanCandidates 不得因已软删根或未抓全楼中楼而跳过残缺内容", () => {
+  const repairCommentsSrc = readScript("scripts/run-comment-repair.mjs");
+  const { scanCandidates } = loadPureFunctions(repairCommentsSrc, ["scanCandidates"]);
+  const db = new Database(":memory:");
+  try {
+    db.exec(`
+      CREATE TABLE contents (pk TEXT PRIMARY KEY, source_type TEXT NOT NULL, comment_count INTEGER NOT NULL, is_deleted INTEGER NOT NULL);
+      CREATE TABLE comments (id TEXT PRIMARY KEY, content_pk TEXT NOT NULL, parent_comment_id TEXT, is_deleted INTEGER NOT NULL);
+      CREATE TABLE comment_threads (root_id TEXT PRIMARY KEY, content_pk TEXT NOT NULL, child_count INTEGER NOT NULL, is_complete INTEGER NOT NULL);
+    `);
+
+    // 场景 A：comment_count=30, 仅 5 条有效根；另有 1 条已软删旧根对应的 thread child_count=30（旧 SQL 会误算 5+30>=30 并跳过）
+    db.prepare("INSERT INTO contents VALUES ('answer:1', 'answer', 30, 0)").run();
+    for (let i = 1; i <= 5; i++) {
+      db.prepare("INSERT INTO comments VALUES (?, 'answer:1', NULL, 0)").run(`r1-${i}`);
+    }
+    db.prepare("INSERT INTO comments VALUES ('r1-deleted', 'answer:1', NULL, 1)").run();
+    db.prepare("INSERT INTO comment_threads VALUES ('r1-deleted', 'answer:1', 30, 1)").run();
+
+    // 场景 B：comment_count=30, 5 条有效根，其中 1 条根 child_count=30 但 is_complete=0（旧 SQL 会误算 5+30>=30 并跳过）
+    db.prepare("INSERT INTO contents VALUES ('answer:2', 'answer', 30, 0)").run();
+    for (let i = 1; i <= 5; i++) {
+      db.prepare("INSERT INTO comments VALUES (?, 'answer:2', NULL, 0)").run(`r2-${i}`);
+    }
+    db.prepare("INSERT INTO comment_threads VALUES ('r2-1', 'answer:2', 30, 0)").run();
+
+    // 场景 C：真正完整（5 条有效根 + is_complete=1 的 25 条子评论 >= 30，无未完成线程）→ 应正确跳过
+    db.prepare("INSERT INTO contents VALUES ('answer:3', 'answer', 30, 0)").run();
+    for (let i = 1; i <= 5; i++) {
+      db.prepare("INSERT INTO comments VALUES (?, 'answer:3', NULL, 0)").run(`r3-${i}`);
+    }
+    db.prepare("INSERT INTO comment_threads VALUES ('r3-1', 'answer:3', 25, 1)").run();
+
+    const scan = scanCandidates(db);
+    assert.equal(scan.skippedAlreadyComplete, 1, "仅真正完整的内容才应被跳过");
+    assert.deepEqual(Array.from(scan.targets, t => t.pk), ["answer:1", "answer:2"]);
+  } finally {
+    db.close();
+  }
+});

@@ -198,6 +198,7 @@ async function runMain() {
     console.warn(`\n⚠️ 收到 ${signal}，正在清理凭据并释放同步锁...`);
     if (activeChild && activeChild.exitCode === null && activeChild.signalCode === null) {
       const childToStop = activeChild;
+      const isProxyParent = !emergencyReleaseCloudLock;
       await new Promise(resolve => {
         let done = false;
         const finish = () => {
@@ -207,12 +208,27 @@ async function runMain() {
           childToStop.off("close", finish);
           resolve();
         };
-        const timer = setTimeout(finish, 5000);
-        childToStop.once("close", finish);
-        try {
-          childToStop.kill("SIGTERM");
-        } catch {
+        const timer = setTimeout(() => {
+          // 代理父进程优先等子进程自行放云端锁并退出；仅超时兜底再强杀
+          if (isProxyParent) {
+            try { childToStop.kill("SIGTERM"); } catch { /* ignore */ }
+          }
           finish();
+        }, 5000);
+        childToStop.once("close", finish);
+        if (!isProxyParent) {
+          try {
+            childToStop.kill("SIGTERM");
+          } catch {
+            finish();
+          }
+        } else if (signal !== "SIGINT") {
+          // SIGINT 会同组送达子进程；非 SIGINT 时先发软中断让子进程释放云端锁
+          try {
+            childToStop.kill("SIGINT");
+          } catch {
+            finish();
+          }
         }
       });
     }
@@ -247,11 +263,12 @@ async function runMain() {
             }
           );
           activeChild = child;
-          child.on("close", exitCode => {
+          child.on("close", (exitCode, sig) => {
             activeChild = null;
-            resolve(exitCode ?? 0);
+            resolve(exitCode !== null ? exitCode : (sig ? 130 : 1));
           });
         });
+        if (signalHandled) return;
         process.exitCode = code;
         return;
       } else {
@@ -446,11 +463,12 @@ async function runMain() {
         const buildCode = await new Promise(resolve => {
           const p = spawn(process.execPath, [tscBin], { cwd: CRAWLER_DIR, stdio: "inherit" });
           activeChild = p;
-          p.on("close", c => {
+          p.on("close", (c, sig) => {
             activeChild = null;
-            resolve(c ?? 0);
+            resolve(c !== null ? c : (sig ? 130 : 1));
           });
         });
+        if (signalHandled) return;
         if (buildCode !== 0) {
           console.error(`❌ 编译 apps/apify-crawler 失败 (退出码 ${buildCode})`);
           process.exitCode = buildCode;
@@ -458,6 +476,7 @@ async function runMain() {
         }
       }
 
+      if (signalHandled) return;
       if (dryRun) {
         console.log("✅ --dry-run 校验通过（dist/main.js 已编译；含明文凭据的 INPUT.json 已清理）。");
         return;
@@ -466,6 +485,7 @@ async function runMain() {
       // 单实例锁已在 main() 入口、任何网络/编译/INPUT 操作之前用 wx 原子持有
 
       // 6. 启动本地爬虫（dist/main.js）
+      if (signalHandled) return;
       console.log("🚀 开始本地同步（Playwright 直连知乎 + 自动写入云端 D1/R2，零 Apify 额度消耗）...\n");
       const nodeArgs = process.env.HTTPS_PROXY ? ["--use-env-proxy", "dist/main.js"] : ["dist/main.js"];
       const code = await new Promise(resolve => {
@@ -482,9 +502,9 @@ async function runMain() {
           }
         });
         activeChild = runProc;
-        runProc.on("close", c => {
+        runProc.on("close", (c, sig) => {
           activeChild = null;
-          resolve(c ?? 0);
+          resolve(c !== null ? c : (sig ? 130 : 1));
         });
       });
 
