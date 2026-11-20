@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "zh-CN"
+early_access: false
+
+reviews:
+  # chill: 只抓重点缺陷 | assertive: 更严格，会提更多重构和风格建议
+  profile: "assertive"
+  # 设为 false 避免机器人在 PR 里直接打回（Request Changes）阻塞合并
+  request_changes_workflow: false
+  # 保留高阶改动摘要，关掉打油诗、流程图等刷屏项
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  sequence_diagrams: false
+
+  # 通用排除项：依赖目录、构建产物、锁文件、压缩文件与二进制资源
+  path_filters:
+    - "!**/node_modules/**"
+    - "!**/vendor/**"
+    - "!**/.venv/**"
+    - "!**/venv/**"
+    - "!**/__pycache__/**"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/out/**"
+    - "!**/target/**"
+    - "!**/.next/**"
+    - "!**/*.lock"
+    - "!**/package-lock.json"
+    - "!**/pnpm-lock.yaml"
+    - "!**/yarn.lock"
+    - "!**/go.sum"
+    - "!**/*.min.*"
+    - "!**/*.map"
+    - "!**/*.svg"
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/*.jpeg"
+    - "!**/*.ico"
+    - "!**/*.woff*"
+
+  # 跨语言通用审查指令
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        审查时保持简洁直接，按以下优先级输出意见：
+        1. 优先指出逻辑错误、边界条件遗漏、竞态/并发问题、未处理的异常与资源泄漏。
+        2. 重点检查安全隐患（注入、越权、敏感信息硬编码、不安全的外部输入处理）。
+        3. 忽略纯代码格式、缩进、空行和主观命名偏好，除非命名会造成明显语义歧义。
+        4. 给出的修改建议必须具体、可直接落地，不要泛泛而谈。
+    - path: "**/*{test,spec}*"
+      instructions: |
+        检查测试是否覆盖核心边界条件和异常路径，指出无效断言、过度 Mock 或可能导致不稳定的测试逻辑。
+
+  auto_review:
+    enabled: true
+    drafts: false
+    # PR 标题包含这些关键词时跳过审查
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+      - "chore(deps)"
+
+chat:
+  # 在评论区直接回复它的意见即可继续对话，不必每次手动 @coderabbitai
+  auto_reply: true
