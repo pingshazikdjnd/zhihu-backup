@@ -563,7 +563,11 @@ async function createStealthContext(browser: Awaited<ReturnType<typeof setupBrow
   });
   if (typeof (context as any).addInitScript === "function") {
     await (context as any).addInitScript(() => {
-      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      // @apify/tsconfig 不包含 DOM lib，通过 globalThis 访问以避免 tsc 报 Cannot find name 'navigator'
+      const nav = (globalThis as { navigator?: object }).navigator;
+      if (nav) {
+        Object.defineProperty(nav, "webdriver", { get: () => undefined });
+      }
     });
   }
   return context;
