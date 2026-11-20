@@ -23,13 +23,13 @@ import {
  *   回退到原始外链提供查询线索。
  */
 
-/** 单次批量默认/最多领取多少条任务 */
-export const IMAGE_TASK_BATCH_DEFAULT_LIMIT = 20;
+/** 单次批量默认/最多领取多少条任务（默认 6 保证单批子请求总量 < 50） */
+export const IMAGE_TASK_BATCH_DEFAULT_LIMIT = 6;
 export const IMAGE_TASK_BATCH_MAX_LIMIT = 100;
 /** ingest 响应后 waitUntil 顺手消化的任务数：小批量，控制在后台生命周期内 */
 export const IMAGE_TASK_INGEST_KICK_LIMIT = 4;
-/** 一次后台 drain 最多消化多少条（含重试），避免单个 isolate 被历史积压拖住 */
-const IMAGE_TASK_KICK_TOTAL_LIMIT = 16;
+/** 一次后台 drain 最多消化多少条（含重试），避免单个 isolate 超子请求上限或被积压拖住 */
+const IMAGE_TASK_KICK_TOTAL_LIMIT = 8;
 
 const MAX_IMAGE_TASK_ATTEMPTS = 3;
 const PROCESSING_STALE_MS = 10 * 60 * 1000;
@@ -150,26 +150,26 @@ async function claimImageTasks(limit: number): Promise<ImageTaskRow[]> {
   return claimed;
 }
 
-async function markTaskDone(id: number): Promise<void> {
-  await db.prepare(
+function markTaskDone(id: number, updatedAt: string): unknown {
+  return db.prepare(
     `UPDATE image_tasks SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?`
-  ).run(new Date().toISOString(), id);
+  ).raw(updatedAt, id);
 }
 
-async function markTaskRetry(id: number): Promise<void> {
-  await db.prepare(
+function markTaskRetry(id: number, updatedAt: string): unknown {
+  return db.prepare(
     `UPDATE image_tasks SET status = 'pending', updated_at = ? WHERE id = ?`
-  ).run(new Date().toISOString(), id);
+  ).raw(updatedAt, id);
 }
 
-async function markTaskFailed(id: number, message: string): Promise<void> {
-  await db.prepare(
+function markTaskFailed(id: number, message: string, updatedAt: string): unknown {
+  return db.prepare(
     `UPDATE image_tasks SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?`
-  ).run(message.slice(0, 500), new Date().toISOString(), id);
+  ).raw(message.slice(0, 500), updatedAt, id);
 }
 
 /**
- * 消费一批图片任务：下载并写 R2，逐条更新任务状态。
+ * 消费一批图片任务：下载并写 R2，整批通过单次 db.batch 更新任务状态。
  * 单条失败只影响自己；批量层任何异常都不会外抛给调用方。
  */
 export async function processImageBatch(
@@ -185,40 +185,51 @@ export async function processImageBatch(
 
   // 质量设置在每个 isolate 内缓存 60 秒，整批只读一次
   const quality = await getImageQualitySetting(bucket);
+  const updateStmts: unknown[] = [];
 
   // 与下载并发保持一致地分批：槽位闸门本身也会限流，这里分批是为了把
-  // HEAD/失败写库的节奏摊平，避免一次拉起几十个并行请求
+  // HEAD/失败判断的节奏摊平，避免一次拉起过多并行请求
   for (let i = 0; i < rows.length; i += IMAGE_FETCH_CONCURRENCY) {
     const chunk = rows.slice(i, i + IMAGE_FETCH_CONCURRENCY);
     await Promise.all(chunk.map(async row => {
       try {
         const localPath = await localizeImage(row.image_url, bucket, quality);
+        const now = new Date().toISOString();
         if (localPath) {
-          await markTaskDone(row.id);
+          updateStmts.push(markTaskDone(row.id, now));
           summary.done += 1;
           return;
         }
         // 领取时 attempts 已 +1，这里用 +1 后的值判断是否耗尽重试
         if (row.attempts + 1 >= MAX_IMAGE_TASK_ATTEMPTS) {
-          await markTaskFailed(row.id, "download failed");
+          updateStmts.push(markTaskFailed(row.id, "download failed", now));
           summary.failed += 1;
         } else {
-          await markTaskRetry(row.id);
+          updateStmts.push(markTaskRetry(row.id, now));
           summary.retry += 1;
         }
       } catch (err) {
         // 任务层任何异常都不能让整批失败，但也必须受 MAX_IMAGE_TASK_ATTEMPTS 上限约束防止无限重试
         warnTasks(`task ${row.id} failed`, err);
         const errMsg = err instanceof Error ? err.message : String(err || "download error");
+        const now = new Date().toISOString();
         if (row.attempts + 1 >= MAX_IMAGE_TASK_ATTEMPTS) {
-          await markTaskFailed(row.id, errMsg.slice(0, 200)).catch(() => {});
+          updateStmts.push(markTaskFailed(row.id, errMsg.slice(0, 200), now));
           summary.failed += 1;
         } else {
-          await markTaskRetry(row.id).catch(() => {});
+          updateStmts.push(markTaskRetry(row.id, now));
           summary.retry += 1;
         }
       }
     }));
+  }
+
+  if (updateStmts.length > 0) {
+    try {
+      await db.batch(updateStmts);
+    } catch (err) {
+      warnTasks("batch status update failed", err);
+    }
   }
 
   return summary;

@@ -32,7 +32,7 @@ import type { Bindings } from "../types.js";
 
 export const ingestRoutes = new Hono<{ Bindings: Bindings }>();
 
-async function forwardToExternalTargets(
+export async function forwardToExternalTargets(
   c: any,
   scope: ExternalSyncScope,
   eventPath: string,
@@ -64,6 +64,7 @@ async function forwardToExternalTargets(
             const destUrl = `${t.endpointUrl.replace(/\/+$/, "")}${eventPath}`;
             const res = await fetch(destUrl, {
               method: "POST",
+              redirect: "manual",
               headers: {
                 "Content-Type": "application/json",
                 ...(t.authToken ? { Authorization: `Bearer ${t.authToken}` } : {})
@@ -76,6 +77,7 @@ async function forwardToExternalTargets(
             const tursoUrl = `${t.endpointUrl.replace(/\/+$/, "")}/v2/pipeline`;
             const res = await fetch(tursoUrl, {
               method: "POST",
+              redirect: "manual",
               headers: {
                 "Content-Type": "application/json",
                 ...(t.authToken ? { Authorization: `Bearer ${t.authToken}` } : {})
@@ -123,6 +125,7 @@ async function forwardToExternalTargets(
               // D1 REST /query 一次只接受一条语句：建表和写入必须拆成两次请求
               const ddlRes = await fetch(d1Url, {
                 method: "POST",
+                redirect: "manual",
                 headers: d1Headers,
                 body: JSON.stringify({
                   sql: `CREATE TABLE IF NOT EXISTS zhihu_backup_mirror (
@@ -138,6 +141,7 @@ async function forwardToExternalTargets(
               if (!ddlRes.ok) console.warn(`[mirror:${t.name}] cloudflare_d1 DDL HTTP ${ddlRes.status}`);
               const writeRes = await fetch(d1Url, {
                 method: "POST",
+                redirect: "manual",
                 headers: d1Headers,
                 body: JSON.stringify({
                   sql: `INSERT OR REPLACE INTO zhihu_backup_mirror (scope, entity_key, payload_json, synced_at) VALUES (?, ?, ?, ?)`,
@@ -154,6 +158,7 @@ async function forwardToExternalTargets(
             const objectUrl = `${t.endpointUrl.replace(/\/+$/, "")}/${encodeURIComponent(bucketName)}/${encodeURIComponent(scope)}/${encodeURIComponent(entityKey)}.json`;
             const res = await fetch(objectUrl, {
               method: "PUT",
+              redirect: "manual",
               headers: {
                 "Content-Type": "application/json; charset=utf-8",
                 ...(t.authToken ? { Authorization: `Bearer ${t.authToken}` } : {})
@@ -166,6 +171,7 @@ async function forwardToExternalTargets(
             const supaUrl = `${t.endpointUrl.replace(/\/+$/, "")}/rest/v1/zhihu_backup_mirror`;
             const res = await fetch(supaUrl, {
               method: "POST",
+              redirect: "manual",
               headers: {
                 "Content-Type": "application/json",
                 Prefer: "resolution=merge-duplicates",

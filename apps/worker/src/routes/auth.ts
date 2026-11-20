@@ -109,33 +109,72 @@ function cloneTargets(list: ExternalStorageTarget[]): ExternalStorageTarget[] {
   return list.map(t => ({ ...t, syncScopes: [...t.syncScopes] }));
 }
 
+function parseIsoMs(value: unknown): number {
+  if (typeof value !== "string" || !value.trim()) return 0;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function resolveTargetsUpdatedMs(list: any[], explicitUpdatedAt?: unknown): number {
+  let maxMs = explicitUpdatedAt instanceof Date
+    ? (Number.isFinite(explicitUpdatedAt.getTime()) ? explicitUpdatedAt.getTime() : 0)
+    : parseIsoMs(explicitUpdatedAt);
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    maxMs = Math.max(
+      maxMs,
+      parseIsoMs(item.updatedAt),
+      parseIsoMs(item.lastTestAt),
+      parseIsoMs(item.createdAt)
+    );
+  }
+  return maxMs;
+}
+
 export async function getExternalTargetsRaw(bucket?: any): Promise<ExternalStorageTarget[]> {
   if (cachedExternalTargets && Date.now() - cachedExternalTargets.at < EXTERNAL_TARGETS_CACHE_TTL_MS) {
     return cloneTargets(cachedExternalTargets.list);
   }
 
-  let targets: any[] = [];
-  let d1Found = false;
+  let d1Targets: any[] | null = null;
+  let d1UpdatedMs = 0;
   try {
     const row = await db.prepare(
-      `SELECT value FROM app_settings WHERE key = ?`
-    ).get<{ value: string }>(EXTERNAL_TARGETS_KEY);
+      `SELECT value, updated_at FROM app_settings WHERE key = ?`
+    ).get<{ value: string; updated_at?: string | null }>(EXTERNAL_TARGETS_KEY);
     if (row?.value) {
       const parsed = JSON.parse(row.value);
       if (Array.isArray(parsed)) {
-        d1Found = true;
-        targets = parsed;
+        d1Targets = parsed;
+        d1UpdatedMs = resolveTargetsUpdatedMs(parsed, row.updated_at);
       }
     }
   } catch { /* ignore D1 read error */ }
 
-  if (!d1Found && bucket) {
+  let r2Targets: any[] | null = null;
+  let r2UpdatedMs = 0;
+  if (bucket) {
     try {
       const obj = await bucket.get(R2_EXTERNAL_TARGETS_KEY);
       if (obj) {
-        targets = JSON.parse(await obj.text());
+        const parsed = JSON.parse(await obj.text());
+        if (Array.isArray(parsed)) {
+          r2Targets = parsed;
+          r2UpdatedMs = resolveTargetsUpdatedMs(
+            parsed,
+            obj.customMetadata?.updatedAt ?? obj.uploaded
+          );
+        }
       }
     } catch { /* ignore R2 read error */ }
+  }
+
+  // 同时读取 D1 与 R2 并按最新 updatedAt 择新：D1 满额降级只写入 R2 后缓存过期时不会静默回滚到旧 D1 值
+  let targets: any[] = [];
+  if (d1Targets && r2Targets) {
+    targets = r2UpdatedMs > d1UpdatedMs ? r2Targets : d1Targets;
+  } else {
+    targets = d1Targets ?? r2Targets ?? [];
   }
 
   if (!Array.isArray(targets)) targets = [];
@@ -183,7 +222,8 @@ export async function saveExternalTargetsRaw(bucket: any, targets: ExternalStora
   if (bucket) {
     try {
       await bucket.put(R2_EXTERNAL_TARGETS_KEY, payload, {
-        httpMetadata: { contentType: "application/json; charset=utf-8" }
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+        customMetadata: { updatedAt: now }
       });
       r2Ok = true;
     } catch (err) {
@@ -288,6 +328,7 @@ async function executeTursoBatch(
   const url = `${target.endpointUrl.replace(/\/+$/, "")}/v2/pipeline`;
   const res = await fetch(url, {
     method: "POST",
+    redirect: "manual",
     headers: {
       "Content-Type": "application/json",
       ...(target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {})
@@ -326,6 +367,7 @@ async function executeD1Statement(
   const url = `${base}/client/v4/accounts/${ids.accId}/d1/database/${ids.dbId}/query`;
   const res = await fetch(url, {
     method: "POST",
+    redirect: "manual",
     headers: {
       "Content-Type": "application/json",
       ...(target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {})
@@ -564,6 +606,7 @@ export async function putOffloadedContentHtml(
     const objectUrl = `${base}/html/${encodeURIComponent(pk)}/${encodeURIComponent(hash || "latest")}`;
     const res = await fetch(objectUrl, {
       method: "PUT",
+      redirect: "manual",
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         ...(target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {})
@@ -594,6 +637,7 @@ export async function readOffloadedContentHtml(
       : [`${base}/html/${encodeURIComponent(pk)}`];
     for (const objectUrl of candidates) {
       const res = await fetch(objectUrl, {
+        redirect: "manual",
         headers: target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {}
       }).catch(() => null);
       if (res?.ok) {
@@ -875,17 +919,22 @@ const ALWAYS_BLOCKED_HOSTS = new Set([
   "169.254.169.254",        // AWS / GCP / Azure / 阿里云元数据
   "100.100.100.200",        // 阿里云元数据
   "fd00:ec2::254",          // AWS IPv6 元数据
+  "::ffff:a9fe:a9fe",       // 169.254.169.254 的 IPv4-mapped IPv6 归一化形式
+  "::ffff:169.254.169.254",
+  "::ffff:6464:64c8",       // 100.100.100.200 的 IPv4-mapped IPv6 归一化形式
+  "::ffff:100.100.100.200",
   "metadata.google.internal",
   "metadata"
 ]);
 
 /** 是否为内网 / 回环 / 链路本地地址（不含元数据判断）。 */
-function isPrivateOrLoopbackHost(host: string): boolean {
+export function isPrivateOrLoopbackHost(host: string): boolean {
   const h = host.toLowerCase().replace(/^\[|\]$/g, "");
   if (h === "localhost" || h.endsWith(".localhost")) return true;
   // IPv6 字面量必须带冒号：否则 "fc-xxx.turso.io" 这类正常域名会被误判为 fc00::/7
   if (h.includes(":")) {
     if (h === "::1" || h === "::") return true;
+    if (/^::ffff:/i.test(h)) return true;
     if (/^(fc|fd|fe80)/.test(h)) return true;
   }
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
@@ -1462,6 +1511,7 @@ authRoutes.post("/external-targets/test", async c => {
       const pingUrl = `${endpointUrl.replace(/\/+$/, "")}/v2/pipeline`;
       const res = await fetch(pingUrl, {
         method: "POST",
+        redirect: "manual",
         headers: {
           "Content-Type": "application/json",
           ...(authToken ? { Authorization: `Bearer ${authToken}` } : {})
@@ -1505,6 +1555,7 @@ authRoutes.post("/external-targets/test", async c => {
         const d1Url = `${d1Base}/client/v4/accounts/${accId}/d1/database/${dbId}/query`;
         const res = await fetch(d1Url, {
           method: "POST",
+          redirect: "manual",
           headers: {
             "Content-Type": "application/json",
             ...(authToken ? { Authorization: `Bearer ${authToken}` } : {})
@@ -1532,6 +1583,7 @@ authRoutes.post("/external-targets/test", async c => {
       const supaUrl = `${endpointUrl.replace(/\/+$/, "")}/rest/v1/`;
       const res = await fetch(supaUrl, {
         method: "GET",
+        redirect: "manual",
         headers: {
           ...(authToken ? { apikey: authToken, Authorization: `Bearer ${authToken}` } : {})
         },
@@ -1553,6 +1605,7 @@ authRoutes.post("/external-targets/test", async c => {
 
       let res = await fetch(endpointUrl, {
         method: "GET",
+        redirect: "manual",
         headers: reqHeaders,
         signal: controller.signal
       }).catch(() => null);
@@ -1561,6 +1614,7 @@ authRoutes.post("/external-targets/test", async c => {
         // 重试 HEAD
         res = await fetch(endpointUrl, {
           method: "HEAD",
+          redirect: "manual",
           headers: reqHeaders,
           signal: controller.signal
         }).catch(() => null);

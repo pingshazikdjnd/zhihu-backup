@@ -1,7 +1,7 @@
 import { db } from "../db.js";
 import { buildChangeStatement } from "./changes.js";
 import { hasOffloadedComments } from "./comments.js";
-import { normalizeForHash, sha256 } from "../utils/hash.js";
+import { isAvatarUrlChanged, normalizeForHash, sha256 } from "../utils/hash.js";
 import { withKeyLock } from "./lock.js";
 import { buildSearchText, safeTruncate } from "shared";
 import type { IngestContentInput } from "shared";
@@ -244,7 +244,8 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
   const safeFavoriteCount = (!input.favoriteCount && existing.favorite_count > 0) ? existing.favorite_count : (input.favoriteCount || 0);
   const safeVisitCount = (!input.visitCount && existing.visit_count > 0) ? existing.visit_count : (input.visitCount || 0);
 
-  const safeAuthorAvatar = (input.author?.avatarUrl || existing.author_avatar) || null;
+  const avatarChanged = isAvatarUrlChanged(existing.author_avatar, input.author?.avatarUrl);
+  const safeAuthorAvatar = (avatarChanged ? input.author?.avatarUrl : existing.author_avatar) || null;
   const safeAuthorHeadline = (input.author?.headline || existing.author_headline) || null;
   const rawAuthorName = input.author?.name || "";
   const safeAuthorName =
@@ -288,7 +289,7 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
   if (existing.visit_count !== safeVisitCount) {
     counterChanges.push(`浏览量(${existing.visit_count} -> ${safeVisitCount})`);
   }
-  if ((existing.author_avatar || null) !== safeAuthorAvatar) {
+  if (avatarChanged) {
     profileChanges.push("作者头像更新");
   }
   if ((existing.author_headline || null) !== safeAuthorHeadline) {

@@ -51,19 +51,20 @@ recommendRoutes.get("/similar/:pk", async c => {
 
 // 调用 Cloudflare Workers AI 对单篇回答进行「和谐风险 + 核心价值」深度鉴定
 recommendRoutes.post("/ai-assess", async c => {
-  // 已配置写入口令（含 API_SECRET 兜底）时不再接受「仅 Origin」放行：
-  // 必须携带有效 Bearer（API_SECRET / 写入口令），且带 Origin 时还须命中白名单，
-  // 防止伪造 Origin 的脚本无凭据刷 AI 额度。极端空环境才保留原有 Origin 门禁。
   const origin = c.req.header("origin");
-  const activeToken = await getActiveWriteToken(c).catch(() => "");
-  let authorized: boolean;
-  if (activeToken) {
-    authorized = (await hasApiCredential(c)) && (!origin || isOriginAllowed(c, true));
-  } else {
-    authorized = Boolean(origin) && isOriginAllowed(c);
+  // 1) 先验 Origin：带了 Origin 就必须命中白名单，非法才返回 403 Forbidden origin
+  if (origin && !isOriginAllowed(c, true)) {
+    return c.json({ error: "Forbidden origin" }, 403);
   }
-  if (!authorized) {
-    return c.json({ error: origin ? "Forbidden origin" : "Unauthorized" }, origin ? 403 : 401);
+  // 2) 再验写口令：已配置写口令（含 API_SECRET 兜底）时必须携带有效 Bearer；
+  //    缺失或错误统一返回 401 { error: "Unauthorized", needToken: true }，与前端弹密逻辑对齐。
+  const activeToken = await getActiveWriteToken(c).catch(() => "");
+  if (activeToken) {
+    if (!(await hasApiCredential(c))) {
+      return c.json({ error: "Unauthorized", needToken: true }, 401);
+    }
+  } else if (!origin) {
+    return c.json({ error: "Unauthorized", needToken: true }, 401);
   }
   const now = Date.now();
   if (now - rateWindowStart > 60_000) {

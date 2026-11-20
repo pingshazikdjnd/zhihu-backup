@@ -1,6 +1,6 @@
 import { db } from "../db.js";
 import { buildChangeStatement } from "./changes.js";
-import { normalizeForHash, sha256 } from "../utils/hash.js";
+import { isAvatarUrlChanged, normalizeForHash, sha256 } from "../utils/hash.js";
 import { withKeyLock } from "./lock.js";
 import { getR2TextWithEdgeCache, purgeR2EdgeCache } from "../utils/r2-cache.js";
 import {
@@ -21,6 +21,9 @@ import type {
 
 // D1 单次 batch 的语句数不宜过大；100 条一批兼顾往返次数和单批体积
 const BATCH_SIZE = 100;
+const CHILD_THREAD_CACHE_TTL_SECONDS = 30;
+const R2_BULK_DELETE_BATCH_SIZE = 1000;
+const MAX_SYNC_EDGE_PURGE_KEYS = 10;
 
 /**
  * 评论同步。
@@ -179,7 +182,7 @@ async function replaceCommentsInner(input: IngestCommentsInput) {
     // 旧行 time_text/location 可能是 NULL，本次抓取缺失时是空串：二者视为相同，
     // 否则每次同步都会因 NULL !== "" 再发一条刷新 UPDATE。
     const needsRefresh =
-      (!!c.authorAvatar && c.authorAvatar !== exists.author_avatar) ||
+      isAvatarUrlChanged(exists.author_avatar, c.authorAvatar) ||
       (exists.time_text || "") !== (c.time || "") ||
       (exists.location || "") !== (c.location || "");
 
@@ -404,12 +407,41 @@ function parsePreviewJson(raw: string | null | undefined): PreviewReply[] {
   }
 }
 
-async function readStoredChildThread(bucket: R2Bucket, rootId: string): Promise<StoredChildThread> {
+async function deleteR2KeysBatch(bucket: any, keys: string[]): Promise<void> {
+  if (!keys.length || typeof bucket?.delete !== "function") return;
+  for (let i = 0; i < keys.length; i += R2_BULK_DELETE_BATCH_SIZE) {
+    const batch = keys.slice(i, i + R2_BULK_DELETE_BATCH_SIZE);
+    if (batch.length === 1) {
+      await bucket.delete(batch[0]).catch(() => {
+        // R2 删除失败不阻塞清零：D1 行删除后旧对象不再被引用，仅浪费少量存储
+      });
+      continue;
+    }
+    try {
+      await bucket.delete(batch);
+    } catch {
+      // 兼容仅支持单 key 字符串的测试 mock：小批量退回逐条删除，大批量不撞子请求上限
+      if (batch.length <= MAX_SYNC_EDGE_PURGE_KEYS) {
+        for (const k of batch) {
+          await bucket.delete(k).catch(() => {});
+        }
+      }
+    }
+  }
+}
+
+async function readStoredChildThread(
+  bucket: R2Bucket,
+  rootId: string,
+  options: { bypassCache?: boolean } = {}
+): Promise<StoredChildThread> {
   const key = childCommentsKey(rootId);
   try {
-    // 楼中楼 JSON 一天内基本不变：走边缘缓存，命中时 0 次 R2 Class B；
-    // 写入/清空路径会在 PUT/DELETE 后立即 purge，绝不读到脏数据。
-    const text = await getR2TextWithEdgeCache(bucket, key, { ttlSeconds: 86400 });
+    // 写路径必须跳过进程内/边缘缓存直读 R2（强一致），避免跨 isolate 旧缓存覆盖新写入；
+    // 读路径走短 TTL 边缘缓存，命中时 0 次 R2 Class B 且写入/清空会立即 purge。
+    const text = options.bypassCache
+      ? await bucket.get(key).then(obj => (obj ? obj.text() : null))
+      : await getR2TextWithEdgeCache(bucket, key, { ttlSeconds: CHILD_THREAD_CACHE_TTL_SECONDS });
     if (text === null) return { status: "missing" };
     const parsed = JSON.parse(text) as { children?: unknown; complete?: unknown } | null;
     if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.children)) {
@@ -668,7 +700,7 @@ async function replaceCommentsByRootInner(
 
     // hash 未变：只有头像/时间/位置/子评论数确有变化才补一条轻量刷新
     const needsRefresh =
-      (!!root.authorAvatar && root.authorAvatar !== exists.author_avatar) ||
+      isAvatarUrlChanged(exists.author_avatar, root.authorAvatar) ||
       (exists.time_text || "") !== (root.time || "") ||
       (exists.location || "") !== (root.location || "") ||
       Number(exists.child_count ?? 0) !== root.childCount;
@@ -736,15 +768,14 @@ async function replaceCommentsByRootInner(
   // 原站清空后又新增子评论、下次 partial 同步时旧 R2 子评论会被「合并复活」。
   // 所有根评论此刻都已软删，直接删掉残余线程索引行最干净，下次从零重建。
   if (!input.partial && input.roots.length === 0 && (!input.allRootIds || input.allRootIds.length === 0)) {
-    for (const rootId of existingThreads.keys()) {
-      const bucket = env.BUCKET as any;
-      if (typeof bucket?.delete === "function") {
-        await bucket.delete(childCommentsKey(rootId)).catch(() => {
-          // R2 删除失败不阻塞清零：D1 行删除后旧对象不再被引用，仅浪费少量存储
-        });
+    const keysToDelete = Array.from(existingThreads.keys(), rootId => childCommentsKey(rootId));
+    if (keysToDelete.length > 0) {
+      await deleteR2KeysBatch(env.BUCKET, keysToDelete);
+      const skipEdge = keysToDelete.length > MAX_SYNC_EDGE_PURGE_KEYS;
+      for (const key of keysToDelete) {
+        // 删完立刻失效缓存：超过 10 条时跳过同步边缘 cache.delete，避免击穿 Workers 50 子请求硬限
+        await purgeR2EdgeCache(key, { skipEdge });
       }
-      // 删完立刻失效边缘缓存：否则已清零的楼中楼仍会从 CDN 缓存里读出来
-      await purgeR2EdgeCache(childCommentsKey(rootId));
     }
     threadStmts.push(database.prepare(`
       DELETE FROM comment_threads WHERE content_pk = ?
@@ -778,7 +809,7 @@ async function replaceCommentsByRootInner(
       }
 
       let r2Ready = false;
-      const stored = await readStoredChildThread(env.BUCKET, root.id);
+      const stored = await readStoredChildThread(env.BUCKET, root.id, { bypassCache: true });
       if (stored.status === "error") {
         // 读取失败时状态未知：绝不盲写覆盖可能仍可读的旧对象，下面保留重试状态。
         console.warn(`[comments] skip empty R2 put for ${key}: previous object unreadable`);
@@ -889,7 +920,7 @@ async function replaceCommentsByRootInner(
     if (!root.isChildrenComplete) {
       // 本次没抓全：与 R2 旧对象合并，只增改不删。
       // 读失败（error）时状态未知，绝不能把本次不完整数据当成合并结果写回去。
-      const stored = await readStoredChildThread(env.BUCKET, root.id);
+      const stored = await readStoredChildThread(env.BUCKET, root.id, { bypassCache: true });
       if (stored.status === "error") {
         readFailed = true;
       } else if (legacyChildrenReadFailed) {
@@ -1471,7 +1502,7 @@ async function replaceCommentsByRootOffloaded(
     }
 
     const needsRefresh =
-      (!!root.authorAvatar && root.authorAvatar !== exists.author_avatar) ||
+      isAvatarUrlChanged(exists.author_avatar, root.authorAvatar) ||
       (exists.time_text || "") !== (root.time || "") ||
       (exists.location || "") !== (root.location || "") ||
       Number(exists.child_count ?? 0) !== root.childCount;
@@ -1516,17 +1547,16 @@ async function replaceCommentsByRootOffloaded(
   // 评论被整体清空：删掉外部库残余楼中楼与线程索引，并把主 D1 的 contents.comment_count 归零
   // （只更新 contents 的计数元数据，不写 comments —— 主 D1 评论行仍为 0 行）。
   if (!input.partial && input.roots.length === 0 && (!input.allRootIds || input.allRootIds.length === 0)) {
-    const clearStatements: RemoteSqlStatement[] = [];
-    for (const rootId of existingThreads.keys()) {
-      clearStatements.push({
-        sql: `DELETE FROM child_comment_blobs WHERE root_id = ?`,
-        params: [rootId]
-      });
-    }
-    clearStatements.push({
-      sql: `DELETE FROM comment_threads WHERE content_pk = ?`,
-      params: [input.contentPk]
-    });
+    const clearStatements: RemoteSqlStatement[] = [
+      {
+        sql: `DELETE FROM child_comment_blobs WHERE content_pk = ?`,
+        params: [input.contentPk]
+      },
+      {
+        sql: `DELETE FROM comment_threads WHERE content_pk = ?`,
+        params: [input.contentPk]
+      }
+    ];
     // 清理失败不阻塞清零：下次同输入会重试
     await executeRemoteSqlBatch(target, clearStatements).catch(() => {});
     try {
@@ -1563,21 +1593,21 @@ async function replaceCommentsByRootOffloaded(
     const childCount = Math.max(root.childCount, children.length);
     const existingThread = existingThreads.get(root.id);
 
-    // 单个根的楼中楼被删光：外部库同步清空，避免旧预览继续展示或回退复活
-    const existingRootChildCount = existingMap.get(root.id)?.child_count ?? 0;
-    const hadRemoteThreadData = Boolean(
-      existingThread &&
-      (existingThread.child_count > 0 || existingThread.thread_hash !== "" || existingThread.is_complete === 0)
-    );
-    if (
-      !input.partial &&
-      !hasChildren &&
-      childCount === 0 &&
-      root.isChildrenComplete &&
-      (hadRemoteThreadData || existingRootChildCount > 0)
-    ) {
+    // 单个根的楼中楼被删光：外部库同步落 complete-empty 快照并更新线程索引，
+    // 命中快路径（已落盘且索引一致）时 0 写入；不以既有计数或线程行存在为前置，避免回退主 R2 旧对象复活已删子评。
+    if (!input.partial && !hasChildren && childCount === 0 && root.isChildrenComplete) {
       const emptyThreadHash = await sha256(JSON.stringify({ children: [], complete: true }));
       const emptyIncomingHash = await sha256(JSON.stringify({ children: [], childCount: 0, complete: true }));
+      if (
+        existingThread &&
+        existingThread.incoming_hash === emptyIncomingHash &&
+        existingThread.thread_hash === emptyThreadHash &&
+        existingThread.child_count === 0 &&
+        existingThread.is_complete === 1 &&
+        existingThread.preview_json === "[]"
+      ) {
+        continue;
+      }
       childStatements.push({
         sql: `INSERT OR REPLACE INTO child_comment_blobs (root_id, content_pk, payload_json, complete, updated_at)
               VALUES (?, ?, ?, ?, ?)`,
