@@ -252,7 +252,8 @@ async function pickWorkerPort(startPort) {
 async function startLocalWorker(port) {
   const proc = spawn(process.execPath, [WRANGLER_BIN, "dev", "--local", "--port", String(port)], {
     cwd: WORKER_DIR,
-    stdio: ["pipe", "pipe", "pipe"]
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: process.platform !== "win32"
   });
   let dead = false;
   let exitCode = null;
@@ -291,7 +292,11 @@ function stopLocalWorker(proc) {
     if (process.platform === "win32") {
       execFileSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], { stdio: "ignore" });
     } else {
-      proc.kill("SIGTERM");
+      try {
+        process.kill(-proc.pid, "SIGTERM");
+      } catch {
+        proc.kill("SIGTERM");
+      }
     }
   } catch {}
 }

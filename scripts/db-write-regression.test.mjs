@@ -1496,7 +1496,9 @@ export const Actor = {
   init: async () => {},
   getInput: async () => globalThis.__crawlerInput,
   exit: async () => {},
-  fail: async message => { throw new Error(String(message)); }
+  fail: async message => { throw new Error(String(message)); },
+  on: noop,
+  off: noop
 };
 export const log = { error: noop, warning: noop, info: noop, debug: noop };
 `);

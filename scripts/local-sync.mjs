@@ -43,6 +43,21 @@ let ownsLocalLock = false;
 // 无论是否超过 TTL，都不会自动删除/接管锁文件（见 acquireLocalLock）。
 const LOCK_TTL_MS = 12 * 60 * 60 * 1000;
 
+function resolveTimeoutMs(envName, fallbackMs, minMs = 1) {
+  const raw = Number(process.env[envName]);
+  return Number.isFinite(raw) && raw >= minMs ? Math.trunc(raw) : fallbackMs;
+}
+// 代理父进程兜底超时默认 18s（覆盖子进程 5s 停爬虫 + 10s 放云锁 + 余量），可通过环境变量注入以便测试
+const PROXY_SHUTDOWN_TIMEOUT_MS = resolveTimeoutMs("LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS", 18_000);
+const CRAWLER_STOP_TIMEOUT_MS = 5_000;
+const FORCE_KILL_CLOSE_WAIT_MS = resolveTimeoutMs("LOCAL_SYNC_FORCE_KILL_WAIT_MS", 3_000);
+
+function disconnectIpcSafely() {
+  if (typeof process.disconnect === "function" && process.connected) {
+    try { process.disconnect(); } catch { /* ignore */ }
+  }
+}
+
 // 1. 加载 .env.local（如果存在）
 const envPath = path.join(ROOT, ".env.local");
 if (fs.existsSync(envPath)) {
@@ -201,20 +216,31 @@ async function runMain() {
       const isProxyParent = !emergencyReleaseCloudLock;
       await new Promise(resolve => {
         let done = false;
+        let forceKillTimer = null;
         const finish = () => {
           if (done) return;
           done = true;
           clearTimeout(timer);
+          if (forceKillTimer) clearTimeout(forceKillTimer);
           childToStop.off("close", finish);
           resolve();
         };
         const timer = setTimeout(() => {
-          // 代理父进程优先等子进程自行放云端锁并退出；仅超时兜底再强杀
+          if (childToStop.exitCode !== null || childToStop.signalCode !== null) {
+            finish();
+            return;
+          }
+          // 代理父进程优先等子进程自行放云端锁并退出；超时后强杀并继续等 close（带保底）再放本地锁
           if (isProxyParent) {
             try { childToStop.kill("SIGTERM"); } catch { /* ignore */ }
+            forceKillTimer = setTimeout(() => {
+              try { childToStop.kill("SIGKILL"); } catch { /* ignore */ }
+              finish();
+            }, FORCE_KILL_CLOSE_WAIT_MS);
+            return;
           }
           finish();
-        }, 5000);
+        }, isProxyParent ? PROXY_SHUTDOWN_TIMEOUT_MS : CRAWLER_STOP_TIMEOUT_MS);
         childToStop.once("close", finish);
         if (!isProxyParent) {
           try {
@@ -222,12 +248,21 @@ async function runMain() {
           } catch {
             finish();
           }
-        } else if (signal !== "SIGINT") {
-          // SIGINT 会同组送达子进程；非 SIGINT 时先发软中断让子进程释放云端锁
-          try {
-            childToStop.kill("SIGINT");
-          } catch {
-            finish();
+        } else {
+          // 代理父进程发 IPC 软退出消息前先检 childToStop.connected；若已断开仅非 Windows 回退 SIGTERM
+          let sent = false;
+          if (childToStop.connected && typeof childToStop.send === "function") {
+            try {
+              childToStop.send({ type: "graceful-shutdown", signal });
+              sent = true;
+            } catch { /* ignore */ }
+          }
+          if (!sent && process.platform !== "win32") {
+            try {
+              childToStop.kill("SIGTERM");
+            } catch {
+              finish();
+            }
           }
         }
       });
@@ -237,10 +272,17 @@ async function runMain() {
       try { await emergencyReleaseCloudLock(); } catch { /* ignore */ }
     }
     if (ownsLocalLock) releaseLocalLock();
+    disconnectIpcSafely();
     process.exit(130);
+  };
+  const onGracefulShutdownMessage = msg => {
+    if (msg && msg.type === "graceful-shutdown") {
+      void handleSignal(msg.signal || "SIGTERM");
+    }
   };
   process.once("SIGINT", handleSignal);
   process.once("SIGTERM", handleSignal);
+  process.on("message", onGracefulShutdownMessage);
 
   try {
     // 2. 自动探测本地代理端口是否存活，若存活且尚未带 --use-env-proxy 则重启自身
@@ -253,7 +295,7 @@ async function runMain() {
             ["--use-env-proxy", fileURLToPath(import.meta.url), ...process.argv.slice(2)],
             {
               cwd: ROOT,
-              stdio: "inherit",
+              stdio: ["inherit", "inherit", "inherit", "ipc"],
               env: {
                 ...process.env,
                 NODE_USE_ENV_PROXY: "1",
@@ -319,21 +361,28 @@ async function runMain() {
   // 脚本在 finally 里主动释放，进程崩溃则由 15 分钟租约自然过期。
   const syncOwnerId = "local-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
   let cloudLockAcquired = false;
+  let cloudLockReleasePromise = null;
 
-  const releaseCloudLock = async () => {
-    if (!cloudLockAcquired) return;
-    cloudLockAcquired = false;
-    await fetch(`${apiUrl}/ingest/sync-lock/release`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${apiSecret}`,
-        connection: "close"
-      },
-      body: JSON.stringify({ ownerId: syncOwnerId }),
-      signal: AbortSignal.timeout(30_000)
-    }).catch(() => {});
-    console.log("🔓 已释放云端同步锁");
+  const releaseCloudLock = () => {
+    if (!cloudLockAcquired) return cloudLockReleasePromise ?? Promise.resolve();
+    if (!cloudLockReleasePromise) {
+      cloudLockAcquired = false;
+      cloudLockReleasePromise = fetch(`${apiUrl}/ingest/sync-lock/release`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${apiSecret}`,
+          connection: "close"
+        },
+        body: JSON.stringify({ ownerId: syncOwnerId }),
+        signal: AbortSignal.timeout(30_000)
+      })
+        .catch(() => {})
+        .then(() => {
+          console.log("🔓 已释放云端同步锁");
+        });
+    }
+    return cloudLockReleasePromise;
   };
   emergencyReleaseCloudLock = releaseCloudLock;
 
@@ -528,6 +577,8 @@ async function runMain() {
   } finally {
     process.off("SIGINT", handleSignal);
     process.off("SIGTERM", handleSignal);
+    process.off("message", onGracefulShutdownMessage);
+    disconnectIpcSafely();
   }
 }
 

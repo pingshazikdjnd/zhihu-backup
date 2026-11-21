@@ -41,6 +41,47 @@ const followedProgMap = followedProgress && typeof followedProgress === "object"
 // 同步租约：云端 Apify 由 Worker 注入 input.syncOwnerId，本地同步由 local-sync.mjs
 // 通过环境变量 SYNC_OWNER_ID 传入；每批 /ingest 请求带 x-sync-owner 自动续租 15 分钟。
 const syncOwnerId = String(input.syncOwnerId || process.env.SYNC_OWNER_ID || "").trim();
+
+// 幂等释放云端同步锁：共享同一进行中 Promise，确保 Actor.on("aborting") 与信号钩子并发触发时
+// 只发一次释放请求并等待在途请求完成再退出。
+let syncLockReleasePromise: Promise<void> | null = null;
+async function releaseSyncLockBeforeExit(): Promise<void> {
+  if (!syncOwnerId) return;
+  if (!syncLockReleasePromise) {
+    syncLockReleasePromise = (async () => {
+      const base = apiUrl.endsWith("/") ? apiUrl.slice(0, -1) : apiUrl;
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (apiSecret) headers["authorization"] = `Bearer ${apiSecret}`;
+      try {
+        await fetch(`${base}/ingest/sync-lock/release`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ownerId: syncOwnerId }),
+          signal: AbortSignal.timeout(10_000)
+        });
+      } catch {
+        // 释放失败不阻塞退出，租约 15 分钟后自然过期
+      }
+    })();
+  }
+  await syncLockReleasePromise;
+}
+
+if (typeof Actor.on === "function") {
+  Actor.on("aborting", () => {
+    void releaseSyncLockBeforeExit();
+  });
+}
+let abortSignalHandled = false;
+const handleCrawlerSignal = () => {
+  if (abortSignalHandled) return;
+  abortSignalHandled = true;
+  void releaseSyncLockBeforeExit().finally(() => {
+    process.exit(130);
+  });
+};
+process.once("SIGINT", handleCrawlerSignal);
+process.once("SIGTERM", handleCrawlerSignal);
 const cfg = {
   commentsMyAnswers: syncConfig?.commentsMyAnswers || "full",
   commentsCollections: syncConfig?.commentsCollections || "hot",
@@ -922,6 +963,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
         return `https://www.zhihu.com/api/v4/comment_v5/answers/${task.answerId}/root_comment?order_by=${orderBy}&limit=20&offset=${offset === 0 ? "" : offset}`;
       };
       let currentOrderBy: "ts" | "score" = cfg.commentsMyAnswers === "full" ? "ts" : "score";
+      let fellBackToScore = false;
       let cNextUrl = buildRootCommentsUrl(0, currentOrderBy);
       while (!cIsEnd && rootPages < MAX_COMMENT_PAGES && !stats.riskExhausted && !stats.circuitBroken) {
         let cJson: any;
@@ -939,6 +981,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           ) {
             console.log(`ℹ️ answer ${task.answerId} order_by=ts 首页空页（is_end=false），回退改用 order_by=score`);
             await jitterSleep(400, 750);
+            fellBackToScore = true;
             currentOrderBy = "score";
             cNextUrl = buildRootCommentsUrl(0, "score");
             cJson = (
@@ -964,11 +1007,44 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           cFailed = true;
           break;
         }
+        // P1-4: 响应缺失 data 数组（畸形响应）直接判定失败，绝不能误判为空页清零
+        if (!Array.isArray(cJson?.data)) {
+          console.warn(`⚠️ 回答 ${task.answerId} 根评论响应缺少 data 数组，本轮标记失败`);
+          cIncomplete = true;
+          cFailed = true;
+          break;
+        }
         // 知乎风控会返回 200 + 空数组；该形态已在 zhihuJson 内重试并计数。
         // 能走到这里的是 is_end 的合法空页（或第 0 页空页）。
-        if (!cJson.data || cJson.data.length === 0) {
+        if (cJson.data.length === 0) {
           const emptyIsEnd = cJson.paging?.is_end === true;
-          if (rootPages === 0 && emptyIsEnd && cfg.commentsMyAnswers === "full") {
+          if (rootPages === 0 && emptyIsEnd && !fellBackToScore && cfg.commentsMyAnswers === "full") {
+            let confirmedEmpty = (task.commentCount || 0) === 0;
+            if (!confirmedEmpty) {
+              // task.commentCount > 0 时必须复用爬虫请求封装二次确认，防止偶发空响应清空历史评论
+              try {
+                await jitterSleep(300, 600);
+                const confirmJson = (
+                  await zhihuJson(context, buildRootCommentsUrl(0, "ts"), {
+                    label: `回答 ${task.answerId} 根评论空页二次确认`,
+                    allowEmptyPage: true
+                  })
+                ).json;
+                confirmedEmpty =
+                  Array.isArray(confirmJson?.data) &&
+                  confirmJson.data.length === 0 &&
+                  confirmJson.paging?.is_end === true;
+              } catch (confirmErr: any) {
+                console.warn(`⚠️ 回答 ${task.answerId} 空页二次确认失败: ${sanitizeErrorForLog(confirmErr)}`);
+                confirmedEmpty = false;
+              }
+            }
+            if (!confirmedEmpty) {
+              console.warn(`⚠️ 回答 ${task.answerId} commentCount=${task.commentCount} 但空页二次确认未通过，保留既有历史`);
+              cIncomplete = true;
+              cFailed = true;
+              break;
+            }
             rootEnded = true;
             cIsEnd = true;
             try {
@@ -982,8 +1058,11 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
               cFailed = true;
               console.warn(`⚠️ 回答 ${task.answerId} 空页清零对账失败: ${sanitizeErrorForLog(e)}`);
             }
-          } else if (emptyIsEnd) {
+          } else if (emptyIsEnd && !fellBackToScore) {
             rootEnded = true;
+            cIsEnd = true;
+          } else if (emptyIsEnd && fellBackToScore) {
+            cIncomplete = true;
             cIsEnd = true;
           } else {
             cIncomplete = true;
@@ -1117,15 +1196,17 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       }
       
       if (pendingRoots.length > 0) {
-        // 最后一批：全量且完整时 partial=false 并带完整 allRootIds 供删除对账；
-        // 抓取中断时保持 partial=true，绝不能按不完整列表删数据
+        // 最后一批：全量且完整且未回退 score 排序时才 partial=false 并带完整 allRootIds 供删除对账；
+        // score 排序会在约 200 根处假 is_end，回退后一律强制 partial=true 仅增量保存。
         const batch = pendingRoots;
         pendingRoots = [];
         try {
-          const res = await postCommentsByRoot(contentPk, batch, {
-            partial: cIncomplete,
-            allRootIds
-          });
+          const partialSubmit = cIncomplete || fellBackToScore;
+          const res = await postCommentsByRoot(
+            contentPk,
+            batch,
+            partialSubmit ? { partial: true } : { partial: false, allRootIds }
+          );
           submittedRoots += res.roots;
           submittedChildren += res.children;
           if (res.aborted) {
@@ -1141,7 +1222,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
             break;
           }
         }
-      } else if (cfg.commentsMyAnswers === "full" && !cIncomplete && allRootIds.length > 0) {
+      } else if (cfg.commentsMyAnswers === "full" && !cIncomplete && !fellBackToScore && allRootIds.length > 0) {
         try {
           const res = await postCommentsByRoot(contentPk, [], { partial: false, allRootIds });
           if (res.aborted) {
@@ -1370,6 +1451,7 @@ export async function syncHotCommentsForContent(
     let cOffset = 0;
     let cIsEnd = false;
     let currentOrderBy: "ts" | "score" = mode === "full" ? "ts" : "score";
+    let fellBackToScore = false;
     let nextUrl = buildUrl(cOffset, currentOrderBy);
     const maxPages = mode === "full" ? MAX_COMMENT_PAGES : 1;
     const seenRootIds = new Set<string>();
@@ -1377,12 +1459,12 @@ export async function syncHotCommentsForContent(
     let rootsBuffer: RootCommentGroup[] = [];
 
     // 每 20 根一批提交（服务端每根 2 个子请求，仍在 Workers 50 子请求限制内）。
-    // 非最后一批一律 partial=true；最后一批是否对账由调用点按 full + 完整性决定。
+    // 非最后一批或已回退 score 排序一律 partial=true；最后一批是否对账由调用点按 full + 完整性决定。
     const flushRoots = async (isLast: boolean) => {
       if (rootsBuffer.length === 0) return;
       const batch = rootsBuffer;
       rootsBuffer = [];
-      const canReconcile = isLast && mode === "full" && !cIncomplete;
+      const canReconcile = isLast && mode === "full" && !cIncomplete && !fellBackToScore;
       const res = await postCommentsByRoot(
         contentPk,
         batch,
@@ -1415,6 +1497,7 @@ export async function syncHotCommentsForContent(
         ) {
           console.log(`ℹ️ ${sourceType} ${sourceId} order_by=ts 首页空页（is_end=false），回退改用 order_by=score`);
           await jitterSleep(400, 750);
+          fellBackToScore = true;
           currentOrderBy = "score";
           nextUrl = buildUrl(0, "score");
           cJson = (
@@ -1440,16 +1523,22 @@ export async function syncHotCommentsForContent(
         break;
       }
 
-      const pageData: any[] = Array.isArray(cJson.data) ? cJson.data : [];
+      if (!Array.isArray(cJson?.data)) {
+        console.warn(`⚠️ 抓取评论响应缺少 data 数组 (${sourceType}:${sourceId})，本轮标记失败`);
+        cIncomplete = true;
+        cFailed = true;
+        break;
+      }
+      const pageData: any[] = cJson.data;
       if (pageData.length === 0) {
         // 合法空页：知乎明确 is_end 才可信（风控空页已在 zhihuJson 内重试并计数）
         const emptyIsEnd = cJson.paging?.is_end === true;
-        if (pagesFetched === 0 && emptyIsEnd && mode === "full") {
+        if (pagesFetched === 0 && emptyIsEnd && !fellBackToScore && mode === "full") {
           // 评论被整体删光/关闭评论：空 roots 全量对账，让 Worker 软删旧根并清零计数
           await postCommentsByRoot(contentPk, [], { partial: false, allRootIds: [] });
-        } else if (!emptyIsEnd) {
+        } else if (!emptyIsEnd || fellBackToScore) {
           cIncomplete = true;
-          cFailed = true;
+          if (!emptyIsEnd) cFailed = true;
         }
         cIsEnd = emptyIsEnd;
         break;
@@ -1606,9 +1695,9 @@ export async function syncHotCommentsForContent(
     }
 
     if (rootsBuffer.length > 0) {
-      // 最后一批：只有 full 且完整翻到 is_end 才做删除对账
+      // 最后一批：只有 full 且完整翻到 is_end 且未回退 score 才做删除对账
       await flushRoots(true);
-    } else if (mode === "full" && !cIncomplete && allRootIds.length > 0) {
+    } else if (mode === "full" && !cIncomplete && !fellBackToScore && allRootIds.length > 0) {
       // 根评论恰好是 20 的整数倍：最后一批已作为中间批发出，这里补一次空 roots 的全量对账
       const res = await postCommentsByRoot(contentPk, [], { partial: false, allRootIds });
       if (res.aborted) {
@@ -3211,26 +3300,6 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
   console.log("🎉 关注答主同步完成！");
 }
 
-
-let syncLockReleased = false;
-async function releaseSyncLockBeforeExit(): Promise<void> {
-  if (!syncOwnerId || syncLockReleased) return;
-  syncLockReleased = true;
-  const base = apiUrl.endsWith("/") ? apiUrl.slice(0, -1) : apiUrl;
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  if (apiSecret) headers["authorization"] = `Bearer ${apiSecret}`;
-  try {
-    await fetch(`${base}/ingest/sync-lock/release`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ ownerId: syncOwnerId }),
-      signal: AbortSignal.timeout(10_000)
-    });
-  } catch {
-    // 释放失败不阻塞退出，租约 15 分钟后自然过期
-  }
-}
-
 // --- Apify Entry Point ---
 // 失败必须让 run 状态可见。之前所有异常都被吞掉后正常 exit，
 // cookie 失效后 run 依然 SUCCEEDED，Worker /auth 页据此误报"一切正常"。
@@ -3350,6 +3419,8 @@ if (stats.failed > 0 || stats.zhihuRejected > 0 || stats.riskExhausted) {
 }
 
 await releaseSyncLockBeforeExit();
+process.off("SIGINT", handleCrawlerSignal);
+process.off("SIGTERM", handleCrawlerSignal);
 if (finalStatusMessage) {
   await Actor.exit({ statusMessage: finalStatusMessage });
 } else {

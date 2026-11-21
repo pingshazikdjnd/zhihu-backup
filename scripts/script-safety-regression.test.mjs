@@ -1291,8 +1291,8 @@ test("[P0-2][P1-8][P2-3][P2-4][P2-7] crawler/main.ts 与补抓脚本安全回归
   );
   assert.match(scraperBody, /const canFallbackScore = cfg\.commentsMyAnswers === "full" && rootPages === 0 && currentOrderBy === "ts";/);
   assert.match(scraperBody, /\.\.\.\(canFallbackScore \? \{ allowEmptyPage: true \} : \{\}\)/);
-  assert.match(scraperBody, /currentOrderBy = "score";\s*cNextUrl = buildRootCommentsUrl\(0, "score"\);/);
-  assert.match(scraperBody, /if \(rootPages === 0 && emptyIsEnd && cfg\.commentsMyAnswers === "full"\)[\s\S]{0,200}postCommentsByRoot\(contentPk, \[\], \{ partial: false, allRootIds: \[\] \}\)/);
+  assert.match(scraperBody, /fellBackToScore = true;\s*currentOrderBy = "score";\s*cNextUrl = buildRootCommentsUrl\(0, "score"\);/);
+  assert.match(scraperBody, /if \(rootPages === 0 && emptyIsEnd && !fellBackToScore && cfg\.commentsMyAnswers === "full"\)[\s\S]{0,2000}postCommentsByRoot\(contentPk, \[\], \{ partial: false, allRootIds: \[\] \}\)/);
 
   // P2-3：hasReachedCursor 优先时间维度 offset，不被浅层 page_num 误导
   const cursorStart = crawlerSrc.indexOf("  function hasReachedCursor(");
@@ -1499,4 +1499,476 @@ test("[P2-4] crawler fetchStoredCommentState / shouldSyncCommentsDeep 对 is_com
   const retryState = await ctx.__state("answer:p24-retry");
   assert.equal(retryState.incompleteRoots, 1);
   assert.equal(await ctx.__deep("answer:p24-retry", 11, 11, "full"), true);
+});
+
+test("[P0-1][P1-4] crawler score 回退不触发全量删对账，畸形响应与非确认空页不误清零", async () => {
+  const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const crawlerRequire = createRequire(path.join(ROOT, "apps", "apify-crawler", "package.json"));
+  const tsMod = await import(pathToFileURL(crawlerRequire.resolve("typescript")).href);
+  const ts = tsMod.default ?? tsMod;
+  const crawlerJs = ts.transpileModule(crawlerSrc, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+  }).outputText;
+
+  const fnCode = [
+    extractFunction(crawlerJs, "pickCommentImageUrl"),
+    extractFunction(crawlerJs, "normalizeCommentImage"),
+    extractFunction(crawlerJs, "toChildComment"),
+    extractFunction(crawlerJs, "toRootCommentGroup"),
+    "async " + extractFunction(crawlerJs, "runScraperBody"),
+    "async " + extractFunction(crawlerJs.replace("export async function syncHotCommentsForContent(", "async function syncHotCommentsForContent("), "syncHotCommentsForContent")
+  ].join("\n");
+
+  const makeRoots = (prefix, count, startIdx = 0) =>
+    Array.from({ length: count }, (_, idx) => {
+      const n = startIdx + idx;
+      return {
+        id: `${prefix}-${n}`,
+        content: `comment ${n}`,
+        author: { name: `U${n}`, avatar_url: "" },
+        vote_count: n,
+        child_comment_count: 0,
+        child_comments: []
+      };
+    });
+
+  let zhihuHandler;
+  let postRootCalls = [];
+  let incompleteSet = new Set();
+  const makeStats = () => ({
+    saved: 0, failed: 0, authRejected: 0, riskEmpty: 0, zhihuRejected: 0,
+    riskFailStreak: 0, riskExhausted: false, riskPaused: false, riskPauseMs: 0,
+    consecutiveFailures: 0, circuitBroken: false, estimatedWrites: 0
+  });
+  const sandbox = {
+    URL,
+    Set,
+    Map,
+    Array,
+    Number,
+    String,
+    Boolean,
+    Math,
+    encodeURIComponent,
+    setTimeout,
+    clearTimeout,
+    console: { log() {}, warn() {}, error() {} },
+    MAX_COMMENT_PAGES: 200,
+    ZHIHU_USERNAME: "tester",
+    isFast: false,
+    cfg: { commentsMyAnswers: "full", commentsCollections: "full", commentsUpvotes: "full", commentsFollowing: "full" },
+    stats: makeStats(),
+    get commentSyncIncomplete() { return incompleteSet; },
+    jitterSleep: async () => {},
+    createStealthContext: async () => ({ addCookies: async () => {} }),
+    getCookiesArray: () => [],
+    fetchAnswerTrueStats: async () => null,
+    resolveAnswerQuestionMeta: (q, id) => ({ sourceUrl: `https://www.zhihu.com/question/1/answer/${id}`, question: q }),
+    cleanHtml: s => String(s || ""),
+    toIsoOrNull: () => "2026-01-01T00:00:00.000Z",
+    sendContent: async () => ({ created: false, changed: false, prevCommentCount: 0 }),
+    shouldSyncCommentsDeep: async () => true,
+    sanitizeErrorForLog: e => String(e?.message || e),
+    zhihuJson: async (ctx, url, opts) => zhihuHandler(ctx, url, opts),
+    postCommentsByRoot: async (contentPk, roots, opts = {}) => {
+      postRootCalls.push({ contentPk, count: roots.length, opts });
+      return { batches: 1, roots: roots.length, children: 0, aborted: false };
+    }
+  };
+  const ctx = vm.createContext(sandbox);
+  vm.runInContext(`${fnCode}\nglobalThis.__run = runScraperBody;\nglobalThis.__syncHot = syncHotCommentsForContent;`, ctx);
+
+  // 1) P0-1 runScraperBody: order_by=ts 首页空页 is_end=false 回退 order_by=score 返回 200 根 + is_end=true
+  //    断言全部 postCommentsByRoot 调用均为 partial: true 且无 allRootIds（绝不触发 201~N 删除对账）
+  postRootCalls = [];
+  incompleteSet = new Set();
+  sandbox.stats = makeStats();
+  zhihuHandler = async (_c, url) => {
+    if (url.includes("/members/tester/answers")) {
+      return {
+        json: {
+          data: [{ id: "ans-p01", type: "answer", comment_count: 300, content: "<p>body</p>", question: { id: 1, title: "Q" } }],
+          paging: { is_end: true }
+        }
+      };
+    }
+    if (url.includes("order_by=ts")) {
+      return { json: { data: [], paging: { is_end: false } } };
+    }
+    const u = new URL(url);
+    const pageIdx = Number(u.searchParams.get("offset") || "0");
+    const nextIdx = pageIdx + 1;
+    return {
+      json: {
+        data: makeRoots("score", 20, pageIdx * 20),
+        paging: nextIdx < 10
+          ? { is_end: false, next: `https://www.zhihu.com/api/v4/comment_v5/answers/ans-p01/root_comment?order_by=score&limit=20&offset=${nextIdx}` }
+          : { is_end: true }
+      }
+    };
+  };
+  await ctx.__run({});
+  assert.ok(postRootCalls.length >= 10, "200 根应分多批提交");
+  assert.equal(postRootCalls.every(c => c.opts?.partial === true && c.opts?.allRootIds === undefined), true, "score 回退全批必须强制 partial:true 且不带 allRootIds");
+
+  // 2) P0-1 syncHotCommentsForContent: 200 根回退 score 同样不得在尾部补发 partial:false 全量对账
+  postRootCalls = [];
+  incompleteSet = new Set();
+  sandbox.stats = makeStats();
+  zhihuHandler = async (_c, url) => {
+    if (url.includes("order_by=ts")) {
+      return { json: { data: [], paging: { is_end: false } } };
+    }
+    const u = new URL(url);
+    const pageIdx = Number(u.searchParams.get("offset") || "0");
+    const nextIdx = pageIdx + 1;
+    return {
+      json: {
+        data: makeRoots("art-score", 20, pageIdx * 20),
+        paging: nextIdx < 10
+          ? { is_end: false, next: `https://www.zhihu.com/api/v4/comment_v5/articles/art-p01/root_comment?order_by=score&limit=20&offset=${nextIdx}` }
+          : { is_end: true }
+      }
+    };
+  };
+  await ctx.__syncHot({}, "article", "art-p01", "full");
+  assert.equal(postRootCalls.length, 10);
+  assert.equal(postRootCalls.every(c => c.opts?.partial === true && c.opts?.allRootIds === undefined), true);
+
+  // 3) P1-4: 缺失 data 数组的畸形响应 { paging: { is_end: true } } 不得误判清零
+  postRootCalls = [];
+  incompleteSet = new Set();
+  sandbox.stats = makeStats();
+  zhihuHandler = async (_c, url) => {
+    if (url.includes("/members/tester/answers")) {
+      return {
+        json: {
+          data: [{ id: "ans-mal", type: "answer", comment_count: 10, content: "<p>body</p>", question: { id: 1, title: "Q" } }],
+          paging: { is_end: true }
+        }
+      };
+    }
+    return { json: { paging: { is_end: true } } };
+  };
+  await ctx.__run({});
+  assert.equal(postRootCalls.length, 0, "缺失 data 数组不得触发任何清零提交");
+  assert.equal(incompleteSet.has("answer:ans-mal"), true);
+
+  // 4) P1-4: commentCount > 0 时首页单次空页 is_end=true 必须走 zhihuJson 二次确认；二次确认不通过则绝不清零
+  postRootCalls = [];
+  incompleteSet = new Set();
+  sandbox.stats = makeStats();
+  let tsCalls = 0;
+  zhihuHandler = async (_c, url) => {
+    if (url.includes("/members/tester/answers")) {
+      return {
+        json: {
+          data: [{ id: "ans-confirm-fail", type: "answer", comment_count: 25, content: "<p>body</p>", question: { id: 1, title: "Q" } }],
+          paging: { is_end: true }
+        }
+      };
+    }
+    tsCalls++;
+    if (tsCalls === 1) return { json: { data: [], paging: { is_end: true } } };
+    return { json: { data: makeRoots("recover", 1), paging: { is_end: true } } };
+  };
+  await ctx.__run({});
+  assert.equal(tsCalls, 2, "commentCount > 0 时必须复用 zhihuJson 发起二次确认");
+  assert.equal(postRootCalls.length, 0, "二次确认仍有评论/未确认清空时不得提交 allRootIds: []");
+  assert.equal(incompleteSet.has("answer:ans-confirm-fail"), true);
+
+  // 5) P1-4: 二次确认仍为空且 is_end=true 时放行清零
+  postRootCalls = [];
+  incompleteSet = new Set();
+  sandbox.stats = makeStats();
+  tsCalls = 0;
+  zhihuHandler = async (_c, url) => {
+    if (url.includes("/members/tester/answers")) {
+      return {
+        json: {
+          data: [{ id: "ans-confirm-ok", type: "answer", comment_count: 25, content: "<p>body</p>", question: { id: 1, title: "Q" } }],
+          paging: { is_end: true }
+        }
+      };
+    }
+    tsCalls++;
+    return { json: { data: [], paging: { is_end: true } } };
+  };
+  await ctx.__run({});
+  assert.equal(tsCalls, 2);
+  assert.equal(postRootCalls.length, 1);
+  assert.deepEqual(Array.from(postRootCalls[0].opts.allRootIds), []);
+  assert.equal(postRootCalls[0].opts.partial, false);
+});
+
+test("[P1-7][P2-9] local-sync 代理 IPC 软停/等 close 再放锁/幂等、crawler aborting 钩子与 run-comment-repair 进程组停机", async () => {
+  const http = await import("node:http");
+  const net = await import("node:net");
+  const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");
+  const repairCommentsSrc = readScript("scripts/run-comment-repair.mjs");
+
+  // 1) 静态与行为校验：crawler/main.ts 已挂载 Actor.on("aborting") 与 SIGINT/SIGTERM，且并发释放严格幂等
+  assert.match(crawlerSrc, /Actor\.on\("aborting"/);
+  assert.match(crawlerSrc, /process\.once\("SIGINT", handleCrawlerSignal\)/);
+  assert.match(crawlerSrc, /process\.once\("SIGTERM", handleCrawlerSignal\)/);
+
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const crawlerRequire = createRequire(path.join(ROOT, "apps", "apify-crawler", "package.json"));
+  const tsMod = await import(pathToFileURL(crawlerRequire.resolve("typescript")).href);
+  const ts = tsMod.default ?? tsMod;
+  const crawlerJs = ts.transpileModule(crawlerSrc, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+  }).outputText;
+  const releaseFnCode = "async " + extractFunction(crawlerJs, "releaseSyncLockBeforeExit");
+  let resolveFetch;
+  let fetchCalls = 0;
+  const relCtx = vm.createContext({
+    AbortSignal,
+    syncOwnerId: "owner-1",
+    apiUrl: "https://worker.example",
+    apiSecret: "sec",
+    syncLockReleasePromise: null,
+    fetch: () => {
+      fetchCalls++;
+      return new Promise(r => { resolveFetch = r; });
+    }
+  });
+  vm.runInContext(`${releaseFnCode}\nglobalThis.__rel = releaseSyncLockBeforeExit;`, relCtx);
+  let p1Done = false;
+  let p2Done = false;
+  const p1 = relCtx.__rel().then(() => { p1Done = true; });
+  const p2 = relCtx.__rel().then(() => { p2Done = true; });
+  assert.equal(fetchCalls, 1, "并发调用 releaseSyncLockBeforeExit 只允许发出 1 次释放请求");
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(p1Done || p2Done, false, "未收到释放响应前两个调用方都必须等待同一在途 Promise");
+  resolveFetch({ ok: true });
+  await Promise.all([p1, p2]);
+  assert.equal(p1Done && p2Done, true);
+
+  // 2) 静态检查：local-sync 默认超时 >= 18_000、IPC 通道、connected 校验与 process.disconnect()
+  assert.match(localSyncSrc, /resolveTimeoutMs\("LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS",\s*18_000\)/);
+  assert.match(localSyncSrc, /stdio:\s*\["inherit",\s*"inherit",\s*"inherit",\s*"ipc"\]/);
+  assert.match(localSyncSrc, /childToStop\.connected/);
+  assert.match(localSyncSrc, /type:\s*"graceful-shutdown"/);
+  assert.match(localSyncSrc, /process\.disconnect\(\)/);
+
+  // 3) 真实代理父子进程联调（全程限定在 os.tmpdir()）：验证 IPC 软停、等 close 再放锁、叠加信号幂等、超时强杀等 close
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-local-sync-ipc-"));
+  const scriptsDir = path.join(dir, "scripts");
+  const crawlerDir = path.join(dir, "apps", "apify-crawler");
+  const distDir = path.join(crawlerDir, "dist");
+  const lockFile = path.join(crawlerDir, ".local-sync.lock");
+  fs.mkdirSync(scriptsDir, { recursive: true });
+  fs.mkdirSync(distDir, { recursive: true });
+
+  // 测试副本仅在环境变量显式存在时把信号文件转成父/子进程内信号事件（解决 Windows 下 kill() 无信号句柄的跨平台测试限制）
+  const instrumentedLocalSync = `${localSyncSrc}
+if (!process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_PARENT_SIGNAL_FILE) {
+  const sigFile = process.env.__TEST_PARENT_SIGNAL_FILE;
+  const t = setInterval(() => {
+    if (fs.existsSync(sigFile)) {
+      clearInterval(t);
+      const sig = fs.readFileSync(sigFile, "utf8").trim() || "SIGTERM";
+      process.emit(sig, sig);
+    }
+  }, 15);
+  t.unref();
+}
+if (process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_CHILD_SIGNAL_FILE) {
+  const sigFile = process.env.__TEST_CHILD_SIGNAL_FILE;
+  const t = setInterval(() => {
+    if (fs.existsSync(sigFile)) {
+      clearInterval(t);
+      const sig = fs.readFileSync(sigFile, "utf8").trim() || "SIGINT";
+      process.emit(sig, sig);
+    }
+  }, 15);
+  t.unref();
+}
+`;
+  const testScriptPath = path.join(scriptsDir, "local-sync.mjs");
+  fs.writeFileSync(testScriptPath, instrumentedLocalSync, "utf8");
+  fs.writeFileSync(
+    path.join(distDir, "main.js"),
+    `import fs from "node:fs";
+     if (process.env.__TEST_CRAWLER_READY_FILE) fs.writeFileSync(process.env.__TEST_CRAWLER_READY_FILE, String(process.pid));
+     setInterval(() => {}, 1000);`,
+    "utf8"
+  );
+
+  let releaseDelayMs = 150;
+  let releaseCalls = 0;
+  let lockExistsDuringRelease = [];
+  const proxyServer = net.createServer(sock => sock.end());
+  await new Promise(resolve => proxyServer.listen(0, "127.0.0.1", resolve));
+  const proxyPort = proxyServer.address().port;
+
+  const workerServer = http.createServer(async (req, res) => {
+    if (req.method === "POST" && req.url === "/ingest/sync-lock/acquire") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    if (req.method === "GET" && req.url === "/ingest/sync-state") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ cookieString: "z_c0=test", zhihuUsername: "tester", syncConfig: {} }));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/ingest/sync-lock/release") {
+      releaseCalls++;
+      lockExistsDuringRelease.push(fs.existsSync(lockFile));
+      await new Promise(r => setTimeout(r, releaseDelayMs));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, released: true }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise(resolve => workerServer.listen(0, "127.0.0.1", resolve));
+  const workerPort = workerServer.address().port;
+
+  const waitUntilFile = async (file, timeoutMs = 10_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!fs.existsSync(file)) {
+      if (Date.now() > deadline) throw new Error(`timeout waiting for ${file}`);
+      await new Promise(r => setTimeout(r, 20));
+    }
+  };
+
+  let spawnedProc = null;
+  try {
+    // 场景 A：代理父进程发 IPC 软停，子进程耗时 150ms 放云锁并 process.disconnect() 迅速退出；
+    //         子进程关闭前绝不可删除 .local-sync.lock
+    releaseDelayMs = 150;
+    releaseCalls = 0;
+    lockExistsDuringRelease = [];
+    const readyA = path.join(dir, "ready-a");
+    const parentSigA = path.join(dir, "parent-sig-a");
+    spawnedProc = spawn(process.execPath, [testScriptPath], {
+      cwd: dir,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        WORKER_URL: `http://127.0.0.1:${workerPort}`,
+        API_SECRET: "sec",
+        HTTPS_PROXY: `http://127.0.0.1:${proxyPort}`,
+        LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS: "6000",
+        __TEST_CRAWLER_READY_FILE: readyA,
+        __TEST_PARENT_SIGNAL_FILE: parentSigA
+      }
+    });
+    await waitUntilFile(readyA);
+    assert.equal(fs.existsSync(lockFile), true);
+    const tStartA = Date.now();
+    fs.writeFileSync(parentSigA, "SIGTERM");
+    const exitA = await waitForExit(spawnedProc);
+    const elapsedA = Date.now() - tStartA;
+    spawnedProc = null;
+    assert.equal(exitA, 130);
+    assert.equal(releaseCalls, 1, "子进程必须执行一次 /ingest/sync-lock/release");
+    assert.deepEqual(lockExistsDuringRelease, [true], "子进程释放云锁且 close 前，父进程不得删除 .local-sync.lock");
+    assert.equal(fs.existsSync(lockFile), false, "子进程 close 后父进程必须清理 .local-sync.lock");
+    assert.ok(elapsedA < 4000, `process.disconnect() 应使子进程迅速退出而不等待 6000ms 超时，实际=${elapsedA}ms`);
+
+    // 场景 B：叠加信号（子进程同时收到 SIGINT 与父进程 IPC graceful-shutdown）严格幂等只释放一次云锁
+    releaseDelayMs = 120;
+    releaseCalls = 0;
+    lockExistsDuringRelease = [];
+    const readyB = path.join(dir, "ready-b");
+    const parentSigB = path.join(dir, "parent-sig-b");
+    const childSigB = path.join(dir, "child-sig-b");
+    spawnedProc = spawn(process.execPath, [testScriptPath], {
+      cwd: dir,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        WORKER_URL: `http://127.0.0.1:${workerPort}`,
+        API_SECRET: "sec",
+        HTTPS_PROXY: `http://127.0.0.1:${proxyPort}`,
+        LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS: "5000",
+        __TEST_CRAWLER_READY_FILE: readyB,
+        __TEST_PARENT_SIGNAL_FILE: parentSigB,
+        __TEST_CHILD_SIGNAL_FILE: childSigB
+      }
+    });
+    await waitUntilFile(readyB);
+    fs.writeFileSync(childSigB, "SIGINT");
+    fs.writeFileSync(parentSigB, "SIGINT");
+    const exitB = await waitForExit(spawnedProc);
+    spawnedProc = null;
+    assert.equal(exitB, 130);
+    assert.equal(releaseCalls, 1, "叠加 SIGINT 与 IPC 必须幂等只释放一次云端锁");
+    assert.equal(fs.existsSync(lockFile), false);
+
+    // 场景 C：可注入短超时兜底（250ms），触发强杀后等待 close 再删除 .local-sync.lock
+    releaseDelayMs = 3000;
+    releaseCalls = 0;
+    const readyC = path.join(dir, "ready-c");
+    const parentSigC = path.join(dir, "parent-sig-c");
+    spawnedProc = spawn(process.execPath, [testScriptPath], {
+      cwd: dir,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        WORKER_URL: `http://127.0.0.1:${workerPort}`,
+        API_SECRET: "sec",
+        HTTPS_PROXY: `http://127.0.0.1:${proxyPort}`,
+        LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS: "250",
+        LOCAL_SYNC_FORCE_KILL_WAIT_MS: "1000",
+        __TEST_CRAWLER_READY_FILE: readyC,
+        __TEST_PARENT_SIGNAL_FILE: parentSigC
+      }
+    });
+    await waitUntilFile(readyC);
+    const tStartC = Date.now();
+    fs.writeFileSync(parentSigC, "SIGTERM");
+    const exitC = await waitForExit(spawnedProc);
+    const elapsedC = Date.now() - tStartC;
+    spawnedProc = null;
+    assert.equal(exitC, 130);
+    assert.ok(elapsedC >= 200, `超时前应充分等待软停，实际=${elapsedC}ms`);
+    assert.equal(fs.existsSync(lockFile), false, "超时强杀 wait close 后必须清理 .local-sync.lock");
+  } finally {
+    if (spawnedProc && spawnedProc.exitCode === null && spawnedProc.signalCode === null) {
+      spawnedProc.kill();
+    }
+    proxyServer.close();
+    workerServer.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  // 4) P2-9: run-comment-repair startLocalWorker detached 与 stopLocalWorker 非 Windows 进程组停机
+  assert.match(repairCommentsSrc, /detached:\s*process\.platform !== "win32"/);
+  const stopCalls = [];
+  let failGroupKill = false;
+  const stopSrc = extractFunction(repairCommentsSrc, "stopLocalWorker");
+  const stopCtx = vm.createContext({
+    execFileSync: () => {},
+    process: {
+      platform: "linux",
+      kill: (pid, sig) => {
+        stopCalls.push({ kind: "process.kill", pid, sig });
+        if (failGroupKill) throw new Error("ESRCH");
+      }
+    }
+  });
+  vm.runInContext(`${stopSrc}\nglobalThis.__stop = stopLocalWorker;`, stopCtx);
+
+  const procMock = {
+    pid: 4321,
+    kill: sig => stopCalls.push({ kind: "proc.kill", pid: 4321, sig })
+  };
+  stopCtx.__stop(procMock);
+  assert.deepEqual(Array.from(stopCalls), [{ kind: "process.kill", pid: -4321, sig: "SIGTERM" }]);
+
+  stopCalls.length = 0;
+  failGroupKill = true;
+  stopCtx.__stop(procMock);
+  assert.deepEqual(Array.from(stopCalls), [
+    { kind: "process.kill", pid: -4321, sig: "SIGTERM" },
+    { kind: "proc.kill", pid: 4321, sig: "SIGTERM" }
+  ]);
 });
