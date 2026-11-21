@@ -16,7 +16,6 @@ import {
   kickImageDrain,
   processImageBatch,
   IMAGE_TASK_BATCH_DEFAULT_LIMIT,
-  IMAGE_TASK_BATCH_MAX_LIMIT,
   IMAGE_TASK_INGEST_KICK_LIMIT
 } from "../services/image-tasks.js";
 import {
@@ -216,8 +215,8 @@ function triggerExternalForward(c: any, scope: ExternalSyncScope, eventPath: str
 function triggerImageDrain(c: Context<{ Bindings: Bindings }>): void {
   const bucket = c.env.BUCKET;
   if (!bucket) return;
-  const promise = dbContext
-    .run(c.env.DB, () => kickImageDrain(bucket, IMAGE_TASK_INGEST_KICK_LIMIT))
+  const promise = Promise.resolve()
+    .then(() => dbContext.run(c.env.DB, () => kickImageDrain(bucket, IMAGE_TASK_INGEST_KICK_LIMIT)))
     .catch(err => {
       console.warn("[ingest] image drain failed:", err instanceof Error ? err.message : err);
       return null;
@@ -347,10 +346,12 @@ ingestRoutes.post("/content", async c => {
   return c.json({ ...result, offloadedTo: htmlOffloadedTo ?? undefined });
 });
 
+const IMAGE_TASK_ROUTE_MAX_LIMIT = 12;
+
 /**
  * 图片任务批量消费（P1）：每次领取一批 pending 任务，下载并写入 R2。
  * ingest 响应后的 waitUntil 会自动触发一次；cron / 手动补采也可以直接调用。
- * body 可选 { limit }，缺省 IMAGE_TASK_BATCH_DEFAULT_LIMIT，上限 IMAGE_TASK_BATCH_MAX_LIMIT。
+ * body 可选 { limit }，缺省 IMAGE_TASK_BATCH_DEFAULT_LIMIT，路由上限钳制为 12。
  */
 ingestRoutes.post("/image-batch", async c => {
   const bucket = c.env.BUCKET;
@@ -359,7 +360,7 @@ ingestRoutes.post("/image-batch", async c => {
   const body = await c.req.json().catch(() => null) as { limit?: unknown } | null;
   const rawLimit = Number(body?.limit);
   const limit = Number.isFinite(rawLimit) && rawLimit > 0
-    ? Math.min(Math.trunc(rawLimit), IMAGE_TASK_BATCH_MAX_LIMIT)
+    ? Math.min(Math.trunc(rawLimit), IMAGE_TASK_ROUTE_MAX_LIMIT)
     : IMAGE_TASK_BATCH_DEFAULT_LIMIT;
 
   const result = await processImageBatch(bucket, limit);

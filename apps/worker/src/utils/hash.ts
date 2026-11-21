@@ -30,11 +30,14 @@ export function normalizeAvatarUrlForCompare(url?: string | null): string {
     const isZhimgPic = /^pic[0-9a-z-]*\.zhimg\.com$/i.test(host) || host === "zhimg.com";
     const canonicalProtocol = isZhimgPic ? "https:" : parsed.protocol.toLowerCase();
     const canonicalHost = isZhimgPic ? "zhimg.com" : host;
-    return `${canonicalProtocol}//${canonicalHost}${parsed.pathname}`;
+    return `${canonicalProtocol}//${canonicalHost}${parsed.pathname}${isZhimgPic ? "" : parsed.search}`;
   } catch {
-    return candidate
-      .replace(/^https?:\/\/pic[0-9a-z-]*\.zhimg\.com/i, "https://zhimg.com")
-      .replace(/[?#].*$/, "");
+    if (/^https?:\/\/(?:pic[0-9a-z-]*\.)?zhimg\.com(?:[/:?#]|$)/i.test(candidate)) {
+      return candidate
+        .replace(/^https?:\/\/pic[0-9a-z-]*\.zhimg\.com/i, "https://zhimg.com")
+        .replace(/[?#].*$/, "");
+    }
+    return candidate;
   }
 }
 

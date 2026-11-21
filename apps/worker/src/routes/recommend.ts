@@ -57,8 +57,18 @@ recommendRoutes.post("/ai-assess", async c => {
     return c.json({ error: "Forbidden origin" }, 403);
   }
   // 2) 再验写口令：已配置写口令（含 API_SECRET 兜底）时必须携带有效 Bearer；
+  //    D1 查询异常且环境变量也未配置任何口令时必须 fail-closed 返回 503，绝不退化为免密放行；
   //    缺失或错误统一返回 401 { error: "Unauthorized", needToken: true }，与前端弹密逻辑对齐。
-  const activeToken = await getActiveWriteToken(c).catch(() => "");
+  let activeToken = "";
+  try {
+    activeToken = await getActiveWriteToken(c);
+  } catch {
+    const fallbackToken = String(c.env.COOKIE_WRITE_TOKEN || c.env.API_SECRET || "").trim();
+    if (!fallbackToken) {
+      return c.json({ error: "Auth storage unavailable" }, 503);
+    }
+    activeToken = fallbackToken;
+  }
   if (activeToken) {
     if (!(await hasApiCredential(c))) {
       return c.json({ error: "Unauthorized", needToken: true }, 401);

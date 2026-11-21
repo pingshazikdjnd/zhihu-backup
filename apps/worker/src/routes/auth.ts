@@ -927,15 +927,20 @@ const ALWAYS_BLOCKED_HOSTS = new Set([
   "metadata"
 ]);
 
+/** 归一化 SSRF 检查用 host：小写、剥离 IPv6 方括号及域名尾点 */
+function normalizeHostForSsrf(host: string): string {
+  return host.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+}
+
 /** 是否为内网 / 回环 / 链路本地地址（不含元数据判断）。 */
 export function isPrivateOrLoopbackHost(host: string): boolean {
-  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  const h = normalizeHostForSsrf(host);
   if (h === "localhost" || h.endsWith(".localhost")) return true;
   // IPv6 字面量必须带冒号：否则 "fc-xxx.turso.io" 这类正常域名会被误判为 fc00::/7
   if (h.includes(":")) {
     if (h === "::1" || h === "::") return true;
     if (/^::ffff:/i.test(h)) return true;
-    if (/^(fc|fd|fe80)/.test(h)) return true;
+    if (/^(fc|fd|fe[89ab]|64:ff9b:)/.test(h)) return true;
   }
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
   if (!m) return false;
@@ -977,7 +982,7 @@ function validateExternalTargetUrl(c: any, rawUrl: string): string | null {
   if (parsed.username || parsed.password) {
     return "连接地址不能包含账号密码，请把凭据填写到访问凭据( authToken )中";
   }
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const host = normalizeHostForSsrf(parsed.hostname);
   if (ALWAYS_BLOCKED_HOSTS.has(host)) {
     return "不允许访问云元数据或链路本地地址";
   }
@@ -1003,6 +1008,7 @@ export type WriteTokenSource = "db" | "env" | "api_secret" | "none";
 export async function getActiveWriteTokenInfo(
   c: any
 ): Promise<{ token: string; source: WriteTokenSource }> {
+  let dbError: unknown = null;
   try {
     const row = await db.prepare(
       `SELECT value FROM app_settings WHERE key = ?`
@@ -1010,13 +1016,16 @@ export async function getActiveWriteTokenInfo(
     if (row?.value && row.value.trim()) {
       return { token: row.value.trim(), source: "db" };
     }
-  } catch {
-    // 忽略表未就绪
+  } catch (err) {
+    dbError = err;
   }
   const envToken = String(c.env.COOKIE_WRITE_TOKEN || "").trim();
   if (envToken) return { token: envToken, source: "env" };
   const apiSecret = String(c.env.API_SECRET || "").trim();
   if (apiSecret) return { token: apiSecret, source: "api_secret" };
+  if (dbError !== null) {
+    throw new Error("Auth storage unavailable");
+  }
   return { token: "", source: "none" };
 }
 
@@ -1029,7 +1038,7 @@ export async function getActiveWriteToken(c: any): Promise<string> {
  * - 必须携带 `Authorization: Bearer <token>`，不存在「仅 Origin 免密」分支；
  * - 带了 Origin 就必须命中白名单（CLI 无 Origin 时凭口令即可）；
  * - 依次接受 API_SECRET / 写入口令（D1 在线设置 > COOKIE_WRITE_TOKEN > API_SECRET）；
- * - 连 API_SECRET 都没配的空环境直接拒绝，绝不默认放行。
+ * - 连 API_SECRET 都没配的空环境或 D1 不可用且无 env 兜底时直接拒绝，绝不默认放行。
  */
 export async function authorizeWrite(c: any): Promise<{ ok: boolean }> {
   const apiSecret = c.env.API_SECRET;
@@ -1042,7 +1051,12 @@ export async function authorizeWrite(c: any): Promise<{ ok: boolean }> {
 
   if (apiSecret && auth === `Bearer ${apiSecret}`) return { ok: true };
 
-  const writeToken = await getActiveWriteToken(c);
+  let writeToken = "";
+  try {
+    writeToken = await getActiveWriteToken(c);
+  } catch {
+    return { ok: false };
+  }
   if (!writeToken) return { ok: false };
 
   return { ok: auth === `Bearer ${writeToken}` };
@@ -1056,8 +1070,12 @@ export const NO_WRITE_TOKEN_HINT =
  * 给出「先去设置页初始化操作密码」的可操作提示，而不是含糊的「密码错误」。
  */
 async function denyWrite(c: any, fallback: string) {
-  const token = await getActiveWriteToken(c);
-  return c.json({ error: token ? fallback : NO_WRITE_TOKEN_HINT, needToken: true }, 401);
+  try {
+    const token = await getActiveWriteToken(c);
+    return c.json({ error: token ? fallback : NO_WRITE_TOKEN_HINT, needToken: true }, 401);
+  } catch {
+    return c.json({ error: "Auth storage unavailable" }, 503);
+  }
 }
 
 /**
@@ -1118,7 +1136,12 @@ authRoutes.post("/write-token", async c => {
     return c.json({ error: "新密码长度需在 4 到 128 个字符之间" }, 400);
   }
 
-  const activeToken = await getActiveWriteToken(c);
+  let activeToken = "";
+  try {
+    activeToken = await getActiveWriteToken(c);
+  } catch {
+    return c.json({ error: "Auth storage unavailable" }, 503);
+  }
   const auth = c.req.header("authorization") || "";
   const hasApiSecret = Boolean(c.env.API_SECRET && auth === `Bearer ${c.env.API_SECRET}`);
   // 环境变量口令作为应急恢复主钥：D1 里的口令被写坏/忘记时可从 env 恢复
@@ -1233,7 +1256,13 @@ authRoutes.get("/zhihu-status", async c => {
     if (!Number.isNaN(t)) ageHours = Math.round((Date.now() - t) / 3600_000);
   }
 
-  const activeTokenInfo = await getActiveWriteTokenInfo(c);
+  let activeTokenInfo: { token: string; source: WriteTokenSource };
+  try {
+    activeTokenInfo = await getActiveWriteTokenInfo(c);
+  } catch (e) {
+    console.error("read write token failed (migration applied?):", e);
+    activeTokenInfo = { token: "", source: "none" };
+  }
   const syncConfig = await getSyncConfig(c.env.BUCKET);
   // 环境变量注入的 Key 同样算「已配置」，但明文永不回传：只暴露 hasFallbackAiKey
   const hasFallbackAiKey =
@@ -1624,6 +1653,9 @@ authRoutes.post("/external-targets/test", async c => {
       if (res && res.ok) {
         testOk = true;
         testMsg = `HTTP 连通成功 (响应码 ${res.status})`;
+      } else if (res && res.status >= 300 && res.status < 400) {
+        testOk = false;
+        testMsg = `目标返回重定向 (HTTP ${res.status})，出于安全策略已禁止自动跟随`;
       } else if (res && res.status < 500) {
         testOk = false;
         testMsg = `目标返回客户端错误 (HTTP ${res.status})`;

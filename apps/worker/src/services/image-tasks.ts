@@ -29,7 +29,7 @@ export const IMAGE_TASK_BATCH_MAX_LIMIT = 100;
 /** ingest 响应后 waitUntil 顺手消化的任务数：小批量，控制在后台生命周期内 */
 export const IMAGE_TASK_INGEST_KICK_LIMIT = 4;
 /** 一次后台 drain 最多消化多少条（含重试），避免单个 isolate 超子请求上限或被积压拖住 */
-const IMAGE_TASK_KICK_TOTAL_LIMIT = 8;
+const IMAGE_TASK_KICK_TOTAL_LIMIT = 4;
 
 const MAX_IMAGE_TASK_ATTEMPTS = 3;
 const PROCESSING_STALE_MS = 10 * 60 * 1000;
@@ -145,32 +145,34 @@ async function claimImageTasks(limit: number): Promise<ImageTaskRow[]> {
 
   const claimed: ImageTaskRow[] = [];
   for (let i = 0; i < candidates.length; i++) {
-    if (Number(results?.[i]?.meta?.changes ?? 0) > 0) claimed.push(candidates[i]);
+    if (Number(results?.[i]?.meta?.changes ?? 0) > 0) {
+      claimed.push({ ...candidates[i], updated_at: now });
+    }
   }
   return claimed;
 }
 
-function markTaskDone(id: number, updatedAt: string): unknown {
+function markTaskDone(id: number, updatedAt: string, claimedAt: string): unknown {
   return db.prepare(
-    `UPDATE image_tasks SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?`
-  ).raw(updatedAt, id);
+    `UPDATE image_tasks SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ? AND status = 'processing' AND updated_at = ?`
+  ).raw(updatedAt, id, claimedAt);
 }
 
-function markTaskRetry(id: number, updatedAt: string): unknown {
+function markTaskRetry(id: number, updatedAt: string, claimedAt: string): unknown {
   return db.prepare(
-    `UPDATE image_tasks SET status = 'pending', updated_at = ? WHERE id = ?`
-  ).raw(updatedAt, id);
+    `UPDATE image_tasks SET status = 'pending', updated_at = ? WHERE id = ? AND status = 'processing' AND updated_at = ?`
+  ).raw(updatedAt, id, claimedAt);
 }
 
-function markTaskFailed(id: number, message: string, updatedAt: string): unknown {
+function markTaskFailed(id: number, message: string, updatedAt: string, claimedAt: string): unknown {
   return db.prepare(
-    `UPDATE image_tasks SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?`
-  ).raw(message.slice(0, 500), updatedAt, id);
+    `UPDATE image_tasks SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ? AND status = 'processing' AND updated_at = ?`
+  ).raw(message.slice(0, 500), updatedAt, id, claimedAt);
 }
 
 /**
  * 消费一批图片任务：下载并写 R2，整批通过单次 db.batch 更新任务状态。
- * 单条失败只影响自己；批量层任何异常都不会外抛给调用方。
+ * 单条下载失败只影响自己；但末尾批量状态落库 db.batch 失败时清零统计并重抛异常。
  */
 export async function processImageBatch(
   bucket: R2Bucket,
@@ -196,16 +198,16 @@ export async function processImageBatch(
         const localPath = await localizeImage(row.image_url, bucket, quality);
         const now = new Date().toISOString();
         if (localPath) {
-          updateStmts.push(markTaskDone(row.id, now));
+          updateStmts.push(markTaskDone(row.id, now, row.updated_at));
           summary.done += 1;
           return;
         }
         // 领取时 attempts 已 +1，这里用 +1 后的值判断是否耗尽重试
         if (row.attempts + 1 >= MAX_IMAGE_TASK_ATTEMPTS) {
-          updateStmts.push(markTaskFailed(row.id, "download failed", now));
+          updateStmts.push(markTaskFailed(row.id, "download failed", now, row.updated_at));
           summary.failed += 1;
         } else {
-          updateStmts.push(markTaskRetry(row.id, now));
+          updateStmts.push(markTaskRetry(row.id, now, row.updated_at));
           summary.retry += 1;
         }
       } catch (err) {
@@ -214,10 +216,10 @@ export async function processImageBatch(
         const errMsg = err instanceof Error ? err.message : String(err || "download error");
         const now = new Date().toISOString();
         if (row.attempts + 1 >= MAX_IMAGE_TASK_ATTEMPTS) {
-          updateStmts.push(markTaskFailed(row.id, errMsg.slice(0, 200), now));
+          updateStmts.push(markTaskFailed(row.id, errMsg.slice(0, 200), now, row.updated_at));
           summary.failed += 1;
         } else {
-          updateStmts.push(markTaskRetry(row.id, now));
+          updateStmts.push(markTaskRetry(row.id, now, row.updated_at));
           summary.retry += 1;
         }
       }
@@ -228,7 +230,11 @@ export async function processImageBatch(
     try {
       await db.batch(updateStmts);
     } catch (err) {
+      summary.done = 0;
+      summary.failed = 0;
+      summary.retry = 0;
       warnTasks("batch status update failed", err);
+      throw err;
     }
   }
 

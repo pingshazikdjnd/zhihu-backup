@@ -180,7 +180,7 @@ class Hono {
   get(path, handler) { this.handlers.set("GET " + path, handler); return this }
   post(path, handler) { this.handlers.set("POST " + path, handler); return this }
   route() { return this }
-  async __call(method, path, { body, headers, url } = {}, env = {}) {
+  async __call(method, path, { body, headers, url, executionCtx } = {}, env = {}) {
     const handler = this.handlers.get(method + " " + path);
     if (!handler) throw new Error("no handler for " + method + " " + path);
     let status = 200;
@@ -189,6 +189,7 @@ class Hono {
     for (const [k, v] of Object.entries(headers || {})) lower[String(k).toLowerCase()] = v;
     const c = {
       env,
+      ...(executionCtx ? { executionCtx } : {}),
       req: {
         url: url || ("http://127.0.0.1/api/auth" + path),
         header: name => lower[String(name).toLowerCase()],
@@ -4257,5 +4258,305 @@ test("[P2-7] runAndRecord 写入 sync_runs 异常时必须立即释放 sync_lock
     await runWithDb(d1, () => sync.releaseSyncLock("next-owner"));
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("[P1-5] D1 读取 write_token 异常时必须 fail-closed：recommend /ai-assess 返回 503（有 env 时 401）且绝不调 AI", async () => {
+  const recommend = await loadTs(
+    path.join(workerSrc, "routes", "recommend.ts"),
+    new Map([["hono", honoMockUrl]])
+  );
+  const auth = workerModules.auth;
+  const brokenD1 = {
+    prepare() {
+      return {
+        bind: () => ({
+          first: async () => { throw new Error("D1 unavailable"); },
+          all: async () => { throw new Error("D1 unavailable"); },
+          run: async () => { throw new Error("D1 unavailable"); }
+        }),
+        first: async () => { throw new Error("D1 unavailable"); },
+        all: async () => { throw new Error("D1 unavailable"); },
+        run: async () => { throw new Error("D1 unavailable"); }
+      };
+    },
+    batch: async () => { throw new Error("D1 unavailable"); }
+  };
+
+  let aiCalls = 0;
+  const envNoSecret = {
+    ALLOWED_ORIGIN: "https://zhihu-backup.pages.dev",
+    AI: { async run() { aiCalls++; return { response: "bad" }; } }
+  };
+
+  // 1) 无 env 密钥且 D1 抛错：即使携带白名单 Origin，也必须 503 拒绝（绝不退化为免密调用 AI）
+  const res503 = await runWithDb(brokenD1, () =>
+    recommend.recommendRoutes.__call("POST", "/ai-assess", {
+      headers: { origin: "https://zhihu-backup.pages.dev" },
+      body: { pk: "answer:1" }
+    }, envNoSecret)
+  );
+  assert.equal(res503.status, 503);
+  assert.equal(res503.body.error, "Auth storage unavailable");
+  assert.equal(aiCalls, 0);
+
+  // 2) 有 env 兜底密钥且 D1 抛错：必须返回 401，绝不放行
+  const envWithToken = {
+    ...envNoSecret,
+    COOKIE_WRITE_TOKEN: "fallback-token"
+  };
+  const res401 = await runWithDb(brokenD1, () =>
+    recommend.recommendRoutes.__call("POST", "/ai-assess", {
+      headers: { origin: "https://zhihu-backup.pages.dev" },
+      body: { pk: "answer:1" }
+    }, envWithToken)
+  );
+  assert.equal(res401.status, 401);
+  assert.equal(aiCalls, 0);
+
+  // 3) auth.ts getActiveWriteTokenInfo 在 D1 抛错且无 env 密钥时显式抛错；POST /write-token 与 denyWrite 返回 503
+  await assert.rejects(
+    () => runWithDb(brokenD1, () => auth.getActiveWriteTokenInfo({ env: {} })),
+    /Auth storage unavailable/
+  );
+  const resetToken503 = await runWithDb(brokenD1, () =>
+    auth.authRoutes.__call("POST", "/write-token", {
+      url: "https://zhihu-backup.pages.dev/api/auth/write-token",
+      headers: { origin: "https://zhihu-backup.pages.dev" },
+      body: { newToken: "hacked-pass" }
+    }, { ALLOWED_ORIGIN: "https://zhihu-backup.pages.dev" })
+  );
+  assert.equal(resetToken503.status, 503);
+
+  const denyWrite503 = await runWithDb(brokenD1, () =>
+    auth.authRoutes.__call("POST", "/zhihu-cookie", {
+      url: "https://zhihu-backup.pages.dev/api/auth/zhihu-cookie",
+      headers: { origin: "https://zhihu-backup.pages.dev" },
+      body: { cookieString: "z_c0=abc" }
+    }, { ALLOWED_ORIGIN: "https://zhihu-backup.pages.dev" })
+  );
+  assert.equal(denyWrite503.status, 503);
+});
+
+test("[P2-7][P2-8] SSRF 尾点/IPv6/NAT64 与 3xx 重定向文案；非知乎头像保留 query", async () => {
+  const auth = workerModules.auth;
+  const { d1 } = createMemoryDb();
+
+  // P2-7: 域名尾点、RFC4291 fe80::/10 (fe81~febf)、NAT64 64:ff9b::/96
+  assert.equal(auth.isPrivateOrLoopbackHost("localhost."), true);
+  assert.equal(auth.isPrivateOrLoopbackHost("sub.localhost."), true);
+  assert.equal(auth.isPrivateOrLoopbackHost("169.254.169.254."), true);
+  assert.equal(auth.isPrivateOrLoopbackHost("fe81::1"), true);
+  assert.equal(auth.isPrivateOrLoopbackHost("[febf::1]"), true);
+  assert.equal(auth.isPrivateOrLoopbackHost("64:ff9b::127.0.0.1"), true);
+  assert.equal(auth.isPrivateOrLoopbackHost("[64:ff9b::7f00:1]"), true);
+  assert.equal(auth.isPrivateOrLoopbackHost("db.example.com."), false);
+
+  const env = { API_SECRET: "ssrf-2-secret" };
+  const headers = { authorization: "Bearer ssrf-2-secret" };
+  for (const badUrl of [
+    "http://169.254.169.254./latest/meta-data/",
+    "http://localhost./hook",
+    "http://[fe81::1]/hook",
+    "http://[64:ff9b::127.0.0.1]/hook"
+  ]) {
+    const res = await runWithDb(d1, () =>
+      auth.authRoutes.__call("POST", "/external-targets/test", {
+        url: "https://zhihu-backup.pages.dev/api/auth/external-targets/test",
+        headers,
+        body: { provider: "webhook", endpointUrl: badUrl }
+      }, env)
+    );
+    assert.equal(res.status, 400, `必须拦截 ${badUrl}`);
+  }
+
+  // 3xx 明确重定向拒绝文案（不得误报客户端错误）
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 302,
+    headers: new Headers({ location: "http://127.0.0.1/" }),
+    json: async () => ({}),
+    text: async () => ""
+  });
+  try {
+    const testRes = await runWithDb(d1, () =>
+      auth.authRoutes.__call("POST", "/external-targets/test", {
+        url: "https://zhihu-backup.pages.dev/api/auth/external-targets/test",
+        headers,
+        body: { provider: "webhook", endpointUrl: "https://public.example.com/hook" }
+      }, env)
+    );
+    assert.equal(testRes.status, 200);
+    assert.equal(testRes.body.ok, false);
+    assert.match(testRes.body.message, /重定向.*302/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  // P2-8: 非知乎图床保留 query 参数，知乎图床仍剥离 query
+  assert.equal(
+    hashModule.normalizeAvatarUrlForCompare("https://cdn.example.com/avatar.png?v=1"),
+    "https://cdn.example.com/avatar.png?v=1"
+  );
+  assert.equal(
+    hashModule.isAvatarUrlChanged(
+      "https://cdn.example.com/avatar.png?v=1",
+      "https://cdn.example.com/avatar.png?v=2"
+    ),
+    true
+  );
+  assert.equal(
+    hashModule.isAvatarUrlChanged(
+      "https://pic1.zhimg.com/v2-abc.jpg?source=1",
+      "https://picx.zhimg.com/v2-abc.jpg?source=2"
+    ),
+    false
+  );
+});
+
+test("[P1-8][P2-3] image-tasks 落库失败清零并重抛、路由 limit 钳制 <= 12、waitUntil 记日志不外抛、以及租约 Fencing", async () => {
+  const sharedIndexUrl = await moduleUrlFor(sharedIndexPath);
+  const ingest = await loadTs(
+    path.join(workerSrc, "routes", "ingest.ts"),
+    new Map([["hono", honoMockUrl], ["shared", sharedIndexUrl]])
+  );
+  workerModules.auth.invalidateExternalTargetsCache();
+  const originalFetch = globalThis.fetch;
+
+  try {
+    // 1) 末尾 db.batch 抛错时 processImageBatch 清零 summary 并重抛，POST /ingest/image-batch 透出异常
+    const { sqlite: s1, d1: d1_1 } = createMemoryDb();
+    seedContent(s1);
+    seedImageTask(s1, {
+      imageUrl: "https://picx.zhimg.com/p18-ok.jpg",
+      objectKey: `images/${"a".repeat(64)}.jpg`,
+      status: "pending",
+      attempts: 0,
+      updatedAt: NOW_ISO
+    });
+    const failStatusBatchD1 = {
+      prepare: sql => d1_1.prepare(sql),
+      batch: async stmts => {
+        if (stmts.some(st => /UPDATE image_tasks SET status = 'done'/i.test(st.sql))) {
+          throw new Error("simulated D1 write error");
+        }
+        return d1_1.batch(stmts);
+      }
+    };
+    const okBucket = {
+      async head() { return null; },
+      async get() { return null; },
+      async put() {},
+      async delete() {}
+    };
+    globalThis.fetch = async () =>
+      new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { "content-type": "image/jpeg", "content-length": "3" }
+      });
+
+    await assert.rejects(
+      () => runWithDb(failStatusBatchD1, () => imageTasksModule.processImageBatch(okBucket, 5)),
+      /simulated D1 write error/
+    );
+
+    // 路由 POST /ingest/image-batch 不吞异常（交由 app.onError 返回 500）
+    s1.prepare(`UPDATE image_tasks SET status = 'pending', updated_at = ?`).run(NOW_ISO);
+    await assert.rejects(
+      () => runWithDb(failStatusBatchD1, () =>
+        ingest.ingestRoutes.__call("POST", "/image-batch", {
+          headers: { authorization: "Bearer img-secret" },
+          body: { limit: 5 }
+        }, { DB: failStatusBatchD1, BUCKET: okBucket, API_SECRET: "img-secret" })
+      ),
+      /simulated D1 write error/
+    );
+
+    // 2) waitUntil 后台 drain：db.batch 失败时被 try/catch 记日志，不产生未捕获拒绝
+    const { d1: d1_2 } = createMemoryDb();
+    let drainHitError = false;
+    const failDrainD1 = {
+      prepare: sql => d1_2.prepare(sql),
+      batch: async stmts => {
+        if (stmts.some(st => /UPDATE image_tasks SET status = 'done'/i.test(st.sql))) {
+          drainHitError = true;
+          throw new Error("drain batch failed");
+        }
+        return d1_2.batch(stmts);
+      }
+    };
+    const waitUntilPromises = [];
+    const contentRes = await runWithDb(failDrainD1, () =>
+      ingest.ingestRoutes.__call("POST", "/content", {
+        headers: { authorization: "Bearer img-secret" },
+        executionCtx: { waitUntil: p => waitUntilPromises.push(p) },
+        body: {
+          sourceType: "answer",
+          sourceId: "drain-1",
+          title: "T",
+          sourceUrl: "https://www.zhihu.com/question/1/answer/drain-1",
+          contentHtml: `<p><img src="https://picx.zhimg.com/v2-drain1.jpg" /></p>`
+        }
+      }, { DB: failDrainD1, BUCKET: okBucket, API_SECRET: "img-secret" })
+    );
+    assert.equal(contentRes.status, 200);
+    assert.ok(waitUntilPromises.length >= 1, "必须触发 waitUntil 图片 drain");
+    await assert.doesNotReject(() => Promise.all(waitUntilPromises));
+    assert.equal(drainHitError, true, "后台 drain 确实触发并捕获了 db.batch 失败");
+
+    // 3) POST /ingest/image-batch 对超大 limit 使用 Math.min 钳制 <= 12，不返回 400
+    const { sqlite: s3, d1: d1_3 } = createMemoryDb();
+    seedContent(s3);
+    for (let i = 0; i < 15; i++) {
+      seedImageTask(s3, {
+        imageUrl: `https://picx.zhimg.com/clamp-${i}.jpg`,
+        objectKey: `images/${String(i).padStart(64, "b")}.jpg`,
+        status: "pending",
+        attempts: 0,
+        updatedAt: NOW_ISO
+      });
+    }
+    const clampRes = await runWithDb(d1_3, () =>
+      ingest.ingestRoutes.__call("POST", "/image-batch", {
+        headers: { authorization: "Bearer img-secret" },
+        body: { limit: 100 }
+      }, { DB: d1_3, BUCKET: okBucket, API_SECRET: "img-secret" })
+    );
+    assert.equal(clampRes.status, 200);
+    assert.equal(clampRes.body.claimed, 12, "路由 limit=100 必须被钳制到 <= 12");
+
+    // 4) [P2-3] 租约 Fencing：慢 Worker 回写时任务已被新 Worker 接管并置 done（updated_at 已变），
+    //    慢 Worker 的 markTaskFailed 绝不可覆盖 done 状态
+    const { sqlite: s4, d1: d1_4 } = createMemoryDb();
+    seedContent(s4);
+    const taskId = seedImageTask(s4, {
+      imageUrl: "https://picx.zhimg.com/fence.jpg",
+      objectKey: `images/${"c".repeat(64)}.jpg`,
+      status: "pending",
+      attempts: 2,
+      updatedAt: "2025-01-01T00:00:00.000Z"
+    });
+    const slowBucket = {
+      async head() { return null; },
+      async get() { return null; },
+      async put() {},
+      async delete() {}
+    };
+    globalThis.fetch = async () => {
+      // 模拟慢请求期间，新 Worker 已接管任务并标记为 done（刷新了 updated_at）
+      s4.prepare(`UPDATE image_tasks SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?`).run(
+        "2099-01-01T00:00:00.000Z",
+        taskId
+      );
+      return new Response("fail", { status: 500 });
+    };
+    await runWithDb(d1_4, () => imageTasksModule.processImageBatch(slowBucket, 1));
+    const fencedRow = s4.prepare(`SELECT status, updated_at FROM image_tasks WHERE id = ?`).get(taskId);
+    assert.equal(fencedRow.status, "done", "旧 Worker 不得用 failed 覆盖新 Worker 已落库的 done");
+    assert.equal(fencedRow.updated_at, "2099-01-01T00:00:00.000Z");
+  } finally {
+    globalThis.fetch = originalFetch;
+    workerModules.auth.invalidateExternalTargetsCache();
   }
 });
