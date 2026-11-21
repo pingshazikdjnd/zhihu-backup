@@ -2075,7 +2075,7 @@ test("R2 边缘缓存：命中 0 次 R2 读取，楼中楼写入/清空后 purge
     seedContent(sqlite);
     const commentBucket = makeBucket();
     const threadKey = "childcomments/r1.json";
-    const threadUrl = `https://r2-edge-cache.internal/${encodeURIComponent(threadKey)}`;
+    const threadUrl = `https://r2-edge-cache.internal/v2/${encodeURIComponent(threadKey)}`;
     await r2Cache.purgeR2EdgeCache(threadKey);
 
     const payload = (children) => ({
@@ -3179,7 +3179,7 @@ test("[P1-1] 楼中楼写路径跳过跨 isolate 旧缓存，读路径缩短为 
 
   try {
     const threadKey = "childcomments/r-p11.json";
-    const threadCacheUrl = `https://r2-edge-cache.internal/${encodeURIComponent(threadKey)}`;
+    const threadCacheUrl = `https://r2-edge-cache.internal/v2/${encodeURIComponent(threadKey)}`;
 
     // 1) 初始写入 1 条不完整子评论，并由读路径预热 30 秒边缘缓存 + 进程内缓存
     await runWithDb(d1, () =>
@@ -3253,7 +3253,7 @@ test("[P1-1] 楼中楼写路径跳过跨 isolate 旧缓存，读路径缩短为 
 
     // 3) 空线程校验同样绕过旧缓存：边缘缓存残留非空旧数据时，只要 R2 已是 complete-empty 就不重复 PUT
     const emptyKey = "childcomments/r-p11-empty.json";
-    const emptyUrl = `https://r2-edge-cache.internal/${encodeURIComponent(emptyKey)}`;
+    const emptyUrl = `https://r2-edge-cache.internal/v2/${encodeURIComponent(emptyKey)}`;
     r2Store.set(emptyKey, JSON.stringify({ children: [], complete: true }));
     edgeStore.set(emptyUrl, {
       body: JSON.stringify({ children: [{ id: "stale", content: "old" }], complete: false }),
@@ -4157,6 +4157,12 @@ test("[P2-5] 外部存储降级写 R2 按 updatedAt 择新不回滚；offload �
   };
 
   try {
+    // 迁移前主 D1 / 主 R2 已有 r-p25 的旧线程索引，切 offload 后空快照必须落墓碑防止回退复活
+    sqlite.prepare(`
+      INSERT INTO comment_threads (root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at)
+      VALUES ('r-p25', ?, 'childcomments/r-p25.json', 1, 1, 'old-h', 'old-in', '[]', ?)
+    `).run(CONTENT_PK, NOW_ISO);
+
     const emptyRootPayload = {
       contentPk: CONTENT_PK,
       partial: false,
@@ -4558,5 +4564,656 @@ test("[P1-8][P2-3] image-tasks 落库失败清零并重抛、路由 limit 钳制
   } finally {
     globalThis.fetch = originalFetch;
     workerModules.auth.invalidateExternalTargetsCache();
+  }
+});
+
+test("[P1-2][P2-2] cloudflare_d1 20 根批控制子请求 << 50 且单句绑定参数 <= 90；0 回复跳过墓碑；DDL 含 child_comment_blobs 索引", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+
+  const remoteSqlite = new Database(":memory:");
+  const d1Target = {
+    id: "ext-d1-batch",
+    name: "Cloudflare D1 Ext",
+    provider: "cloudflare_d1",
+    enabled: true,
+    syncScopes: ["comments"],
+    storageRole: "offload",
+    overflowThresholdRows: 1500000,
+    endpointUrl: "https://api.cloudflare.com",
+    databaseId: "acc1/db1",
+    authToken: "tok",
+    createdAt: NOW_ISO,
+    updatedAt: NOW_ISO
+  };
+  const bucket = {
+    async get(key) {
+      if (key === auth.R2_EXTERNAL_TARGETS_KEY) {
+        return { async text() { return JSON.stringify([d1Target]); } };
+      }
+      return null;
+    },
+    async put() {},
+    async delete() {}
+  };
+
+  let fetchCount = 0;
+  let maxParamsInSql = 0;
+  const recordedSqls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init = {}) => {
+    fetchCount++;
+    const body = JSON.parse(String(init.body));
+    const sql = body.sql;
+    const params = Array.isArray(body.params) ? body.params : [];
+    assert.ok(params.length <= 90, `单条远端 SQL 绑定参数 (${params.length}) 不得超过 90: ${sql.slice(0, 80)}`);
+    if (params.length > maxParamsInSql) maxParamsInSql = params.length;
+    recordedSqls.push({ sql, paramCount: params.length });
+
+    const st = remoteSqlite.prepare(sql);
+    if (st.reader) {
+      const results = st.all(...params);
+      return { ok: true, status: 200, json: async () => ({ success: true, result: [{ results, meta: { changes: 0 } }] }), text: async () => "" };
+    }
+    const info = st.run(...params);
+    return { ok: true, status: 200, json: async () => ({ success: true, result: [{ results: [], meta: { changes: info.changes } }] }), text: async () => "" };
+  };
+
+  try {
+    // 预热远端建表 DDL（验证 P2-2 索引已创建）
+    await auth.ensureRemoteCommentSchema(d1Target);
+    const indexes = remoteSqlite.prepare(`PRAGMA index_list('child_comment_blobs')`).all().map(r => r.name);
+    assert.ok(indexes.includes("idx_ext_child_comment_blobs_content"), "外部库必须建 idx_ext_child_comment_blobs_content 索引");
+
+    // 1) 20 条全新 0 回复根：跳过墓碑 + 多行合并写入，fetch << 50，不降级写主库
+    fetchCount = 0;
+    d1.writes.length = 0;
+    const zeroReplyRoots = Array.from({ length: 20 }, (_, i) => ({
+      id: `rz-${i}`,
+      author: `U${i}`,
+      authorAvatar: "",
+      content: `c${i}`,
+      img: "",
+      time: NOW_ISO,
+      location: "",
+      likes: i,
+      isAuthor: false,
+      isTop: false,
+      isFeatured: false,
+      childCount: 0,
+      isChildrenComplete: true,
+      children: []
+    }));
+    const resZero = await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        allRootIds: zeroReplyRoots.map(r => r.id),
+        roots: zeroReplyRoots
+      }, { DB: d1, BUCKET: bucket })
+    );
+    assert.equal(resZero.offloadedTo, "Cloudflare D1 Ext");
+    assert.equal(resZero.offloadedCounts.added, 20);
+    assert.ok(fetchCount < 15, `20 条全新 0 回复根 fetch 次数应远低于 50，实际=${fetchCount}`);
+    assert.equal(d1.writes.length, 0, "不得降级回写主 D1");
+    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM child_comment_blobs`).get().n, 0);
+    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads`).get().n, 0);
+
+    // 2) 20 条带子评论根（合并写入 blobs 与 threads）：fetch << 50 且所有 SQL 参数 <= 90
+    fetchCount = 0;
+    const childRoots = Array.from({ length: 20 }, (_, i) => ({
+      id: `rc-${i}`,
+      author: `U${i}`,
+      authorAvatar: "",
+      content: `c${i}`,
+      img: "",
+      time: NOW_ISO,
+      location: "",
+      likes: i,
+      isAuthor: false,
+      isTop: false,
+      isFeatured: false,
+      childCount: 1,
+      isChildrenComplete: true,
+      children: [{ id: `ch-${i}`, parentId: `rc-${i}`, author: "A", content: `reply-${i}`, likes: 1 }]
+    }));
+    const resChild = await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        allRootIds: [...zeroReplyRoots, ...childRoots].map(r => r.id),
+        roots: childRoots
+      }, { DB: d1, BUCKET: bucket })
+    );
+    assert.equal(resChild.offloadedCounts.added, 20);
+    assert.ok(fetchCount < 20, `20 条带子评论根 fetch 次数应远低于 50，实际=${fetchCount}`);
+    assert.ok(maxParamsInSql <= 90);
+    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM child_comment_blobs`).get().n, 20);
+    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads`).get().n, 20);
+
+    // 3) 20 条不完整子评论根：mergeRootIds 使用 IN (...) 批量查询，fetch << 50
+    fetchCount = 0;
+    const incompleteRoots = Array.from({ length: 20 }, (_, i) => ({
+      id: `rc-${i}`,
+      author: `U${i}`,
+      authorAvatar: "",
+      content: `c${i}`,
+      img: "",
+      time: NOW_ISO,
+      location: "",
+      likes: i,
+      isAuthor: false,
+      isTop: false,
+      isFeatured: false,
+      childCount: 2,
+      isChildrenComplete: false,
+      children: [{ id: `ch2-${i}`, parentId: `rc-${i}`, author: "B", content: `reply2-${i}`, likes: 2 }]
+    }));
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: true,
+        roots: incompleteRoots
+      }, { DB: d1, BUCKET: bucket })
+    );
+    assert.ok(fetchCount < 35, `20 条含计数更新的不完整合并 fetch 次数应远低于 50，实际=${fetchCount}`);
+    const sampleBlob = JSON.parse(
+      remoteSqlite.prepare(`SELECT payload_json FROM child_comment_blobs WHERE root_id = 'rc-0'`).get().payload_json
+    );
+    assert.deepEqual(sampleBlob.children.map(c => c.id), ["ch-0", "ch2-0"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
+
+test("[P1-6] offload 全量清零同步清理主 D1 残留评论/线程与主 R2 旧对象，杜绝回退复活", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+
+  // 1) 迁移前：主 D1 与主 R2 已有旧根评论、旧扁平子评论与 comment_threads/R2 对象
+  const mainThreadKey = "childcomments/r-main-legacy.json";
+  const r2Store = new Map([
+    [mainThreadKey, JSON.stringify({ children: [{ id: "old_r2_child", content: "from main R2" }], complete: true })]
+  ]);
+  const bucket = {
+    async get(key) {
+      const val = r2Store.get(key);
+      return val === undefined ? null : { async text() { return val; } };
+    },
+    async put(key, val) { r2Store.set(key, String(val)); },
+    async delete(key) {
+      if (Array.isArray(key)) {
+        for (const k of key) r2Store.delete(k);
+      } else {
+        r2Store.delete(key);
+      }
+    }
+  };
+  sqlite.prepare(`
+    INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+    VALUES ('r-main-legacy', ?, NULL, 'OldRoot', 'root', 1, 'h1', ?, ?, 0),
+           ('ch-main-legacy', ?, 'r-main-legacy', 'OldChild', 'child', 1, 'h2', ?, ?, 0)
+  `).run(CONTENT_PK, NOW_ISO, NOW_ISO, CONTENT_PK, NOW_ISO, NOW_ISO);
+  sqlite.prepare(`
+    INSERT INTO comment_threads (root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at)
+    VALUES ('r-main-legacy', ?, ?, 1, 1, 'th', 'ih', '[]', ?)
+  `).run(CONTENT_PK, mainThreadKey, NOW_ISO);
+
+  // 2) 启用 offload 后先写入远端一条新根，再提交全量清零
+  const remoteSqlite = new Database(":memory:");
+  const offloadTarget = {
+    id: "ext-p16",
+    name: "Turso P16",
+    provider: "turso",
+    enabled: true,
+    syncScopes: ["comments"],
+    storageRole: "offload",
+    overflowThresholdRows: 1500000,
+    endpointUrl: "https://ext-p16.example.com",
+    authToken: "tok",
+    createdAt: NOW_ISO,
+    updatedAt: NOW_ISO
+  };
+  r2Store.set(auth.R2_EXTERNAL_TARGETS_KEY, JSON.stringify([offloadTarget]));
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init = {}) => {
+    const body = JSON.parse(String(init.body));
+    const results = [];
+    for (const req of body.requests) {
+      if (req.type === "close") {
+        results.push({ type: "ok", response: { type: "close" } });
+        continue;
+      }
+      const sql = req.stmt.sql;
+      const args = (req.stmt.args || []).map(a => (!a || a.type === "null") ? null : (a.type === "integer" || a.type === "float") ? Number(a.value) : String(a.value));
+      const st = remoteSqlite.prepare(sql);
+      if (st.reader) {
+        const cols = st.columns().map(c => ({ name: c.name }));
+        const rows = st.all(...args).map(r => cols.map(c => tursoCell(r[c.name])));
+        results.push({ type: "ok", response: { type: "execute", result: { cols, rows, affected_row_count: 0, last_insert_rowid: null } } });
+      } else {
+        const info = st.run(...args);
+        results.push({ type: "ok", response: { type: "execute", result: { cols: [], rows: [], affected_row_count: info.changes, last_insert_rowid: null } } });
+      }
+    }
+    return { ok: true, status: 200, json: async () => ({ results }), text: async () => "" };
+  };
+
+  try {
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        allRootIds: ["r-ext"],
+        roots: [{
+          id: "r-ext",
+          author: "Ext",
+          authorAvatar: "",
+          content: "ext",
+          img: "",
+          time: NOW_ISO,
+          location: "",
+          likes: 2,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 1,
+          isChildrenComplete: true,
+          children: [{ id: "ch-ext", parentId: "r-ext", author: "C", content: "ext child", likes: 1 }]
+        }]
+      }, { DB: d1, BUCKET: bucket })
+    );
+
+    // 提交全量清零
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        allRootIds: [],
+        roots: []
+      }, { DB: d1, BUCKET: bucket })
+    );
+
+    assert.equal(r2Store.has(mainThreadKey), false, "主 R2 旧楼中楼对象必须已删除");
+    assert.equal(sqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n, 0);
+    assert.equal(sqlite.prepare(`SELECT COUNT(*) AS n FROM comments WHERE content_pk = ? AND is_deleted = 0`).get(CONTENT_PK).n, 0);
+    assert.equal(sqlite.prepare(`SELECT comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).comment_count, 0);
+    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM child_comment_blobs WHERE content_pk = ?`).get(CONTENT_PK).n, 0);
+    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n, 0);
+    assert.deepEqual(await runWithDb(d1, () => commentsModule.getChildComments(bucket, "r-main-legacy", d1)), []);
+    assert.deepEqual(await runWithDb(d1, () => commentsModule.listRootComments(d1, CONTENT_PK, {}, bucket)), []);
+  } finally {
+    globalThis.fetch = originalFetch;
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
+
+test("[P1-3][P2-1] R2 批量删失败保留 comment_threads 行、部分成功按 <=90 参数分块删，以及 childcomments /v2/ 边缘缓存升版", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  workerModules.auth.invalidateExternalTargetsCache();
+
+  // 1) 20 个线程清零时 bucket.delete(batch) 抛错 -> 必须保留全部 20 行 comment_threads 供重试
+  const r2Store = new Map();
+  for (let i = 0; i < 20; i++) {
+    const rid = `r-fail-${i}`;
+    r2Store.set(`childcomments/${rid}.json`, JSON.stringify({ children: [{ id: `c-${i}` }], complete: true }));
+    sqlite.prepare(`
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+      VALUES (?, ?, NULL, 'U', 'text', 1, 'h', ?, ?, 0)
+    `).run(rid, CONTENT_PK, NOW_ISO, NOW_ISO);
+    sqlite.prepare(`
+      INSERT INTO comment_threads (root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at)
+      VALUES (?, ?, ?, 1, 1, 'th', 'ih', '[]', ?)
+    `).run(rid, CONTENT_PK, `childcomments/${rid}.json`, NOW_ISO);
+  }
+  const failingBucket = {
+    async get(k) { const v = r2Store.get(k); return v === undefined ? null : { async text() { return v; } }; },
+    async put(k, v) { r2Store.set(k, String(v)); },
+    async delete() { throw new Error("R2 bulk delete error"); }
+  };
+  await runWithDb(d1, () =>
+    commentsModule.replaceCommentsByRoot({ contentPk: CONTENT_PK, partial: false, allRootIds: [], roots: [] }, { DB: d1, BUCKET: failingBucket })
+  );
+  assert.equal(
+    sqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n,
+    20,
+    "R2 批量删除失败时绝不可删除 comment_threads 索引行"
+  );
+
+  // 2) 部分成功（1015 个线程，首批 1000 成功、次批 15 > 10 失败不回退逐条删）-> 仅删 1000 个成功项，且 IN (...) SQL 参数严格 <= 90
+  const { sqlite: s2, d1: d1_2 } = createMemoryDb();
+  seedContent(s2);
+  const insertRootStmt = s2.prepare(`
+    INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+    VALUES (?, ?, NULL, 'U', 'text', 1, 'h', ?, ?, 0)
+  `);
+  const insertThreadStmt = s2.prepare(`
+    INSERT INTO comment_threads (root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at)
+    VALUES (?, ?, ?, 1, 1, 'th', 'ih', '[]', ?)
+  `);
+  s2.transaction(() => {
+    for (let i = 0; i < 1015; i++) {
+      const rid = `r-chunk-${i}`;
+      insertRootStmt.run(rid, CONTENT_PK, NOW_ISO, NOW_ISO);
+      insertThreadStmt.run(rid, CONTENT_PK, `childcomments/${rid}.json`, NOW_ISO);
+    }
+  })();
+
+  let delBatchIdx = 0;
+  const partialFailBucket = {
+    async get() { return null; },
+    async put() {},
+    async delete(keys) {
+      delBatchIdx++;
+      if (Array.isArray(keys) && delBatchIdx === 2) {
+        throw new Error("second R2 batch failed");
+      }
+    }
+  };
+  const threadDeleteParamCounts = [];
+  const wrappedD1 = {
+    prepare(sql) {
+      const stmt = d1_2.prepare(sql);
+      if (/DELETE FROM comment_threads/i.test(sql)) {
+        return {
+          bind(...params) {
+            threadDeleteParamCounts.push(params.length);
+            assert.ok(params.length <= 90, `IN 删除语句参数数 (${params.length}) 必须 <= 90`);
+            return stmt.bind(...params);
+          }
+        };
+      }
+      return stmt;
+    },
+    batch: stmts => d1_2.batch(stmts)
+  };
+  await runWithDb(wrappedD1, () =>
+    commentsModule.replaceCommentsByRoot({ contentPk: CONTENT_PK, partial: false, allRootIds: [], roots: [] }, { DB: wrappedD1, BUCKET: partialFailBucket })
+  );
+  assert.ok(threadDeleteParamCounts.length >= 12, "1000 个成功 root_id 必须按 <= 89 块分片删除");
+  assert.equal(Math.max(...threadDeleteParamCounts), 90);
+  assert.equal(
+    s2.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n,
+    15,
+    "仅 R2 删除失败的那 15 行线程索引应保留"
+  );
+
+  // 3) P2-1: childcomments/* 边缘缓存 URL 必须带 /v2/ 前缀（自然淘汰旧 86400s 缓存）
+  const edgeStore = new Map();
+  const originalCaches = globalThis.caches;
+  globalThis.caches = {
+    default: {
+      async match(url) { const hit = edgeStore.get(String(url)); return hit ? new Response(hit) : undefined; },
+      async put(url, res) { edgeStore.set(String(url), await res.text()); },
+      async delete(url) { edgeStore.delete(String(url)); }
+    }
+  };
+  try {
+    const v2Key = "childcomments/r-v2-check.json";
+    const v2Bucket = {
+      async get(k) {
+        if (k === v2Key) return { async text() { return JSON.stringify({ children: [{ id: "cv2", content: "hi" }], complete: true }); } };
+        return null;
+      }
+    };
+    await runWithDb(d1, () => commentsModule.getChildComments(v2Bucket, "r-v2-check", d1));
+    assert.equal(edgeStore.has(`https://r2-edge-cache.internal/v2/${encodeURIComponent(v2Key)}`), true);
+    assert.equal(edgeStore.has(`https://r2-edge-cache.internal/${encodeURIComponent(v2Key)}`), false);
+  } finally {
+    if (originalCaches === undefined) delete globalThis.caches;
+    else globalThis.caches = originalCaches;
+  }
+});
+
+test("[P2-4] 闭评三态 is_complete=2：主库与外部库保留历史楼中楼、不被后续增量同步降级回 0、可正常恢复为 1", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+
+  // 1) 主 D1 + R2 路径：既有历史楼中楼 ch_old，随后遇闭评上报 ch_new + isChildrenClosed: true
+  const r2Store = new Map([
+    ["childcomments/r-closed.json", JSON.stringify({ children: [{ id: "ch_old", parentId: "r-closed", author: "Old", content: "old", likes: 1 }], complete: false })]
+  ]);
+  const mainBucket = {
+    async get(k) { const v = r2Store.get(k); return v === undefined ? null : { async text() { return v; } }; },
+    async put(k, v) { r2Store.set(k, String(v)); },
+    async delete(k) { r2Store.delete(k); }
+  };
+  await runWithDb(d1, () =>
+    commentsModule.replaceCommentsByRoot({
+      contentPk: CONTENT_PK,
+      partial: false,
+      allRootIds: ["r-closed", "r-closed-noinline"],
+      roots: [
+        {
+          id: "r-closed",
+          author: "Root",
+          authorAvatar: "",
+          content: "root",
+          img: "",
+          time: NOW_ISO,
+          location: "",
+          likes: 5,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 3,
+          isChildrenComplete: false,
+          isChildrenClosed: true,
+          children: [{ id: "ch_new", parentId: "r-closed", author: "New", content: "new", likes: 2 }]
+        },
+        {
+          id: "r-closed-noinline",
+          author: "Root2",
+          authorAvatar: "",
+          content: "root2",
+          img: "",
+          time: NOW_ISO,
+          location: "",
+          likes: 3,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 4,
+          isChildrenComplete: false,
+          isChildrenClosed: true,
+          children: []
+        }
+      ]
+    }, { DB: d1, BUCKET: mainBucket })
+  );
+
+  const mergedR2 = JSON.parse(r2Store.get("childcomments/r-closed.json"));
+  assert.deepEqual(mergedR2.children.map(c => c.id), ["ch_old", "ch_new"], "闭评必须保留并合并历史楼中楼");
+  assert.equal(sqlite.prepare(`SELECT is_complete FROM comment_threads WHERE root_id = 'r-closed'`).get().is_complete, 2);
+  assert.equal(sqlite.prepare(`SELECT is_complete FROM comment_threads WHERE root_id = 'r-closed-noinline'`).get().is_complete, 2);
+
+  // 后续 hot / 增量同步（跳过子评论：isChildrenComplete=false 且不带 isChildrenClosed）绝不可把 2 降级回 0
+  await runWithDb(d1, () =>
+    commentsModule.replaceCommentsByRoot({
+      contentPk: CONTENT_PK,
+      partial: true,
+      roots: [
+        {
+          id: "r-closed",
+          author: "Root",
+          authorAvatar: "",
+          content: "root",
+          img: "",
+          time: NOW_ISO,
+          location: "",
+          likes: 6,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 3,
+          isChildrenComplete: false,
+          children: [{ id: "ch_new", parentId: "r-closed", author: "New", content: "new", likes: 2 }]
+        },
+        {
+          id: "r-closed-noinline",
+          author: "Root2",
+          authorAvatar: "",
+          content: "root2",
+          img: "",
+          time: NOW_ISO,
+          location: "",
+          likes: 3,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 5,
+          isChildrenComplete: false,
+          children: []
+        }
+      ]
+    }, { DB: d1, BUCKET: mainBucket })
+  );
+  assert.equal(sqlite.prepare(`SELECT is_complete FROM comment_threads WHERE root_id = 'r-closed'`).get().is_complete, 2, "有内联子评的后续增量同步不得降级 is_complete=2");
+  assert.equal(sqlite.prepare(`SELECT is_complete FROM comment_threads WHERE root_id = 'r-closed-noinline'`).get().is_complete, 2, "无内联子评的后续增量同步不得降级 is_complete=2");
+
+  // 后续评论区重开并抓全时，可正常升回 1
+  await runWithDb(d1, () =>
+    commentsModule.replaceCommentsByRoot({
+      contentPk: CONTENT_PK,
+      partial: false,
+      allRootIds: ["r-closed", "r-closed-noinline"],
+      roots: [{
+        id: "r-closed",
+        author: "Root",
+        authorAvatar: "",
+        content: "root",
+        img: "",
+        time: NOW_ISO,
+        location: "",
+        likes: 6,
+        isAuthor: false,
+        isTop: false,
+        isFeatured: false,
+        childCount: 2,
+        isChildrenComplete: true,
+        children: [
+          { id: "ch_old", parentId: "r-closed", author: "Old", content: "old", likes: 1 },
+          { id: "ch_new", parentId: "r-closed", author: "New", content: "new", likes: 2 }
+        ]
+      }]
+    }, { DB: d1, BUCKET: mainBucket })
+  );
+  assert.equal(sqlite.prepare(`SELECT is_complete FROM comment_threads WHERE root_id = 'r-closed'`).get().is_complete, 1);
+
+  // 2) 外部 offload 库对称支持 is_complete = 2 且不被后续增量同步降级回 0
+  const remoteSqlite = new Database(":memory:");
+  const offloadTarget = {
+    id: "ext-p24",
+    name: "Turso P24",
+    provider: "turso",
+    enabled: true,
+    syncScopes: ["comments"],
+    storageRole: "offload",
+    overflowThresholdRows: 1500000,
+    endpointUrl: "https://ext-p24.example.com",
+    authToken: "tok",
+    createdAt: NOW_ISO,
+    updatedAt: NOW_ISO
+  };
+  r2Store.set(auth.R2_EXTERNAL_TARGETS_KEY, JSON.stringify([offloadTarget]));
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init = {}) => {
+    const body = JSON.parse(String(init.body));
+    const results = [];
+    for (const req of body.requests) {
+      if (req.type === "close") { results.push({ type: "ok", response: { type: "close" } }); continue; }
+      const sql = req.stmt.sql;
+      const args = (req.stmt.args || []).map(a => (!a || a.type === "null") ? null : (a.type === "integer" || a.type === "float") ? Number(a.value) : String(a.value));
+      const st = remoteSqlite.prepare(sql);
+      if (st.reader) {
+        const cols = st.columns().map(c => ({ name: c.name }));
+        const rows = st.all(...args).map(r => cols.map(c => tursoCell(r[c.name])));
+        results.push({ type: "ok", response: { type: "execute", result: { cols, rows, affected_row_count: 0, last_insert_rowid: null } } });
+      } else {
+        const info = st.run(...args);
+        results.push({ type: "ok", response: { type: "execute", result: { cols: [], rows: [], affected_row_count: info.changes, last_insert_rowid: null } } });
+      }
+    }
+    return { ok: true, status: 200, json: async () => ({ results }), text: async () => "" };
+  };
+
+  try {
+    await auth.ensureRemoteCommentSchema(offloadTarget);
+    remoteSqlite.prepare(`
+      INSERT INTO child_comment_blobs (root_id, content_pk, payload_json, complete, updated_at)
+      VALUES ('r-ext-closed', ?, ?, 0, ?)
+    `).run(CONTENT_PK, JSON.stringify({ children: [{ id: "ch_ext_old", parentId: "r-ext-closed", author: "A", content: "old", likes: 1 }], complete: false }), NOW_ISO);
+
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        allRootIds: ["r-ext-closed"],
+        roots: [{
+          id: "r-ext-closed",
+          author: "ExtRoot",
+          authorAvatar: "",
+          content: "ext",
+          img: "",
+          time: NOW_ISO,
+          location: "",
+          likes: 1,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 3,
+          isChildrenComplete: false,
+          isChildrenClosed: true,
+          children: [{ id: "ch_ext_new", parentId: "r-ext-closed", author: "B", content: "new", likes: 1 }]
+        }]
+      }, { DB: d1, BUCKET: mainBucket })
+    );
+    const extBlob = JSON.parse(remoteSqlite.prepare(`SELECT payload_json FROM child_comment_blobs WHERE root_id = 'r-ext-closed'`).get().payload_json);
+    assert.deepEqual(extBlob.children.map(c => c.id), ["ch_ext_old", "ch_ext_new"]);
+    assert.equal(remoteSqlite.prepare(`SELECT is_complete FROM comment_threads WHERE root_id = 'r-ext-closed'`).get().is_complete, 2);
+
+    // 外部库后续增量同步（无 isChildrenClosed）绝不降级回 0
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: true,
+        roots: [{
+          id: "r-ext-closed",
+          author: "ExtRoot",
+          authorAvatar: "",
+          content: "ext",
+          img: "",
+          time: NOW_ISO,
+          location: "",
+          likes: 2,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 3,
+          isChildrenComplete: false,
+          children: [{ id: "ch_ext_new", parentId: "r-ext-closed", author: "B", content: "new", likes: 1 }]
+        }]
+      }, { DB: d1, BUCKET: mainBucket })
+    );
+    assert.equal(remoteSqlite.prepare(`SELECT is_complete FROM comment_threads WHERE root_id = 'r-ext-closed'`).get().is_complete, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
   }
 });

@@ -1219,8 +1219,8 @@ test("crawler 与补抓脚本统一过滤无效 question.id 并处理楼中楼�
   assert.match(childLoop, /\/已关闭评论\/\.test\(errMsg\)/);
   assert.match(childLoop, /if \(!chIsEnd\) cIncomplete = true;/);
 
-  // 1) fetchStoredCommentState + shouldSyncCommentsDeep：0 子评论根与足够评论总量不反复重抓
-  assert.match(crawlerSrc, /Number\(row\.child_count\) > 0 && Number\(row\.is_complete \?\? 0\) !== 1/);
+  // 1) fetchStoredCommentState + shouldSyncCommentsDeep：0 子评论根、闭评冻结(is_complete=2)与足够评论总量不反复重抓
+  assert.match(crawlerSrc, /Number\(row\.child_count\) > 0 && Number\(row\.is_complete \?\? 0\) === 0/);
   assert.match(crawlerSrc, /if \(state\.storedComments >= expected\) return false;/);
 
   // 2) postCommentsByRoot 只因 circuitBroken 中断（含空 roots 全量对账），不在 riskExhausted 时丢弃内存已抓批次
@@ -1436,10 +1436,67 @@ test("[P1-7] run-comment-repair scanCandidates 不得因已软删根或未抓全
     }
     db.prepare("INSERT INTO comment_threads VALUES ('r3-1', 'answer:3', 25, 1)").run();
 
+    // 场景 D [P2-4]：闭评冻结（5 条有效根 + is_complete=2 的 25 条子评论 >= 30，无未完成线程）→ 应跳过不再重抓
+    db.prepare("INSERT INTO contents VALUES ('answer:4', 'answer', 30, 0)").run();
+    for (let i = 1; i <= 5; i++) {
+      db.prepare("INSERT INTO comments VALUES (?, 'answer:4', NULL, 0)").run(`r4-${i}`);
+    }
+    db.prepare("INSERT INTO comment_threads VALUES ('r4-1', 'answer:4', 25, 2)").run();
+
     const scan = scanCandidates(db);
-    assert.equal(scan.skippedAlreadyComplete, 1, "仅真正完整的内容才应被跳过");
+    assert.equal(scan.skippedAlreadyComplete, 2, "真正完整与闭评冻结(is_complete=2)的内容都应被跳过");
     assert.deepEqual(Array.from(scan.targets, t => t.pk), ["answer:1", "answer:2"]);
   } finally {
     db.close();
   }
+});
+
+test("[P2-4] crawler fetchStoredCommentState / shouldSyncCommentsDeep 对 is_complete=2 不触发重复补抓", async () => {
+  const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");
+  assert.equal((crawlerSrc.match(/toRootCommentGroup\(c, children, childrenComplete, childrenClosed\)/g) || []).length, 2);
+
+  // 用 TypeScript transpile 剥离类型注解后再在 vm 执行 fetchStoredCommentState + shouldSyncCommentsDeep
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const crawlerRequire = createRequire(path.join(ROOT, "apps", "apify-crawler", "package.json"));
+  const tsMod = await import(pathToFileURL(crawlerRequire.resolve("typescript")).href);
+  const ts = tsMod.default ?? tsMod;
+  const crawlerJs = ts.transpileModule(crawlerSrc, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+  }).outputText;
+
+  const fnBlock = [
+    extractFunction(crawlerJs, "shouldSyncComments"),
+    extractFunction(crawlerJs, "isStoredRootCommentRow"),
+    "async " + extractFunction(crawlerJs, "fetchStoredCommentState"),
+    "async " + extractFunction(crawlerJs, "shouldSyncCommentsDeep")
+  ].join("\n");
+
+  let returnedRows = [];
+  const ctx = vm.createContext({
+    apiUrl: "https://worker.example",
+    apiSecret: "sec",
+    commentSyncIncomplete: new Set(),
+    fetch: async () => ({
+      ok: true,
+      json: async () => ({ data: returnedRows })
+    })
+  });
+  vm.runInContext(`${fnBlock}\nglobalThis.__state = fetchStoredCommentState;\nglobalThis.__deep = shouldSyncCommentsDeep;`, ctx);
+
+  // 1) is_complete = 2 视为已冻结：incompleteRoots = 0，且 storedComments 包含已知子评数
+  returnedRows = [
+    { child_count: 10, is_complete: 2 },
+    { child_count: 5, is_complete: 1 }
+  ];
+  const frozenState = await ctx.__state("answer:p24");
+  assert.equal(frozenState.incompleteRoots, 0, "is_complete=2 不得计入 incompleteRoots");
+  assert.equal(frozenState.storedComments, 17);
+  assert.equal(await ctx.__deep("answer:p24", 17, 17, "full"), false, "闭评冻结后不应再重复触发补抓");
+
+  // 2) is_complete = 0 仍计入 incompleteRoots 并触发补抓
+  returnedRows = [{ child_count: 10, is_complete: 0 }];
+  const retryState = await ctx.__state("answer:p24-retry");
+  assert.equal(retryState.incompleteRoots, 1);
+  assert.equal(await ctx.__deep("answer:p24-retry", 11, 11, "full"), true);
 });

@@ -52,7 +52,9 @@ export type R2EdgeCacheOptions = {
 };
 
 function edgeCacheUrl(r2Key: string): string {
-  return `${EDGE_CACHE_ORIGIN}/${encodeURIComponent(r2Key)}`;
+  // 楼中楼缓存路径升级 /v2/ 前缀：自然淘汰历史 max-age=86400 旧边缘缓存条目
+  const prefix = r2Key.startsWith("childcomments/") ? "/v2/" : "/";
+  return `${EDGE_CACHE_ORIGIN}${prefix}${encodeURIComponent(r2Key)}`;
 }
 
 function resolveTtlSeconds(opts: R2EdgeCacheOptions): number {

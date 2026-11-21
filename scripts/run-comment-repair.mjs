@@ -153,7 +153,7 @@ function scanCandidates(d1) {
       ) cm ON cm.content_pk = c.pk
       LEFT JOIN (
         SELECT ct.content_pk,
-               COALESCE(SUM(CASE WHEN ct.is_complete = 1 THEN ct.child_count ELSE 0 END), 0) AS children,
+               COALESCE(SUM(CASE WHEN ct.is_complete IN (1, 2) THEN ct.child_count ELSE 0 END), 0) AS children,
                COALESCE(SUM(CASE WHEN ct.child_count > 0 AND COALESCE(ct.is_complete, 0) = 0 THEN 1 ELSE 0 END), 0) AS incompleteThreads
         FROM comment_threads ct
         JOIN comments r ON r.id = ct.root_id

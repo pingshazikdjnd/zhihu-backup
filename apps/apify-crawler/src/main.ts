@@ -258,6 +258,7 @@ type RootCommentGroup = {
   childCount: number;
   children: ChildComment[];
   isChildrenComplete: boolean;
+  isChildrenClosed?: boolean;
 };
 
 function toChildComment(child: any, rootId: string): ChildComment {
@@ -286,7 +287,8 @@ function toChildComment(child: any, rootId: string): ChildComment {
 function toRootCommentGroup(
   root: any,
   children: ChildComment[],
-  isChildrenComplete: boolean
+  isChildrenComplete: boolean,
+  isChildrenClosed = false
 ): RootCommentGroup {
   const normalizedImage = normalizeCommentImage(root.content, root);
   return {
@@ -307,7 +309,8 @@ function toRootCommentGroup(
     isFeatured: root.featured === true || root.featured === 1,
     childCount: Number(root.child_comment_count) || 0,
     children,
-    isChildrenComplete
+    isChildrenComplete,
+    ...(isChildrenClosed ? { isChildrenClosed: true } : {})
   };
 }
 
@@ -437,8 +440,8 @@ async function fetchStoredCommentState(contentPk: string): Promise<StoredComment
     let storedComments = rows.length;
     for (const row of rows) {
       // 0 子评论且走 partial 批入库的根不会写 comment_threads，此时 listRootComments 固定返回 is_complete=0；
-      // 只有真正存在子评论（child_count > 0）且尚未完整落盘时，才判定楼中楼不完整
-      if (Number(row.child_count) > 0 && Number(row.is_complete ?? 0) !== 1) incompleteRoots++;
+      // 只有真正存在子评论（child_count > 0）且状态为 0（未完成可重试）时才计入不完整，is_complete=2（闭评冻结）不再触发重抓
+      if (Number(row.child_count) > 0 && Number(row.is_complete ?? 0) === 0) incompleteRoots++;
       storedComments += Number(row.child_count) || 0;
     }
     return { roots: rows.length, storedComments, incompleteRoots };
@@ -1017,6 +1020,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           }
 
           let childrenComplete: boolean;
+          let childrenClosed = false;
           if (childCount > children.length) {
             let chOffset = 0;
             let chIsEnd = false;
@@ -1064,11 +1068,12 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
             }
             // 翻到 is_end 或已补齐 child_comment_count 才算子评论完整；遇闭评一律不覆盖 R2 历史楼中楼
             childrenComplete = !chClosed && (chIsEnd || children.length >= childCount);
+            childrenClosed = chClosed;
           } else {
             childrenComplete = children.length >= childCount;
           }
 
-          await enqueueRoot(toRootCommentGroup(c, children, childrenComplete));
+          await enqueueRoot(toRootCommentGroup(c, children, childrenComplete, childrenClosed));
         }
         
         if (stats.riskExhausted || stats.circuitBroken) {
@@ -1475,6 +1480,7 @@ export async function syncHotCommentsForContent(
         // full 模式：楼中楼必须翻页抓全（知乎根评论接口只内联前几条）。
         // hot 模式（赞同内容）保持轻量：只取 1 页根评论 + 内联楼中楼，不额外翻子评论页。
         let childrenComplete = children.length >= childCount;
+        let childrenClosed = false;
         if (mode === "full" && childCount > children.length) {
           const buildChildUrl = (offset: number) =>
             isArticle
@@ -1551,8 +1557,9 @@ export async function syncHotCommentsForContent(
           }
           // 翻到 is_end 或已补齐 child_comment_count 才算子评论完整；遇闭评或中途异常一律不覆盖历史楼中楼
           childrenComplete = !chClosed && (chIsEnd || children.length >= childCount);
+          childrenClosed = chClosed;
         }
-        rootsBuffer.push(toRootCommentGroup(c, children, childrenComplete));
+        rootsBuffer.push(toRootCommentGroup(c, children, childrenComplete, childrenClosed));
         if (rootsBuffer.length >= 20) await flushRoots(false);
       }
 

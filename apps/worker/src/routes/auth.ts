@@ -474,6 +474,7 @@ const REMOTE_SCHEMA_STATEMENTS: string[] = [
     complete INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
   )`,
+  `CREATE INDEX IF NOT EXISTS idx_ext_child_comment_blobs_content ON child_comment_blobs(content_pk);`,
   // 正文大体积 HTML 存外部库：主 R2 的 html/* 也就不必再写
   `CREATE TABLE IF NOT EXISTS content_blobs (
     pk TEXT PRIMARY KEY,
