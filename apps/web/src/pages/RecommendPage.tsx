@@ -18,14 +18,6 @@ const fmtDate = (val: any) => {
 const stripHtml = (html: string) =>
   html ? html.replace(/<[^>]+>/g, "").substring(0, 160) + "..." : "";
 
-function safeGetWriteToken(): string {
-  try {
-    return localStorage.getItem("cookie_write_token") || "";
-  } catch {
-    return "";
-  }
-}
-
 function safeSetWriteToken(token: string) {
   try {
     localStorage.setItem("cookie_write_token", token);
@@ -100,11 +92,11 @@ export default function RecommendPage() {
   const handleAiAssess = async (e: React.MouseEvent, pk: string) => {
     e.preventDefault();
     e.stopPropagation();
-    if (aiResults[pk]) return;
+    if (aiResults[pk] || aiLoadingPk === pk) return;
     setAiLoadingPk(pk);
-    const callAssess = (tokenStr: string) => {
+    const callAssess = (tokenStr?: string) => {
       const headers: Record<string, string> = { "content-type": "application/json" };
-      if (tokenStr.trim()) headers.authorization = `Bearer ${tokenStr.trim()}`;
+      if (tokenStr && tokenStr.trim()) headers.authorization = `Bearer ${tokenStr.trim()}`;
       return api<any>(`/api/recommend/ai-assess`, {
         method: "POST",
         headers,
@@ -114,14 +106,14 @@ export default function RecommendPage() {
     try {
       let res: any;
       try {
-        res = await callAssess(safeGetWriteToken());
+        res = await callAssess();
       } catch (err: any) {
         const msg = String(err?.message || "");
         const needAuth = msg.startsWith("401") || (msg.startsWith("403") && !/Forbidden origin/i.test(msg));
         if (!needAuth) throw err;
         const input = window.prompt("AI 风险鉴定需验证操作密码（验证后本浏览器自动记住）：", "");
-        if (!input) return;
-        const trimmed = input.trim();
+        const trimmed = input?.trim() || "";
+        if (!trimmed) return;
         res = await callAssess(trimmed);
         safeSetWriteToken(trimmed);
       }

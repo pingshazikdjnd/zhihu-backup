@@ -565,7 +565,14 @@ function RootCommentList({
       const newItems: RootComment[] = res.data || [];
       setRootComments(prev => {
         const seen = new Set(prev.map(item => item.id));
-        return [...prev, ...newItems.filter(item => !seen.has(item.id))];
+        return [
+          ...prev,
+          ...newItems.filter(item => {
+            if (seen.has(item.id)) return false;
+            seen.add(item.id);
+            return true;
+          })
+        ];
       });
       setOffset(prev => prev + newItems.length);
       if (newItems.length < limit) {

@@ -525,32 +525,216 @@ test("前端边界与安全增强：ErrorBoundary 路由复位、sanitize 防御
   assert.doesNotMatch(questionsSrc, /const handleSearch[\s\S]{0,160}questionsStore\.q = trimmed;/);
 });
 
-test("前端 P2-1 / P2-6 回归：AI 鉴权弹窗、FollowingPage 切 Tab 状态重置、localStorage 保护与 CommentTree 去重序号", () => {
+test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页去重、筛选切 Tab 重拉与空格/双击防护", async () => {
   const commentTreeSrc = read("apps/web/src/components/CommentTree.tsx");
 
-  // 1) FollowingPage & RecommendPage：安全读写 localStorage，且 handleAiAssess 携带 Bearer 与 401/403 弹窗重试
+  // 1) FollowingPage & RecommendPage：首次请求不主动读 localStorage 传 Authorization，交由 api() 同源策略控制；
+  //    仅 401/403 弹窗输入非空/非纯空格口令重试后，才传入 Authorization 并 safeSetWriteToken（保留 try/catch 保护）
   for (const [label, src] of [["FollowingPage", followingSrc], ["RecommendPage", recommendSrc]]) {
-    assert.match(src, /function safeGetWriteToken\(/, `${label} 必须使用 safeGetWriteToken`);
+    assert.doesNotMatch(src, /safeGetWriteToken/, `${label} 首次请求不得自行读取 localStorage 口令`);
     assert.match(src, /function safeSetWriteToken\(/, `${label} 必须使用 safeSetWriteToken`);
     const directLsCalls = src.match(/\blocalStorage\.(getItem|setItem)/g) || [];
-    assert.equal(directLsCalls.length, 2, `${label} 只允许在 safeGet/Set helper 中调用 localStorage`);
-    assert.match(src, /headers\.authorization = `Bearer \$\{tokenStr\.trim\(\)\}`/);
+    assert.equal(directLsCalls.length, 1, `${label} 只允许在 safeSetWriteToken 中调用 localStorage.setItem`);
+    assert.match(src, /if \(tokenStr && tokenStr\.trim\(\)\) headers\.authorization = `Bearer \$\{tokenStr\.trim\(\)\}`/);
     assert.match(src, /window\.prompt\("AI 风险鉴定需验证操作密码/);
+    assert.match(src, /if \(aiResults\[pk\] \|\| aiLoadingPk === pk\) return;/, `${label} handleAiAssess 必须拦截正在加载中的双击`);
+    assert.match(src, /const trimmed = input\?\.trim\(\) \|\| "";\s*if \(!trimmed\)/, `${label} prompt 必须拦截纯空格输入`);
   }
+  assert.match(followingSrc, /await doCall\(\);/, "postUserModeWithAuth 首次请求必须无参调用 doCall()");
+  assert.match(followingSrc, /await callAssess\(\);/, "FollowingPage handleAiAssess 首次请求必须无参调用 callAssess()");
+  assert.match(recommendSrc, /await callAssess\(\);/, "RecommendPage handleAiAssess 首次请求必须无参调用 callAssess()");
 
-  // 2) FollowingPage 切回已缓存 Tab 时递增 listReqRef 并清零 loading/error
+  // 1b) 行为验证 [P1-1]：跨源 VITE_API_BASE + 预置 localStorage.cookie_write_token 时，
+  //     postUserModeWithAuth 首次请求不携带 Authorization；prompt 纯空格取消不发请求；输入口令重试才携带
+  const { createRequire } = await import("node:module");
+  const webRequire = createRequire(path.join(ROOT, "apps", "web", "package.json"));
+  const tsMod = await import(pathToFileURL(webRequire.resolve("typescript")).href);
+  const ts = tsMod.default ?? tsMod;
+  const transpile = src =>
+    ts.transpileModule(src, {
+      compilerOptions: {
+        target: ts.ScriptTarget.ES2022,
+        module: ts.ModuleKind.ESNext,
+        jsx: ts.JsxEmit.ReactJSX
+      }
+    }).outputText;
+
+  const apiJs = transpile(apiSrc);
+  const followingJs = transpile(followingSrc);
+
+  const localStore = new Map([["cookie_write_token", "local-secret-token"]]);
+  const fetchCalls = [];
+  let promptQueue = [];
+  const lsMock = {
+    getItem: k => localStore.get(k) ?? null,
+    setItem: (k, v) => { localStore.set(k, String(v)); }
+  };
+  const sharedSandbox = {
+    URL,
+    Headers,
+    AbortController,
+    AbortSignal,
+    setTimeout,
+    clearTimeout,
+    Response,
+    window: {
+      location: { origin: "https://pages.example" },
+      localStorage: lsMock,
+      prompt: () => promptQueue.shift() ?? null
+    },
+    localStorage: lsMock,
+    fetch: async (url, init) => {
+      const headersObj = Object.fromEntries(new Headers(init?.headers).entries());
+      fetchCalls.push({ url: String(url), headers: headersObj });
+      if (!headersObj.authorization) {
+        return { ok: false, status: 401, text: async () => "Unauthorized" };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    }
+  };
+  const syncDecls = [
+    ...["joinApiBase", "resolveRequestUrl", "isSameOriginRequest", "createTimeoutAbort", "createRequestAbort", "resolveWriteToken"].map(name => {
+      const { params, body } = extractFunctionBody(apiJs, name);
+      return `function ${name}(${params.join(", ")}) {${body}}`;
+    }),
+    (() => {
+      const { params, body } = extractFunctionBody(followingJs, "safeSetWriteToken");
+      return `function safeSetWriteToken(${params.join(", ")}) {${body}}`;
+    })(),
+    (() => {
+      const { params, body } = extractFunctionBody(apiJs, "api");
+      return `async function api(${params.join(", ")}) {${body}}`;
+    })(),
+    (() => {
+      const { params, body } = extractFunctionBody(followingJs, "postUserModeWithAuth");
+      return `async function postUserModeWithAuth(${params.join(", ")}) {${body}}`;
+    })()
+  ];
+  const modeCtx = vm.createContext(sharedSandbox);
+  vm.runInContext(
+    [
+      `const API_BASE = "https://third-party-api.example";`,
+      `const REQUEST_TIMEOUT_MS = 30000;`,
+      `const ABORT_SIGNAL_STATICS = AbortSignal;`,
+      ...syncDecls,
+      `globalThis.__postUserModeWithAuth = postUserModeWithAuth;`
+    ].join("\n"),
+    modeCtx
+  );
+
+  // 纯空格 prompt：首次跨源请求无 authorization，收到 401 后纯空格输入被拦截且不覆盖 localStorage
+  promptQueue = ["   "];
+  await assert.rejects(
+    () => modeCtx.__postUserModeWithAuth("alice", "full"),
+    /已取消密码验证/
+  );
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0].headers.authorization, undefined, "跨源首次请求绝不可外发本地 cookie_write_token");
+  assert.equal(localStore.get("cookie_write_token"), "local-secret-token");
+
+  // 输入有效口令重试：首次仍无 authorization，第二次携带输入口令并保存 trimmed
+  fetchCalls.length = 0;
+  promptQueue = ["  new-token-123  "];
+  const modeRes = await modeCtx.__postUserModeWithAuth("alice", "full");
+  assert.deepEqual(Array.from([modeRes.ok]), [true]);
+  assert.equal(fetchCalls.length, 2);
+  assert.equal(fetchCalls[0].headers.authorization, undefined);
+  assert.equal(fetchCalls[1].headers.authorization, "Bearer new-token-123");
+  assert.equal(localStore.get("cookie_write_token"), "new-token-123");
+
+  // 1c) 行为验证 [P1-1][P2-6]：RecommendPage handleAiAssess 跨源首次请求不外泄口令，
+  //     401 后 prompt 输入才带 Bearer 重试；双击正在加载中的 pk 直接忽略
+  const recJs = transpile(recommendSrc);
+  const recSafeSetDecl = extractFunctionBody(recJs, "safeSetWriteToken");
+  const recAssessStart = recJs.indexOf("const handleAiAssess = async (e, pk) => {");
+  assert.ok(recAssessStart >= 0, "transpiled RecommendPage 缺少 handleAiAssess");
+  const braceOpen = recJs.indexOf("{", recAssessStart);
+  let recDepth = 0;
+  let braceEnd = -1;
+  for (let i = braceOpen; i < recJs.length; i++) {
+    if (recJs[i] === "{") recDepth++;
+    else if (recJs[i] === "}") {
+      recDepth--;
+      if (recDepth === 0) {
+        braceEnd = i;
+        break;
+      }
+    }
+  }
+  const recAssessBody = recJs.slice(braceOpen + 1, braceEnd);
+  localStore.set("cookie_write_token", "local-secret-token");
+  fetchCalls.length = 0;
+  promptQueue = ["  rec-secret  "];
+  let aiLoadingPkVal = null;
+  let aiResultsVal = {};
+  const recCtx = vm.createContext({
+    api: async (p, opts) => {
+      const headersObj = Object.fromEntries(new Headers(opts?.headers).entries());
+      fetchCalls.push({ url: p, headers: headersObj });
+      if (!headersObj.authorization) throw new Error("401 Unauthorized");
+      return { ai: { model: "m", analysis: "ok" } };
+    },
+    window: { prompt: () => promptQueue.shift() ?? null },
+    localStorage: lsMock,
+    alert: msg => { throw new Error(`unexpected alert: ${msg}`); },
+    recommendStore: { aiCache: {} },
+    get aiResults() { return aiResultsVal; },
+    get aiLoadingPk() { return aiLoadingPkVal; },
+    setAiLoadingPk: fn => { aiLoadingPkVal = typeof fn === "function" ? fn(aiLoadingPkVal) : fn; },
+    setAiResults: fn => { aiResultsVal = typeof fn === "function" ? fn(aiResultsVal) : fn; }
+  });
+  vm.runInContext(
+    `function safeSetWriteToken(${recSafeSetDecl.params.join(", ")}) {${recSafeSetDecl.body}}
+     async function handleAiAssess(e, pk) {${recAssessBody}}
+     globalThis.__handleAiAssess = handleAiAssess;`,
+    recCtx
+  );
+  const fakeEvent = { preventDefault() {}, stopPropagation() {} };
+  // 模拟加载中双击：aiLoadingPkVal 已是 answer:1 时必须直接返回
+  aiLoadingPkVal = "answer:1";
+  await recCtx.__handleAiAssess(fakeEvent, "answer:1");
+  assert.equal(fetchCalls.length, 0, "加载中重复点击不得发起请求");
+  aiLoadingPkVal = null;
+  await recCtx.__handleAiAssess(fakeEvent, "answer:1");
+  assert.equal(fetchCalls.length, 2);
+  assert.equal(fetchCalls[0].headers.authorization, undefined, "handleAiAssess 首次请求不得带本地口令");
+  assert.equal(fetchCalls[1].headers.authorization, "Bearer rec-secret");
+  assert.equal(localStore.get("cookie_write_token"), "rec-secret");
+
+  // 2) FollowingPage 切回已缓存 Tab 时递增 listReqRef 并清零 loading/error，且按筛选条件变更重拉
+  assert.match(
+    followingSrc,
+    /const lastLoadedUsersKeyRef = useRef<string \| null>\(/
+  );
+  assert.match(
+    followingSrc,
+    /lastLoadedUsersKeyRef\.current = `\$\{q\}\\0\$\{mode\}`;/
+  );
+  assert.match(
+    followingSrc,
+    /if \(users\.length === 0 \|\| lastLoadedUsersKeyRef\.current !== `\$\{userQ\}\\0\$\{modeFilter\}`\)/
+  );
   assert.match(
     followingSrc,
     /\/\/ 切回已缓存 Tab 时作废前 Tab 在途请求并清空残留 loading\/error\s*listReqRef\.current\+\+;\s*setLoading\(false\);\s*setError\(""\);/
   );
 
-  // 3) CommentTree RootCommentList 同 pk 翻页序号作废与 id 去重
+  // 3) CommentTree RootCommentList 同 pk 翻页序号作废与同页+跨页 id 去重
   assert.match(commentTreeSrc, /const loadMoreSeqRef = useRef\(0\);/);
   assert.match(commentTreeSrc, /loadMoreSeqRef\.current\+\+;\s*setRootComments\(initialComments\);/);
   assert.match(commentTreeSrc, /const reqSeq = \+\+loadMoreSeqRef\.current;/);
   assert.match(commentTreeSrc, /reqPk !== resolvedPkRef\.current \|\| reqSeq !== loadMoreSeqRef\.current/);
-  assert.match(
-    commentTreeSrc,
-    /const seen = new Set\(prev\.map\(item => item\.id\)\);\s*return \[\.\.\.prev, \.\.\.newItems\.filter\(item => !seen\.has\(item\.id\)\)\];/
+  const dedupMatch = commentTreeSrc.match(
+    /setRootComments\(prev => \{([\s\S]*?)\}\);/
   );
+  assert.ok(dedupMatch, "CommentTree 必须包含 setRootComments 去重更新");
+  assert.match(dedupMatch[1], /seen\.add\(item\.id\)/, "同页内接受的元素也必须立即写入 seen");
+  const dedupReducer = vm.runInNewContext(
+    `(function(prev, newItems) { let next; const setRootComments = fn => { next = fn(prev); }; ${dedupMatch[0]} return next; })`
+  );
+  const deduped = dedupReducer(
+    [{ id: "c1" }],
+    [{ id: "c1" }, { id: "c2" }, { id: "c2" }, { id: "c3" }]
+  );
+  assert.deepEqual(Array.from(deduped, x => x.id), ["c1", "c2", "c3"], "同页与跨页重复 id 均只保留一条");
 });
