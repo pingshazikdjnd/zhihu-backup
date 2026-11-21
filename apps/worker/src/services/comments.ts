@@ -599,8 +599,9 @@ async function replaceCommentsByRootInner(
 
   // 1) 根评论 upsert + 根级删除对账
   const rootStmts: any[] = [];
-  for (const { root, img, hash } of prepared) {
+  for (const { root, img, hash, children } of prepared) {
     const exists = existingMap.get(root.id);
+    const liveChildCount = Math.max(root.childCount, children.length);
 
     if (!exists) {
       rootStmts.push(database.prepare(`
@@ -642,7 +643,7 @@ async function replaceCommentsByRootInner(
         root.isTop ? 1 : 0,
         root.isFeatured ? 1 : 0,
         hash,
-        root.childCount,
+        liveChildCount,
         now,
         now
       ));
@@ -687,7 +688,7 @@ async function replaceCommentsByRootInner(
         root.isTop ? 1 : 0,
         root.isFeatured ? 1 : 0,
         hash,
-        root.childCount,
+        liveChildCount,
         now,
         root.id
       ));
@@ -710,7 +711,7 @@ async function replaceCommentsByRootInner(
       isAvatarUrlChanged(exists.author_avatar, root.authorAvatar) ||
       (exists.time_text || "") !== (root.time || "") ||
       (exists.location || "") !== (root.location || "") ||
-      Number(exists.child_count ?? 0) !== root.childCount;
+      Number(exists.child_count ?? 0) !== liveChildCount;
 
     if (needsRefresh) {
       rootStmts.push(database.prepare(`
@@ -725,7 +726,7 @@ async function replaceCommentsByRootInner(
         root.likes,
         root.time ?? "",
         root.location ?? "",
-        root.childCount,
+        liveChildCount,
         root.id
       ));
     }
@@ -1105,18 +1106,24 @@ export async function listRootComments(
   const liveOnly = Boolean(opts.liveOnly);
   const liveFilter = liveOnly ? " AND c.is_deleted = 0" : "";
   const liveBareFilter = liveOnly ? " AND is_deleted = 0" : "";
+  const childCountSelectSql = liveOnly
+    ? `CASE
+         WHEN t.root_id IS NOT NULL THEN COALESCE(c.child_count, 0)
+         ELSE COALESCE(NULLIF(c.child_count, 0), (SELECT COUNT(*) FROM comments ch WHERE ch.parent_comment_id = c.id AND ch.is_deleted = 0), 0)
+       END`
+    : `COALESCE(
+         t.child_count,
+         NULLIF(c.child_count, 0),
+         (SELECT COUNT(*) FROM comments ch WHERE ch.parent_comment_id = c.id),
+         0
+       )`;
 
   const result = await database.prepare(`
     SELECT c.id, c.content_pk, c.author_name, c.author_avatar, c.be_replied,
            c.content_md, c.img_url, c.time_text, c.location, c.likes,
            c.is_author, c.is_top, c.is_featured, c.is_deleted, c.comment_hash,
            c.first_seen_at, c.last_seen_at,
-           COALESCE(
-             t.child_count,
-             NULLIF(c.child_count, 0),
-             (SELECT COUNT(*) FROM comments ch WHERE ch.parent_comment_id = c.id),
-             0
-           ) AS child_count,
+           ${childCountSelectSql} AS child_count,
            COALESCE(t.is_complete, 0) AS is_complete,
            t.preview_json AS preview_json,
            t.synced_at AS thread_synced_at
@@ -1254,17 +1261,23 @@ export async function listRootComments(
 // 与主 D1 查询同构：外部库的 comments 存根评论行，comment_threads 存子评论数与预览
 function buildRemoteRootCommentsSql(liveOnly: boolean): string {
   const liveFilter = liveOnly ? " AND c.is_deleted = 0" : "";
+  const childCountSelectSql = liveOnly
+    ? `CASE
+         WHEN t.root_id IS NOT NULL THEN COALESCE(c.child_count, 0)
+         ELSE COALESCE(NULLIF(c.child_count, 0), (SELECT COUNT(*) FROM comments ch WHERE ch.parent_comment_id = c.id AND ch.is_deleted = 0), 0)
+       END`
+    : `COALESCE(
+         t.child_count,
+         NULLIF(c.child_count, 0),
+         (SELECT COUNT(*) FROM comments ch WHERE ch.parent_comment_id = c.id),
+         0
+       )`;
   return `
   SELECT c.id, c.content_pk, c.author_name, c.author_avatar, c.be_replied,
          c.content_md, c.img_url, c.time_text, c.location, c.likes,
          c.is_author, c.is_top, c.is_featured, c.is_deleted, c.comment_hash,
          c.first_seen_at, c.last_seen_at,
-         COALESCE(
-           t.child_count,
-           NULLIF(c.child_count, 0),
-           (SELECT COUNT(*) FROM comments ch WHERE ch.parent_comment_id = c.id),
-           0
-         ) AS child_count,
+         ${childCountSelectSql} AS child_count,
          COALESCE(t.is_complete, 0) AS is_complete,
          t.preview_json AS preview_json,
          t.synced_at AS thread_synced_at
@@ -1495,8 +1508,9 @@ async function replaceCommentsByRootOffloaded(
   // 1) 根评论 upsert + 删除对账（SQLite 目标合并多行 INSERT 与 IN 删除，单句参数 <= 90）
   const rootStatements: RemoteSqlStatement[] = [];
   const newRootParamRows: unknown[][] = [];
-  for (const { root, img, hash } of prepared) {
+  for (const { root, img, hash, children } of prepared) {
     const exists = existingMap.get(root.id);
+    const liveChildCount = Math.max(root.childCount, children.length);
 
     if (!exists) {
       newRootParamRows.push([
@@ -1513,7 +1527,7 @@ async function replaceCommentsByRootOffloaded(
         root.isTop ? 1 : 0,
         root.isFeatured ? 1 : 0,
         hash,
-        root.childCount,
+        liveChildCount,
         now,
         now
       ]);
@@ -1550,7 +1564,7 @@ async function replaceCommentsByRootOffloaded(
           root.isTop ? 1 : 0,
           root.isFeatured ? 1 : 0,
           hash,
-          root.childCount,
+          liveChildCount,
           now,
           root.id
         ]
@@ -1563,7 +1577,7 @@ async function replaceCommentsByRootOffloaded(
       isAvatarUrlChanged(exists.author_avatar, root.authorAvatar) ||
       (exists.time_text || "") !== (root.time || "") ||
       (exists.location || "") !== (root.location || "") ||
-      Number(exists.child_count ?? 0) !== root.childCount;
+      Number(exists.child_count ?? 0) !== liveChildCount;
 
     if (needsRefresh) {
       rootStatements.push({
@@ -1580,7 +1594,7 @@ async function replaceCommentsByRootOffloaded(
           root.likes,
           root.time ?? "",
           root.location ?? "",
-          root.childCount,
+          liveChildCount,
           root.id
         ]
       });

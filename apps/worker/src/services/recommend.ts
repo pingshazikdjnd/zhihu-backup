@@ -632,7 +632,10 @@ export async function assessContentWithWorkersAI(env: Bindings, pk: string) {
       contentDigest = "no-hash";
     }
   }
-  const cacheKey = `meta/ai-risk/${pkSafe}.${contentDigest}.json`;
+  const liveComments = Number(row.live_comment_count ?? row.comment_count) || 0;
+  const displayComments = Number(row.comment_count) || 0;
+  const wipeTag = liveComments === 0 && displayComments > 0 ? ".wiped" : "";
+  const cacheKey = `meta/ai-risk/${pkSafe}.${contentDigest}.v2${wipeTag}.json`;
   const failKey = `${AI_FAIL_OBJECT_PREFIX}single-${pkSafe}.json`;
 
   // 1. 先查 R2 缓存（命中则 0 算力秒回）
@@ -680,8 +683,6 @@ export async function assessContentWithWorkersAI(env: Bindings, pk: string) {
     return bodySnippet;
   };
 
-  const liveComments = Number(row.live_comment_count ?? row.comment_count) || 0;
-  const displayComments = Number(row.comment_count) || 0;
   const commentSummary = liveComments !== displayComments
     ? `现网 ${liveComments} 评论 / 归档 ${displayComments} 评论`
     : `${displayComments} 评论`;

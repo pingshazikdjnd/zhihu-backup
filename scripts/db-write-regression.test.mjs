@@ -175,7 +175,7 @@ function createMemoryDb() {
 // comments 之前准备好 hono mock（否则会解析到真实框架依赖）。
 const honoMockUrl = toDataUrl(`
 class Hono {
-  constructor() { this.handlers = new Map(); }
+  constructor() { this.handlers = new Map(); this.headerStore = new Map(); }
   use() { return this }
   get(path, handler) { this.handlers.set("GET " + path, handler); return this }
   post(path, handler) { this.handlers.set("POST " + path, handler); return this }
@@ -185,6 +185,7 @@ class Hono {
     if (!handler) throw new Error("no handler for " + method + " " + path);
     let status = 200;
     let payload;
+    this.headerStore.clear();
     const lower = {};
     for (const [k, v] of Object.entries(headers || {})) lower[String(k).toLowerCase()] = v;
     const c = {
@@ -197,10 +198,11 @@ class Hono {
         query: name => new URL(url || ("http://127.0.0.1/api/auth" + path)).searchParams.get(name) ?? undefined,
         json: async () => body
       },
+      header: (name, value) => { this.headerStore.set(String(name).toLowerCase(), value); },
       json: (obj, code = 200) => { status = code; payload = obj; return { status, body: obj }; }
     };
     await handler(c);
-    return { status, body: payload };
+    return { status, body: payload, headers: Object.fromEntries(this.headerStore) };
   }
 }
 export { Hono };
@@ -2167,42 +2169,10 @@ test("R2 边缘缓存：命中 0 次 R2 读取，楼中楼写入/清空后 purge
 
     // 8) GET /api/contents/:pk 正文走边缘缓存；children 路由带短时 CDN 缓存头
     const contentsRoutePath = path.join(workerSrc, "routes", "contents.ts");
-    const routeMockUrl = toDataUrl(`
-const handlers = new Map();
-const headerStore = new Map();
-class Hono {
-  use() { return this }
-  get(path, handler) { handlers.set("GET " + path, handler); return this }
-  post() { return this }
-  route() { return this }
-  async __call(pattern, params = {}, env = {}) {
-    const handler = handlers.get("GET " + pattern);
-    if (!handler) throw new Error("no handler for GET " + pattern);
-    let status = 200;
-    let payload;
-    headerStore.clear();
-    const c = {
-      env,
-      req: {
-        param: name => params[name],
-        query: name => params[name],
-        url: "http://127.0.0.1/api/contents/" + (params.pk || ""),
-        header: () => undefined
-      },
-      header: (name, value) => { headerStore.set(String(name).toLowerCase(), value); },
-      json: (obj, code = 200) => { status = code; payload = obj; return { status, body: obj }; }
-    };
-    await handler(c);
-    return { status, body: payload, headers: Object.fromEntries(headerStore) };
-  }
-}
-export { Hono };
-export default Hono;
-`);
     const sharedIndexUrl = await moduleUrlFor(sharedIndexPath);
     const contentsRoutes = await loadTs(
       contentsRoutePath,
-      new Map([["hono", routeMockUrl], ["shared", sharedIndexUrl]])
+      new Map([["hono", honoMockUrl], ["shared", sharedIndexUrl]])
     );
 
     const htmlStore = makeBucket();
@@ -2210,18 +2180,23 @@ export default Hono;
     r2Store.set(`html/${CONTENT_PK}/${hash}`, "<p>full body</p>");
     const env = { BUCKET: htmlStore.bucket, DB: d1 };
 
-    const res1 = await runWithDb(d1, () => contentsRoutes.contentRoutes.__call("/:pk", { pk: CONTENT_PK }, env));
+    const res1 = await runWithDb(d1, () =>
+      contentsRoutes.contentRoutes.__call("GET", "/:pk", { params: { pk: CONTENT_PK } }, env)
+    );
     assert.equal(res1.body.content.content_html, "<p>full body</p>");
     assert.equal(htmlStore.stats.gets, 1);
 
-    const res2 = await runWithDb(d1, () => contentsRoutes.contentRoutes.__call("/:pk", { pk: CONTENT_PK }, env));
+    const res2 = await runWithDb(d1, () =>
+      contentsRoutes.contentRoutes.__call("GET", "/:pk", { params: { pk: CONTENT_PK } }, env)
+    );
     assert.equal(res2.body.content.content_html, "<p>full body</p>");
     assert.equal(htmlStore.stats.gets, 1, "详情页二次打开必须命中边缘缓存，0 次 R2 读取");
 
     const childrenRes = await runWithDb(d1, () =>
       contentsRoutes.contentRoutes.__call(
+        "GET",
         "/:pk/comments/:rootId/children",
-        { pk: CONTENT_PK, rootId: "r1" },
+        { params: { pk: CONTENT_PK, rootId: "r1" } },
         env
       )
     );
@@ -5941,9 +5916,10 @@ test("[PR2-2][PR2-8] listRootComments 与 /root-comments 的 live_only=1 过滤�
   auth.invalidateExternalTargetsCache();
   auth.resetRemoteSchemaCache();
 
+  const sharedIndexUrl = await moduleUrlFor(sharedIndexPath);
   const contentsRoute = await loadTs(
     path.join(workerSrc, "routes", "contents.ts"),
-    new Map([["hono", honoMockUrl]])
+    new Map([["hono", honoMockUrl], ["shared", sharedIndexUrl]])
   );
 
   // 1) 主 D1：50 条高赞已删归档根 + 3 条低赞存活根，外加 D1 扁平子评论（前 2 条已删、第 3 条存活）
@@ -5972,9 +5948,9 @@ test("[PR2-2][PR2-8] listRootComments 与 /root-comments 的 live_only=1 过滤�
 
   // 前端不传 live_only：仍看到高赞已删归档根
   const frontendRes = await runWithDb(d1, () =>
-    contentsRoute.contentRoutes.__call("/:pk/root-comments", {
-      pk: CONTENT_PK,
-      limit: "50"
+    contentsRoute.contentRoutes.__call("GET", "/:pk/root-comments", {
+      params: { pk: CONTENT_PK },
+      url: `http://127.0.0.1/api/contents/${encodeURIComponent(CONTENT_PK)}/root-comments?limit=50`
     }, { DB: d1 })
   );
   assert.equal(frontendRes.status, 200);
@@ -5983,10 +5959,9 @@ test("[PR2-2][PR2-8] listRootComments 与 /root-comments 的 live_only=1 过滤�
 
   // 爬虫传 live_only=1：直接跳过 50 条已删归档，返回全部 3 条存活根
   const crawlerRes = await runWithDb(d1, () =>
-    contentsRoute.contentRoutes.__call("/:pk/root-comments", {
-      pk: CONTENT_PK,
-      limit: "50",
-      live_only: "1"
+    contentsRoute.contentRoutes.__call("GET", "/:pk/root-comments", {
+      params: { pk: CONTENT_PK },
+      url: `http://127.0.0.1/api/contents/${encodeURIComponent(CONTENT_PK)}/root-comments?limit=50&live_only=1`
     }, { DB: d1 })
   );
   assert.equal(crawlerRes.status, 200);
@@ -5994,7 +5969,70 @@ test("[PR2-2][PR2-8] listRootComments 与 /root-comments 的 live_only=1 过滤�
   const live0 = crawlerRes.body.data.find(r => r.id === "live-0");
   assert.equal(live0.preview_replies[0].id, "ch-live-3", "D1 兜底预览必须优先展示存活回复");
 
+  // 1b) 主库 live_only=1 返回现网 child_count，而前端不传 live_only 仍保留已删归档水位
+  {
+    const { sqlite: sMainCnt, d1: d1MainCnt } = createMemoryDb();
+    seedContent(sMainCnt);
+    const mainR2 = new Map();
+    const mainBucket = {
+      async get(k) { const v = mainR2.get(k); return v === undefined ? null : { async text() { return v; } }; },
+      async put(k, v) { mainR2.set(k, String(v)); },
+      async delete() {}
+    };
+    const archived100 = Array.from({ length: 100 }, (_, i) => childComment(`arch-${i}`, `archived ${i}`));
+    const liveOne = childComment("live-only-1", "live reply");
+    const buildPayload = (children, childCount = children.length) => ({
+      contentPk: CONTENT_PK,
+      partial: false,
+      allRootIds: ["r-arch-cnt"],
+      roots: [{
+        id: "r-arch-cnt",
+        author: "Root",
+        authorAvatar: "",
+        content: "root",
+        img: "",
+        time: NOW_ISO,
+        location: "",
+        likes: 10,
+        isAuthor: false,
+        isTop: false,
+        isFeatured: false,
+        childCount,
+        isChildrenComplete: true,
+        children
+      }]
+    });
+    await runWithDb(d1MainCnt, () =>
+      commentsModule.replaceCommentsByRoot(buildPayload([...archived100, liveOne]), { DB: d1MainCnt, BUCKET: mainBucket })
+    );
+    await runWithDb(d1MainCnt, () =>
+      commentsModule.replaceCommentsByRoot(buildPayload([liveOne]), { DB: d1MainCnt, BUCKET: mainBucket })
+    );
+    const mainFrontend = await runWithDb(d1MainCnt, () =>
+      commentsModule.listRootComments(d1MainCnt, CONTENT_PK, { limit: 10, offset: 0 }, mainBucket)
+    );
+    const mainCrawler = await runWithDb(d1MainCnt, () =>
+      commentsModule.listRootComments(d1MainCnt, CONTENT_PK, { limit: 10, offset: 0, liveOnly: true }, mainBucket)
+    );
+    assert.equal(mainFrontend[0].child_count, 101, "主库前端展示 child_count 必须保持 101");
+    assert.equal(mainCrawler[0].child_count, 1, "主库爬虫 live_only=1 必须返回现网 child_count=1");
+
+    // 现网最后 1 条回复也被删光 → comments.child_count 如实归 0，comment_threads 保留 101
+    await runWithDb(d1MainCnt, () =>
+      commentsModule.replaceCommentsByRoot(buildPayload([], 0), { DB: d1MainCnt, BUCKET: mainBucket })
+    );
+    const mainFrontendZero = await runWithDb(d1MainCnt, () =>
+      commentsModule.listRootComments(d1MainCnt, CONTENT_PK, { limit: 10, offset: 0 }, mainBucket)
+    );
+    const mainCrawlerZero = await runWithDb(d1MainCnt, () =>
+      commentsModule.listRootComments(d1MainCnt, CONTENT_PK, { limit: 10, offset: 0, liveOnly: true }, mainBucket)
+    );
+    assert.equal(mainFrontendZero[0].child_count, 101);
+    assert.equal(mainCrawlerZero[0].child_count, 0);
+  }
+
   // 2) offload 混合/远端路径：live_only=1 同样过滤已删根评论
+  auth.invalidateExternalTargetsCache();
   const remoteSqlite = new Database(":memory:");
   const offloadTarget = {
     id: "ext-live-only",
@@ -6065,6 +6103,28 @@ test("[PR2-2][PR2-8] listRootComments 与 /root-comments 的 live_only=1 过滤�
       commentsModule.listRootComments(d1Off, CONTENT_PK, { limit: 10, offset: 1, liveOnly: true }, offloadBucket)
     );
     assert.deepEqual(offPage2.map(r => r.id), ["r-live"], "offset=1 混合过渡态按 live_only=1 精准切到 r-live");
+
+    // 2b) offload 路径 live_only=1 返回现网 child_count（t.child_count=101, c.child_count=1）
+    const remoteRootSql = `
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, child_count, first_seen_at, last_seen_at, is_deleted)
+      VALUES ('r-off-arch', ?, NULL, 'U', 'off root', 9999, 'h-oa', 1, ?, ?, 0)
+    `;
+    remoteSqlite.prepare(remoteRootSql).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+    remoteSqlite.prepare(`
+      INSERT INTO comment_threads (root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at)
+      VALUES ('r-off-arch', ?, 'childcomments/r-off-arch.json', 101, 1, 'th-oa', 'in-oa', '[]', ?)
+    `).run(CONTENT_PK, NOW_ISO);
+    const { d1: d1OffOnly } = createMemoryDb();
+    const offFrontend = await runWithDb(d1OffOnly, () =>
+      commentsModule.listRootComments(d1OffOnly, CONTENT_PK, { limit: 10, offset: 0 }, offloadBucket)
+    );
+    const offCrawler = await runWithDb(d1OffOnly, () =>
+      commentsModule.listRootComments(d1OffOnly, CONTENT_PK, { limit: 10, offset: 0, liveOnly: true }, offloadBucket)
+    );
+    const frontRow = offFrontend.find(r => r.id === "r-off-arch");
+    const crawlRow = offCrawler.find(r => r.id === "r-off-arch");
+    assert.equal(frontRow?.child_count, 101, "offload 前端不传 live_only 必须展示 101");
+    assert.equal(crawlRow?.child_count, 1, "offload 爬虫 live_only=1 必须返回现网 child_count=1");
   } finally {
     globalThis.fetch = originalFetch;
     auth.invalidateExternalTargetsCache();
@@ -6134,22 +6194,47 @@ test("[PR2-3] recommend 与 following 使用 live_comment_count 触发零评风�
   assert.equal(simItem.comment_count, 200);
   assert.ok(simItem.risk_tags.some(t => t.includes("千赞零评")));
 
-  // 3) recommend.assessContentWithWorkersAI prompt 体现现网 0 评论 / 归档 200 评论
+  // 3) recommend.assessContentWithWorkersAI prompt 体现现网 0 评论 / 归档 200 评论，且缓存键按 v2 + wiped 区分
+  let aiCallCount = 0;
   let capturedPrompt = "";
+  r2Map.set(
+    "meta/ai-risk/answer_risk-zero.hash-rz.json",
+    JSON.stringify({ model: "old", analysis: "stale pre-v2 cache" })
+  );
   const mockAiEnv = {
     DB: d1,
     BUCKET: bucket,
     AI: {
       run: async (_model, opts) => {
+        aiCallCount++;
         capturedPrompt = String(opts?.messages?.[1]?.content || "");
-        return { response: "1. 高风险\n2. 核心看点\n3. 建议留存" };
+        return { response: `run-${aiCallCount}: ${capturedPrompt.slice(0, 20)}` };
       }
     }
   };
   const aiRes = await runWithDb(d1, () => recommendModule.assessContentWithWorkersAI(mockAiEnv, "answer:risk-zero"));
   assert.equal(aiRes.ok, true);
+  assert.equal(aiCallCount, 1, "旧版无 .v2 缓存不得命中，必须重新鉴定");
   assert.ok(aiRes.risk_tags.some(t => t.includes("千赞零评")));
   assert.match(capturedPrompt, /现网 0 评论 \/ 归档 200 评论/);
+  assert.equal(
+    r2Map.has("meta/ai-risk/answer_risk-zero.hash-rz.v2.wiped.json"),
+    true,
+    "清评态必须写入带 .v2.wiped.json 后缀的缓存键"
+  );
+
+  // 未清评（live=200, archived=200）时使用 .v2.json，不与清评态共用缓存
+  sqlite.prepare(`UPDATE contents SET comment_count = 200 WHERE pk = 'answer:risk-zero'`).run();
+  const aiResLive = await runWithDb(d1, () => recommendModule.assessContentWithWorkersAI(mockAiEnv, "answer:risk-zero"));
+  assert.equal(aiResLive.ok, true);
+  assert.equal(aiCallCount, 2, "清评状态变化后即使 content_hash 不变也必须重新鉴定");
+  assert.equal(r2Map.has("meta/ai-risk/answer_risk-zero.hash-rz.v2.json"), true);
+
+  // 切回清评态命中之前的 .v2.wiped.json 缓存（不再消耗 AI 调用）
+  sqlite.prepare(`UPDATE contents SET comment_count = 0 WHERE pk = 'answer:risk-zero'`).run();
+  const aiResCachedWiped = await runWithDb(d1, () => recommendModule.assessContentWithWorkersAI(mockAiEnv, "answer:risk-zero"));
+  assert.equal(aiResCachedWiped.cached, true);
+  assert.equal(aiCallCount, 2);
 
   // 4) following.getFollowedUserContents & listFollowingFeed
   const userContents = await runWithDb(d1, () =>
@@ -6334,11 +6419,97 @@ test("[PR2-10] auth.ts 外部存储 /test 慢探测期间并发编辑/新增/删
     assert.equal(afterConcurrentDelete.some(t => t.id === idA), false, "探测期间已删除的目标 A 绝不可复活");
     assert.equal(afterConcurrentDelete.length, 1);
 
-    // 3) saveExternalTargetsRaw：D1 已有更晚时间戳时拒绝旧写倒灌并失效缓存
+    // 3) saveExternalTargetsRaw 显式 CAS：过期 expectedUpdatedAt 与较旧时间戳必抛 ExternalTargetsConflictError，不覆盖 R2 且失效缓存
+    await assert.rejects(
+      () => runWithDb(d1, () => auth.saveExternalTargetsRaw(bucket, [], { expectedUpdatedAt: "2020-01-01T00:00:00.000Z" })),
+      err => err instanceof auth.ExternalTargetsConflictError && err.code === "CONFLICT"
+    );
+    await assert.rejects(
+      () => runWithDb(d1, () => auth.saveExternalTargetsRaw(bucket, [], { expectedUpdatedAt: null })),
+      err => err instanceof auth.ExternalTargetsConflictError && err.code === "CONFLICT"
+    );
+
+    const beforeConflictR2 = r2Store.get(auth.R2_EXTERNAL_TARGETS_KEY);
     sqlite.prepare(`UPDATE app_settings SET updated_at = '2099-01-01T00:00:00.000Z' WHERE key = ?`).run(auth.EXTERNAL_TARGETS_KEY);
-    await runWithDb(d1, () => auth.saveExternalTargetsRaw(bucket, []));
+    await assert.rejects(
+      () => runWithDb(d1, () => auth.saveExternalTargetsRaw(bucket, [])),
+      err => err instanceof auth.ExternalTargetsConflictError
+    );
+    assert.equal(r2Store.get(auth.R2_EXTERNAL_TARGETS_KEY), beforeConflictR2, "CAS 冲突时绝不可覆盖 R2");
     const stillKept = await runWithDb(d1, () => auth.getExternalTargetsRaw(bucket));
-    assert.equal(stillKept.length, 1, "过期时间戳写入被 D1 拒绝后，缓存不得保留过期空数组");
+    assert.equal(stillKept.length, 1, "CAS 冲突失效缓存后仍应读出原有目标");
+
+    // 4) 跨 isolate 并发 CAS：单次瞬时冲突自动重试成功；持续冲突耗尽重试返回 HTTP 409（绝不假报 ok:true）
+    let injectConflicts = 1;
+    const casRaceD1 = {
+      prepare(sql) {
+        const stmt = d1.prepare(sql);
+        if (/UPDATE app_settings\s+SET value = \?, updated_at = \?\s+WHERE key = \? AND updated_at = \?/i.test(sql)) {
+          return {
+            bind(...params) {
+              const bound = stmt.bind(...params);
+              return {
+                first: () => bound.first(),
+                all: () => bound.all(),
+                execute: () => bound.execute(),
+                run: async () => {
+                  if (injectConflicts > 0) {
+                    injectConflicts--;
+                    // 模拟另一 isolate 抢先更新了 updated_at，导致本次 CAS changes=0
+                    sqlite.prepare(`UPDATE app_settings SET updated_at = '2099-02-01T00:00:00.000Z' WHERE key = ?`).run(auth.EXTERNAL_TARGETS_KEY);
+                    return { success: true, meta: { changes: 0 } };
+                  }
+                  return bound.run();
+                }
+              };
+            }
+          };
+        }
+        return stmt;
+      },
+      batch: stmts => d1.batch(stmts)
+    };
+    const retryOkRes = await runWithDb(casRaceD1, () =>
+      auth.authRoutes.__call("POST", "/external-targets", {
+        headers: authHeaders,
+        body: { name: "Target C", provider: "turso", endpointUrl: "https://c.turso.io", authToken: "tokC", syncScopes: ["contents"] }
+      }, env)
+    );
+    assert.equal(retryOkRes.status, 200, "单次跨 isolate CAS 冲突必须自动重读重试并成功");
+    assert.equal(retryOkRes.body.targets.length, 2);
+    const idC = retryOkRes.body.target.id;
+
+    // 持续冲突（超过 2 次重试）必须返回 409
+    injectConflicts = 10;
+    const conflict409Save = await runWithDb(casRaceD1, () =>
+      auth.authRoutes.__call("POST", "/external-targets", {
+        headers: authHeaders,
+        body: { name: "Target D", provider: "turso", endpointUrl: "https://d.turso.io", syncScopes: ["contents"] }
+      }, env)
+    );
+    assert.equal(conflict409Save.status, 409);
+    assert.equal(conflict409Save.body.conflict, true);
+
+    injectConflicts = 10;
+    const conflict409Del = await runWithDb(casRaceD1, () =>
+      auth.authRoutes.__call("POST", "/external-targets/delete", {
+        headers: authHeaders,
+        body: { id: idC }
+      }, env)
+    );
+    assert.equal(conflict409Del.status, 409);
+    assert.equal(conflict409Del.body.conflict, true);
+
+    injectConflicts = 10;
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ results: [{ type: "ok" }] }), text: async () => "" });
+    const conflict409Test = await runWithDb(casRaceD1, () =>
+      auth.authRoutes.__call("POST", "/external-targets/test", {
+        headers: authHeaders,
+        body: { id: idC }
+      }, env)
+    );
+    assert.equal(conflict409Test.status, 409);
+    assert.equal(conflict409Test.body.conflict, true);
   } finally {
     globalThis.fetch = originalFetch;
     auth.invalidateExternalTargetsCache();

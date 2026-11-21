@@ -728,6 +728,65 @@ test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页�
   assert.equal(aiLoadingSet.size, 0);
   assert.equal(Object.keys(aiLoadingPksVal).length, 0);
 
+  // 1e) 行为验证：RecommendPage 与 FollowingPage 各自 handleAiAssess 包装函数均调用 preventDefault/stopPropagation，
+  //     并把全部 state/ref 与各自 errorPrefix 透传给 assessContentRisk
+  for (const [label, pageSrc, expectedErrPrefix] of [
+    ["RecommendPage", recommendSrc, "AI 风险鉴定失败"],
+    ["FollowingPage", followingSrc, "AI 评估失败"]
+  ]) {
+    const pageJs = transpile(pageSrc);
+    const assessIdx = pageJs.indexOf("const handleAiAssess = async (e, pk) => {");
+    assert.ok(assessIdx >= 0, `${label} transpiled 源码缺少 handleAiAssess`);
+    const openIdx = pageJs.indexOf("{", assessIdx);
+    let depth = 0;
+    let closeIdx = -1;
+    for (let i = openIdx; i < pageJs.length; i++) {
+      if (pageJs[i] === "{") depth++;
+      else if (pageJs[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          closeIdx = i;
+          break;
+        }
+      }
+    }
+    assert.ok(closeIdx > openIdx, `${label} handleAiAssess 花括号未闭合`);
+    const body = pageJs.slice(openIdx + 1, closeIdx);
+    const sentinelResults = { existing: true };
+    const sentinelLoadingRef = { current: new Set() };
+    const sentinelSetLoading = () => {};
+    const sentinelSetResults = () => {};
+    let capturedArgs = null;
+    const pageCtx = vm.createContext({
+      aiResults: sentinelResults,
+      aiLoadingSetRef: sentinelLoadingRef,
+      setAiLoadingPks: sentinelSetLoading,
+      setAiResults: sentinelSetResults,
+      assessContentRisk: async arg => {
+        capturedArgs = arg;
+      }
+    });
+    vm.runInContext(
+      `async function handleAiAssess(e, pk) {${body}}\nglobalThis.__handleAiAssess = handleAiAssess;`,
+      pageCtx
+    );
+    let prevented = 0;
+    let stopped = 0;
+    await pageCtx.__handleAiAssess(
+      { preventDefault() { prevented++; }, stopPropagation() { stopped++; } },
+      "answer:42"
+    );
+    assert.equal(prevented, 1, `${label} handleAiAssess 必须调用 preventDefault`);
+    assert.equal(stopped, 1, `${label} handleAiAssess 必须调用 stopPropagation`);
+    assert.ok(capturedArgs, `${label} handleAiAssess 必须调用 assessContentRisk`);
+    assert.equal(capturedArgs.pk, "answer:42");
+    assert.equal(capturedArgs.aiResults, sentinelResults);
+    assert.equal(capturedArgs.aiLoadingSetRef, sentinelLoadingRef);
+    assert.equal(capturedArgs.setAiLoadingPks, sentinelSetLoading);
+    assert.equal(capturedArgs.setAiResults, sentinelSetResults);
+    assert.equal(capturedArgs.errorPrefix, expectedErrPrefix);
+  }
+
   // 2) FollowingPage 切回已缓存 Tab 时递增 listReqRef 并清零 loading/error，且按筛选条件变更重拉
   assert.match(
     followingSrc,
