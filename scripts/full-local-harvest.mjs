@@ -208,6 +208,7 @@ function emptyProgress() {
       startedAt: null,
       finishedAt: null,
       exitCode: null,
+      signal: null,
       statsAfter: null
     };
   }
@@ -1197,6 +1198,7 @@ async function runStageWithCooldown(stage, ctx, progress) {
   entry.startedAt = entry.startedAt || new Date().toISOString();
   entry.finishedAt = null;
   entry.exitCode = null;
+  entry.signal = null;
   progress.currentStage = stage.id;
   writeProgress(progress);
   log(`▶️ 开始 ${stage.id}：${stage.title}（${stage.note}）`);
@@ -1413,6 +1415,7 @@ function resetProgress(progress) {
     entry.startedAt = null;
     entry.finishedAt = null;
     entry.exitCode = null;
+    entry.signal = null;
     entry.statsAfter = null;
   }
   progress.currentStage = null;

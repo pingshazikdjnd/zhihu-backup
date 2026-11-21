@@ -187,7 +187,7 @@ export async function processImageBatch(
 
   // 质量设置在每个 isolate 内缓存 60 秒，整批只读一次
   const quality = await getImageQualitySetting(bucket);
-  const updateStmts: unknown[] = [];
+  const updateOps: Array<{ stmt: unknown; kind: "done" | "failed" | "retry" }> = [];
 
   // 与下载并发保持一致地分批：槽位闸门本身也会限流，这里分批是为了把
   // HEAD/失败判断的节奏摊平，避免一次拉起过多并行请求
@@ -198,17 +198,14 @@ export async function processImageBatch(
         const localPath = await localizeImage(row.image_url, bucket, quality);
         const now = new Date().toISOString();
         if (localPath) {
-          updateStmts.push(markTaskDone(row.id, now, row.updated_at));
-          summary.done += 1;
+          updateOps.push({ stmt: markTaskDone(row.id, now, row.updated_at), kind: "done" });
           return;
         }
         // 领取时 attempts 已 +1，这里用 +1 后的值判断是否耗尽重试
         if (row.attempts + 1 >= MAX_IMAGE_TASK_ATTEMPTS) {
-          updateStmts.push(markTaskFailed(row.id, "download failed", now, row.updated_at));
-          summary.failed += 1;
+          updateOps.push({ stmt: markTaskFailed(row.id, "download failed", now, row.updated_at), kind: "failed" });
         } else {
-          updateStmts.push(markTaskRetry(row.id, now, row.updated_at));
-          summary.retry += 1;
+          updateOps.push({ stmt: markTaskRetry(row.id, now, row.updated_at), kind: "retry" });
         }
       } catch (err) {
         // 任务层任何异常都不能让整批失败，但也必须受 MAX_IMAGE_TASK_ATTEMPTS 上限约束防止无限重试
@@ -216,19 +213,26 @@ export async function processImageBatch(
         const errMsg = err instanceof Error ? err.message : String(err || "download error");
         const now = new Date().toISOString();
         if (row.attempts + 1 >= MAX_IMAGE_TASK_ATTEMPTS) {
-          updateStmts.push(markTaskFailed(row.id, errMsg.slice(0, 200), now, row.updated_at));
-          summary.failed += 1;
+          updateOps.push({ stmt: markTaskFailed(row.id, errMsg.slice(0, 200), now, row.updated_at), kind: "failed" });
         } else {
-          updateStmts.push(markTaskRetry(row.id, now, row.updated_at));
-          summary.retry += 1;
+          updateOps.push({ stmt: markTaskRetry(row.id, now, row.updated_at), kind: "retry" });
         }
       }
     }));
   }
 
-  if (updateStmts.length > 0) {
+  if (updateOps.length > 0) {
     try {
-      await db.batch(updateStmts);
+      const batchResults = await db.batch(updateOps.map(op => op.stmt));
+      if (Array.isArray(batchResults)) {
+        for (let i = 0; i < updateOps.length; i++) {
+          if (Number(batchResults[i]?.meta?.changes ?? 0) > 0) {
+            summary[updateOps[i].kind] += 1;
+          }
+        }
+      } else {
+        for (const op of updateOps) summary[op.kind] += 1;
+      }
     } catch (err) {
       summary.done = 0;
       summary.failed = 0;

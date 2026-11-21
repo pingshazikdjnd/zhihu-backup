@@ -537,7 +537,7 @@ test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页�
     assert.equal(directLsCalls.length, 1, `${label} 只允许在 safeSetWriteToken 中调用 localStorage.setItem`);
     assert.match(src, /if \(tokenStr && tokenStr\.trim\(\)\) headers\.authorization = `Bearer \$\{tokenStr\.trim\(\)\}`/);
     assert.match(src, /window\.prompt\("AI 风险鉴定需验证操作密码/);
-    assert.match(src, /if \(aiResults\[pk\] \|\| aiLoadingPk === pk\) return;/, `${label} handleAiAssess 必须拦截正在加载中的双击`);
+    assert.match(src, /if \(aiResults\[pk\] \|\| aiLoadingSetRef\.current\.has\(pk\)\) return;/, `${label} handleAiAssess 必须拦截正在加载中的双击`);
     assert.match(src, /const trimmed = input\?\.trim\(\) \|\| "";\s*if \(!trimmed\)/, `${label} prompt 必须拦截纯空格输入`);
   }
   assert.match(followingSrc, /await doCall\(\);/, "postUserModeWithAuth 首次请求必须无参调用 doCall()");
@@ -665,22 +665,24 @@ test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页�
   localStore.set("cookie_write_token", "local-secret-token");
   fetchCalls.length = 0;
   promptQueue = ["  rec-secret  "];
-  let aiLoadingPkVal = null;
+  let aiLoadingPksVal = {};
+  const aiLoadingSet = new Set();
   let aiResultsVal = {};
+  let apiHandler = async (p, opts) => {
+    const headersObj = Object.fromEntries(new Headers(opts?.headers).entries());
+    fetchCalls.push({ url: p, headers: headersObj });
+    if (!headersObj.authorization) throw new Error("401 Unauthorized");
+    return { ai: { model: "m", analysis: "ok" } };
+  };
   const recCtx = vm.createContext({
-    api: async (p, opts) => {
-      const headersObj = Object.fromEntries(new Headers(opts?.headers).entries());
-      fetchCalls.push({ url: p, headers: headersObj });
-      if (!headersObj.authorization) throw new Error("401 Unauthorized");
-      return { ai: { model: "m", analysis: "ok" } };
-    },
+    api: (p, opts) => apiHandler(p, opts),
     window: { prompt: () => promptQueue.shift() ?? null },
     localStorage: lsMock,
     alert: msg => { throw new Error(`unexpected alert: ${msg}`); },
     recommendStore: { aiCache: {} },
+    aiLoadingSetRef: { current: aiLoadingSet },
     get aiResults() { return aiResultsVal; },
-    get aiLoadingPk() { return aiLoadingPkVal; },
-    setAiLoadingPk: fn => { aiLoadingPkVal = typeof fn === "function" ? fn(aiLoadingPkVal) : fn; },
+    setAiLoadingPks: fn => { aiLoadingPksVal = typeof fn === "function" ? fn(aiLoadingPksVal) : fn; },
     setAiResults: fn => { aiResultsVal = typeof fn === "function" ? fn(aiResultsVal) : fn; }
   });
   vm.runInContext(
@@ -690,16 +692,47 @@ test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页�
     recCtx
   );
   const fakeEvent = { preventDefault() {}, stopPropagation() {} };
-  // 模拟加载中双击：aiLoadingPkVal 已是 answer:1 时必须直接返回
-  aiLoadingPkVal = "answer:1";
+  // 模拟加载中双击：aiLoadingSet 已含 answer:1 时必须直接返回
+  aiLoadingSet.add("answer:1");
   await recCtx.__handleAiAssess(fakeEvent, "answer:1");
   assert.equal(fetchCalls.length, 0, "加载中重复点击不得发起请求");
-  aiLoadingPkVal = null;
+  aiLoadingSet.delete("answer:1");
   await recCtx.__handleAiAssess(fakeEvent, "answer:1");
   assert.equal(fetchCalls.length, 2);
   assert.equal(fetchCalls[0].headers.authorization, undefined, "handleAiAssess 首次请求不得带本地口令");
   assert.equal(fetchCalls[1].headers.authorization, "Bearer rec-secret");
   assert.equal(localStore.get("cookie_write_token"), "rec-secret");
+
+  // 1d) 并发点击 A、B：重复点 A 被拦截，B 结束后 A 仍保持锁定直到 A 完成
+  fetchCalls.length = 0;
+  aiResultsVal = {};
+  aiLoadingPksVal = {};
+  aiLoadingSet.clear();
+  const deferredByPk = new Map();
+  apiHandler = (p, opts) => {
+    const body = JSON.parse(opts.body);
+    fetchCalls.push({ url: p, pk: body.pk });
+    return new Promise(resolve => { deferredByPk.set(body.pk, resolve); });
+  };
+  const pA = recCtx.__handleAiAssess(fakeEvent, "answer:A");
+  const pB = recCtx.__handleAiAssess(fakeEvent, "answer:B");
+  assert.equal(fetchCalls.length, 2);
+  assert.equal(aiLoadingSet.has("answer:A"), true);
+  assert.equal(aiLoadingSet.has("answer:B"), true);
+  assert.equal(aiLoadingPksVal["answer:A"], true);
+  assert.equal(aiLoadingPksVal["answer:B"], true);
+  await recCtx.__handleAiAssess(fakeEvent, "answer:A");
+  assert.equal(fetchCalls.length, 2, "A 加载中再次点击 A 必须被拦截");
+  deferredByPk.get("answer:B")({ ai: { model: "m", analysis: "B ok" } });
+  await pB;
+  assert.equal(aiLoadingSet.has("answer:B"), false);
+  assert.equal(aiLoadingPksVal["answer:B"], undefined);
+  assert.equal(aiLoadingSet.has("answer:A"), true, "B 结束后不得清除 A 的锁定状态");
+  assert.equal(aiLoadingPksVal["answer:A"], true);
+  deferredByPk.get("answer:A")({ ai: { model: "m", analysis: "A ok" } });
+  await pA;
+  assert.equal(aiLoadingSet.size, 0);
+  assert.equal(Object.keys(aiLoadingPksVal).length, 0);
 
   // 2) FollowingPage 切回已缓存 Tab 时递增 listReqRef 并清零 loading/error，且按筛选条件变更重拉
   assert.match(

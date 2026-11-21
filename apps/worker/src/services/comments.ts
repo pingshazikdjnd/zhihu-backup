@@ -769,15 +769,6 @@ async function replaceCommentsByRootInner(
     }
   }
 
-  // 全量对账（非 partial）且本次一条根评论都没有：原站评论被整体删光。
-  // 单纯把根评论软删不会修正 contents.comment_count，列表页会永远显示旧评论数，
-  // 且下次 ingest 见旧计数非 0 又会重复触发评论抓取 —— 这里同步清零。
-  if (!input.partial && input.roots.length === 0 && (!input.allRootIds || input.allRootIds.length === 0)) {
-    rootStmts.push(database.prepare(`
-      UPDATE contents SET comment_count = 0 WHERE pk = ?
-    `).bind(input.contentPk));
-  }
-
   await runBatchedStatements(database, rootStmts, ROOT_BATCH_SIZE);
 
   // 2) 子评论写 R2；3) comment_threads 最后统一 upsert
@@ -788,8 +779,12 @@ async function replaceCommentsByRootInner(
   // 而且只把 child_count 归零不够：thread_hash / incoming_hash 不清，R2 旧对象不删，
   // 原站清空后又新增子评论、下次 partial 同步时旧 R2 子评论会被「合并复活」。
   // 所有根评论此刻都已软删，直接删掉残余线程索引行最干净，下次从零重建。
+  // 同时需合并无 comment_threads 索引的旧根（existingRoots），确保遗留 R2 对象一并清理；
+  // 若 R2 删除有失败，主动反写正数 comment_count 保持下轮重试触发信号，绝不静默归 0。
   if (!input.partial && input.roots.length === 0 && (!input.allRootIds || input.allRootIds.length === 0)) {
-    const keyEntries = Array.from(existingThreads.keys(), rootId => ({
+    const clearRootIds = new Set<string>(existingThreads.keys());
+    for (const row of existingRoots) clearRootIds.add(row.id);
+    const keyEntries = Array.from(clearRootIds, rootId => ({
       rootId,
       key: childCommentsKey(rootId)
     }));
@@ -822,6 +817,10 @@ async function replaceCommentsByRootInner(
         `).bind(input.contentPk, ...chunk));
       }
     }
+    const nextCommentCount = deleteResult.failedKeys.length > 0 ? deleteResult.failedKeys.length : 0;
+    threadStmts.push(database.prepare(`
+      UPDATE contents SET comment_count = ? WHERE pk = ?
+    `).bind(nextCommentCount, input.contentPk));
   }
   for (const { root, children } of prepared) {
     const hasChildren = children.length > 0;
@@ -1047,10 +1046,11 @@ async function replaceCommentsByRootInner(
         isComplete = targetIsComplete;
         storedThreadHash = nextThreadHash;
       } catch (err) {
-        // R2 与 D1 无法同一事务：PUT 失败不回滚已写的根评论，只把线程标记为不完整（已冻结为 2 则保持 2）。
+        // R2 与 D1 无法同一事务：PUT 失败不回滚已写的根评论，只把线程标记为不完整。
+        // 重开并抓全（complete=true）时 R2 落盘失败必须置 0 可重试，不可沿用闭评冻结态 2。
         // thread_hash 保留旧值、incoming_hash 清空 → 下次同输入不会误命中快路径，会重新 PUT。
         console.warn(`[comments] R2 put failed for ${key}:`, err);
-        isComplete = existingThread?.is_complete === 2 ? 2 : 0;
+        isComplete = complete ? 0 : (existingThread?.is_complete === 2 ? 2 : 0);
         storedThreadHash = existingThread?.thread_hash ?? "";
         storedIncomingHash = "";
       }
@@ -1686,16 +1686,21 @@ async function replaceCommentsByRootOffloaded(
         params: [input.contentPk]
       }
     ];
-    // 清理失败不阻塞清零：下次同输入会重试
-    await executeRemoteSqlBatch(target, clearStatements).catch(() => {});
+    // 清理失败不阻塞清零，但需反写正数 comment_count 保持下轮自动重试触发信号
+    let remoteClearFailed = false;
+    await executeRemoteSqlBatch(target, clearStatements).catch(() => {
+      remoteClearFailed = true;
+    });
     try {
-      const mainThreadsResult = await env.DB.prepare(
-        `SELECT root_id FROM comment_threads WHERE content_pk = ?`
-      ).bind(input.contentPk).all<{ root_id: string }>();
-      const mainThreadEntries = (mainThreadsResult.results ?? [])
-        .map(r => r.root_id)
-        .filter(Boolean)
-        .map(rootId => ({ rootId, key: childCommentsKey(rootId) }));
+      const mainThreadsResult = await env.DB.prepare(`
+        SELECT root_id FROM comment_threads WHERE content_pk = ?
+        UNION
+        SELECT id AS root_id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL
+      `).bind(input.contentPk, input.contentPk).all<{ root_id: string }>();
+      const mainThreadEntries = Array.from(
+        new Set((mainThreadsResult.results ?? []).map(r => r.root_id).filter(Boolean)),
+        rootId => ({ rootId, key: childCommentsKey(rootId) })
+      );
 
       let mainR2Delete = { ok: true, succeededKeys: [] as string[], failedKeys: [] as string[] };
       if (mainThreadEntries.length > 0) {
@@ -1735,18 +1740,23 @@ async function replaceCommentsByRootOffloaded(
         SET is_deleted = 1, deleted_at = ?, last_seen_at = ?
         WHERE content_pk = ? AND is_deleted = 0
       `).bind(now, now, input.contentPk));
+      const nextCommentCount = (remoteClearFailed || mainR2Delete.failedKeys.length > 0)
+        ? Math.max(1, mainR2Delete.failedKeys.length)
+        : 0;
       mainCleanupStmts.push(env.DB.prepare(
-        `UPDATE contents SET comment_count = 0 WHERE pk = ?`
-      ).bind(input.contentPk));
+        `UPDATE contents SET comment_count = ? WHERE pk = ?`
+      ).bind(nextCommentCount, input.contentPk));
       await runBatchedStatements(env.DB, mainCleanupStmts, ROOT_BATCH_SIZE);
     } catch { /* 主库残留清理失败不阻塞外部库已完成的清零 */ }
   }
 
-  // 在进入根循环前向本地主 D1 查一次该内容是否存在迁移前旧楼中楼/子评论计数，
+  // 在进入根循环前向本地主 D1 与外部库各查一次该内容是否存在迁移前旧楼中楼/子评论计数，
   // 只有远端或主库确有旧楼中楼历史时，才为 0 回复根写入 complete-empty 墓碑，
   // 避免全新 0 回复根每批白白多发几十次子请求。
   const mainLegacyRootIds = new Set<string>();
   let mainLegacyQueryFailed = false;
+  const remoteLegacyRootIds = new Set<string>();
+  let remoteLegacyQueryFailed = false;
   const hasZeroReplyCompleteCandidate =
     !input.partial &&
     prepared.some(
@@ -1777,6 +1787,23 @@ async function replaceCommentsByRootOffloaded(
       }
     } catch {
       mainLegacyQueryFailed = true;
+    }
+    try {
+      const remoteLegacyRes = await executeRemoteSqlBatch(target, [{
+        sql: `
+          SELECT root_id FROM child_comment_blobs WHERE content_pk = ?
+          UNION
+          SELECT DISTINCT parent_comment_id AS root_id FROM comments
+          WHERE content_pk = ? AND parent_comment_id IS NOT NULL AND is_deleted = 0
+        `,
+        params: [input.contentPk, input.contentPk]
+      }]);
+      for (const row of remoteLegacyRes[0]?.rows ?? []) {
+        const rid = row.root_id == null ? "" : String(row.root_id);
+        if (rid) remoteLegacyRootIds.add(rid);
+      }
+    } catch {
+      remoteLegacyQueryFailed = true;
     }
   }
 
@@ -1845,7 +1872,8 @@ async function replaceCommentsByRootOffloaded(
       const hadRemoteThreadData = Boolean(existingThread);
       const existingRootChildCount = Number(existingMap.get(root.id)?.child_count ?? 0);
       const hadMainLegacyData = mainLegacyQueryFailed || mainLegacyRootIds.has(root.id);
-      if (!hadRemoteThreadData && existingRootChildCount === 0 && !hadMainLegacyData) {
+      const hadRemoteLegacyData = remoteLegacyQueryFailed || remoteLegacyRootIds.has(root.id);
+      if (!hadRemoteThreadData && existingRootChildCount === 0 && !hadMainLegacyData && !hadRemoteLegacyData) {
         continue;
       }
 

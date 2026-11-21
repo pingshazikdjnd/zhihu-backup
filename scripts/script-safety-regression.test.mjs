@@ -1291,7 +1291,7 @@ test("[P0-2][P1-8][P2-3][P2-4][P2-7] crawler/main.ts 与补抓脚本安全回归
   );
   assert.match(scraperBody, /const canFallbackScore = cfg\.commentsMyAnswers === "full" && rootPages === 0 && currentOrderBy === "ts";/);
   assert.match(scraperBody, /\.\.\.\(canFallbackScore \? \{ allowEmptyPage: true \} : \{\}\)/);
-  assert.match(scraperBody, /fellBackToScore = true;\s*currentOrderBy = "score";\s*cNextUrl = buildRootCommentsUrl\(0, "score"\);/);
+  assert.match(scraperBody, /fellBackToScore = true;\s*cIncomplete = true;\s*currentOrderBy = "score";\s*cNextUrl = buildRootCommentsUrl\(0, "score"\);/);
   assert.match(scraperBody, /if \(rootPages === 0 && emptyIsEnd && !fellBackToScore && cfg\.commentsMyAnswers === "full"\)[\s\S]{0,2000}postCommentsByRoot\(contentPk, \[\], \{ partial: false, allRootIds: \[\] \}\)/);
 
   // P2-3：hasReachedCursor 优先时间维度 offset，不被浅层 page_num 误导
@@ -1748,8 +1748,9 @@ test("[P1-7][P2-9] local-sync 代理 IPC 软停/等 close 再放锁/幂等、cra
   await Promise.all([p1, p2]);
   assert.equal(p1Done && p2Done, true);
 
-  // 2) 静态检查：local-sync 默认超时 >= 18_000、IPC 通道、connected 校验与 process.disconnect()
-  assert.match(localSyncSrc, /resolveTimeoutMs\("LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS",\s*18_000\)/);
+  // 2) 静态检查：local-sync 默认超时推导公式、IPC 通道、connected 校验与 process.disconnect()
+  assert.match(localSyncSrc, /DEFAULT_PROXY_SHUTDOWN_TIMEOUT_MS\s*=\s*CRAWLER_STOP_TIMEOUT_MS\s*\+\s*FORCE_KILL_CLOSE_WAIT_MS\s*\+\s*CLOUD_LOCK_RELEASE_TIMEOUT_MS\s*\+\s*2_000/);
+  assert.match(localSyncSrc, /resolveTimeoutMs\(\s*"LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS",\s*DEFAULT_PROXY_SHUTDOWN_TIMEOUT_MS\s*\)/);
   assert.match(localSyncSrc, /stdio:\s*\["inherit",\s*"inherit",\s*"inherit",\s*"ipc"\]/);
   assert.match(localSyncSrc, /childToStop\.connected/);
   assert.match(localSyncSrc, /type:\s*"graceful-shutdown"/);
@@ -1807,6 +1808,8 @@ if (process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_CHILD_SIGN
   await new Promise(resolve => proxyServer.listen(0, "127.0.0.1", resolve));
   const proxyPort = proxyServer.address().port;
 
+  let hangRelease = false;
+  const openReleaseResponses = [];
   const workerServer = http.createServer(async (req, res) => {
     if (req.method === "POST" && req.url === "/ingest/sync-lock/acquire") {
       res.writeHead(200, { "content-type": "application/json" });
@@ -1821,6 +1824,10 @@ if (process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_CHILD_SIGN
     if (req.method === "POST" && req.url === "/ingest/sync-lock/release") {
       releaseCalls++;
       lockExistsDuringRelease.push(fs.existsSync(lockFile));
+      if (hangRelease) {
+        openReleaseResponses.push(res);
+        return;
+      }
       await new Promise(r => setTimeout(r, releaseDelayMs));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, released: true }));
@@ -1832,14 +1839,20 @@ if (process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_CHILD_SIGN
   const workerPort = workerServer.address().port;
 
   const spawnWithLogs = extraEnv => {
+    const cleanEnv = { ...process.env };
+    for (const k of ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "https_proxy"]) {
+      delete cleanEnv[k];
+    }
     const proc = spawn(process.execPath, [testScriptPath], {
       cwd: dir,
       stdio: ["ignore", "pipe", "pipe"],
       env: {
-        ...process.env,
+        ...cleanEnv,
         WORKER_URL: `http://127.0.0.1:${workerPort}`,
         API_SECRET: "sec",
         HTTPS_PROXY: `http://127.0.0.1:${proxyPort}`,
+        NO_PROXY: "127.0.0.1,localhost",
+        no_proxy: "127.0.0.1,localhost",
         ...extraEnv
       }
     });
@@ -1918,8 +1931,8 @@ if (process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_CHILD_SIGN
     assert.equal(releaseCalls, 1, "叠加 SIGINT 与 IPC 必须幂等只释放一次云端锁");
     assert.equal(fs.existsSync(lockFile), false);
 
-    // 场景 C：可注入短超时兜底（250ms），触发强杀后等待 close 再删除 .local-sync.lock
-    releaseDelayMs = 3000;
+    // 场景 C：可注入短超时兜底（250ms），令解锁请求永久挂起以区分强杀与自然退出
+    hangRelease = true;
     releaseCalls = 0;
     const readyC = path.join(dir, "ready-c");
     const parentSigC = path.join(dir, "parent-sig-c");
@@ -1937,9 +1950,13 @@ if (process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_CHILD_SIGN
     const elapsedC = Date.now() - tStartC;
     spawnedProc = null;
     assert.equal(exitC, 130);
-    assert.ok(elapsedC >= 200, `超时前应充分等待软停，实际=${elapsedC}ms`);
+    assert.ok(elapsedC >= 200 && elapsedC < 2000, `超时强杀应落在 200..2000ms 区间而非自然退出或长时间卡死，实际=${elapsedC}ms`);
     assert.equal(fs.existsSync(lockFile), false, "超时强杀 wait close 后必须清理 .local-sync.lock");
   } finally {
+    hangRelease = false;
+    for (const res of openReleaseResponses) {
+      try { res.destroy(); } catch {}
+    }
     if (spawnedProc && spawnedProc.exitCode === null && spawnedProc.signalCode === null) {
       spawnedProc.kill();
     }
@@ -1980,4 +1997,403 @@ if (process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_CHILD_SIGN
     { kind: "process.kill", pid: -4321, sig: "SIGTERM" },
     { kind: "proc.kill", pid: 4321, sig: "SIGTERM" }
   ]);
+});
+
+// ---------- M1 / M2 / M3 / M4 / M8 / M9 / M15 回归测试 ----------
+
+test("[M1] crawler 中止停写、排空在途写入后再放锁，并在途挂死时不提前释锁", async () => {
+  const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");
+  // Actor.on("aborting") 必须 await stopWorkAndReleaseSyncLock() 且绝不调 process.exit(130)
+  assert.match(crawlerSrc, /Actor\.on\("aborting",\s*async \(\) => \{\s*await stopWorkAndReleaseSyncLock\(\);\s*\}\);/);
+  assert.match(crawlerSrc, /stopWorkAndReleaseSyncLock\(\)\.finally\(\(\) => \{\s*process\.exit\(130\);\s*\}\);/);
+
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const crawlerRequire = createRequire(path.join(ROOT, "apps", "apify-crawler", "package.json"));
+  const tsMod = await import(pathToFileURL(crawlerRequire.resolve("typescript")).href);
+  const ts = tsMod.default ?? tsMod;
+  const crawlerJs = ts.transpileModule(crawlerSrc, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+  }).outputText;
+
+  const fnCode = [
+    extractFunction(crawlerJs, "sanitizeErrorForLog"),
+    "async " + extractFunction(crawlerJs, "releaseSyncLockBeforeExit"),
+    extractFunction(crawlerJs, "waitForInFlightIngestWrites"),
+    "async " + extractFunction(crawlerJs, "stopWorkAndReleaseSyncLock"),
+    "async " + extractFunction(crawlerJs, "post"),
+    "async " + extractFunction(crawlerJs, "postCommentsByRoot")
+  ].join("\n");
+
+  const runScenario = async ({ hangInFlight }) => {
+    let releaseCalls = 0;
+    const writeCalls = [];
+    let resolveInFlight;
+    let firstWriteStarted;
+    const firstWriteStartedPromise = new Promise(r => { firstWriteStarted = r; });
+    const abortSignals = [];
+    const ctx = vm.createContext({
+      AbortController,
+      AbortSignal,
+      Promise,
+      Set,
+      Array,
+      Math,
+      Number,
+      String,
+      Error,
+      setTimeout,
+      clearTimeout,
+      console: { log() {}, warn() {}, error() {} },
+      apiUrl: "https://worker.example",
+      apiSecret: "sec",
+      syncOwnerId: "owner-m1",
+      UNLIMITED_LOCAL_WRITES: true,
+      MAX_DAILY_ESTIMATED_WRITES: 100000,
+      stats: { saved: 0, failed: 0, consecutiveFailures: 0, circuitBroken: false, estimatedWrites: 0 },
+      fetch: (url, init = {}) => {
+        const u = String(url);
+        if (u.endsWith("/ingest/sync-lock/release")) {
+          releaseCalls++;
+          return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
+        }
+        writeCalls.push(u);
+        if (init.signal) abortSignals.push(init.signal);
+        firstWriteStarted();
+        if (hangInFlight) {
+          return new Promise(() => {});
+        }
+        return new Promise(resolve => { resolveInFlight = resolve; });
+      }
+    });
+    const patchedPrefix = `
+      let syncLockReleasePromise = null;
+      let abortRequested = false;
+      const ingestAbortController = new AbortController();
+      const inFlightIngestWrites = new Set();
+      const INGEST_ABORT_DRAIN_TIMEOUT_MS = 40;
+      const INGEST_ABORT_CANCEL_GRACE_MS = 25;
+      let stopAndReleasePromise = null;
+    `;
+    vm.runInContext(
+      `${patchedPrefix}\n${fnCode}\nglobalThis.__stop = stopWorkAndReleaseSyncLock;\nglobalThis.__post = post;\nglobalThis.__postRoots = postCommentsByRoot;\nglobalThis.__getStats = () => stats;\nglobalThis.__getAbortReq = () => abortRequested;`,
+      ctx
+    );
+
+    // 发起一个在途写请求并等其进入 fetch
+    const inFlightPromise = ctx.__post("/ingest/content", { pk: "answer:1" });
+    await firstWriteStartedPromise;
+    assert.equal(writeCalls.length, 1);
+
+    // 触发中止协调：立即阻断新写；未结束前不得释放云锁
+    const stopPromise = ctx.__stop();
+    assert.equal(ctx.__getAbortReq(), true);
+    assert.equal(ctx.__getStats().circuitBroken, true);
+    await assert.rejects(() => ctx.__post("/ingest/content", { pk: "answer:2" }), /abort_requested/);
+    const rootAborted = await ctx.__postRoots("answer:2", [], { partial: false, allRootIds: [] });
+    assert.equal(rootAborted.aborted, true);
+    assert.equal(writeCalls.length, 1, "中止后不得再发出任何新 fetch");
+    assert.equal(releaseCalls, 0, "在途写入结束前绝不可释放云端锁");
+
+    if (!hangInFlight) {
+      resolveInFlight({
+        ok: true,
+        status: 200,
+        json: async () => ({ created: true }),
+        text: async () => ""
+      });
+      await inFlightPromise;
+      await stopPromise;
+      assert.equal(releaseCalls, 1, "全部在途写入结束后才释放 1 次云端锁");
+    } else {
+      await stopPromise;
+      assert.equal(abortSignals.length, 1);
+      assert.equal(abortSignals[0].aborted, true, "超时后必须调用 ingestAbortController.abort()");
+      assert.equal(releaseCalls, 0, "仍有未确认结束的挂死写入时绝不可提前释放云端锁");
+    }
+  };
+
+  await runScenario({ hangInFlight: false });
+  await runScenario({ hangInFlight: true });
+});
+
+test("[M2][M3] crawler hot 模式不传 partial:false、score 回退保留在 commentSyncIncomplete、syncHotCommentsForContent 空页二次确认", async () => {
+  const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const crawlerRequire = createRequire(path.join(ROOT, "apps", "apify-crawler", "package.json"));
+  const tsMod = await import(pathToFileURL(crawlerRequire.resolve("typescript")).href);
+  const ts = tsMod.default ?? tsMod;
+  const crawlerJs = ts.transpileModule(crawlerSrc, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+  }).outputText;
+
+  const fnCode = [
+    extractFunction(crawlerJs, "pickCommentImageUrl"),
+    extractFunction(crawlerJs, "normalizeCommentImage"),
+    extractFunction(crawlerJs, "toChildComment"),
+    extractFunction(crawlerJs, "toRootCommentGroup"),
+    "async " + extractFunction(crawlerJs, "runScraperBody"),
+    "async " + extractFunction(crawlerJs.replace("export async function syncHotCommentsForContent(", "async function syncHotCommentsForContent("), "syncHotCommentsForContent")
+  ].join("\n");
+
+  const makeRoots = (prefix, count, startIdx = 0) =>
+    Array.from({ length: count }, (_, idx) => {
+      const n = startIdx + idx;
+      return {
+        id: `${prefix}-${n}`,
+        content: `comment ${n}`,
+        author: { name: `U${n}`, avatar_url: "" },
+        vote_count: n,
+        child_comment_count: 0,
+        child_comments: []
+      };
+    });
+
+  let zhihuHandler;
+  let postRootCalls = [];
+  let postRootAborted = false;
+  let incompleteSet = new Set();
+  const makeStats = () => ({
+    saved: 0, failed: 0, authRejected: 0, riskEmpty: 0, zhihuRejected: 0,
+    riskFailStreak: 0, riskExhausted: false, riskPaused: false, riskPauseMs: 0,
+    consecutiveFailures: 0, circuitBroken: false, estimatedWrites: 0
+  });
+  const sandbox = {
+    URL,
+    Set,
+    Map,
+    Array,
+    Number,
+    String,
+    Boolean,
+    Math,
+    encodeURIComponent,
+    setTimeout,
+    clearTimeout,
+    console: { log() {}, warn() {}, error() {} },
+    MAX_COMMENT_PAGES: 200,
+    ZHIHU_USERNAME: "tester",
+    isFast: false,
+    cfg: { commentsMyAnswers: "full", commentsCollections: "full", commentsUpvotes: "full", commentsFollowing: "full" },
+    stats: makeStats(),
+    get commentSyncIncomplete() { return incompleteSet; },
+    jitterSleep: async () => {},
+    createStealthContext: async () => ({ addCookies: async () => {} }),
+    getCookiesArray: () => [],
+    fetchAnswerTrueStats: async () => null,
+    resolveAnswerQuestionMeta: (q, id) => ({ sourceUrl: `https://www.zhihu.com/question/1/answer/${id}`, question: q }),
+    cleanHtml: s => String(s || ""),
+    toIsoOrNull: () => "2026-01-01T00:00:00.000Z",
+    sendContent: async () => ({ created: false, changed: false, prevCommentCount: 0 }),
+    shouldSyncCommentsDeep: async () => true,
+    sanitizeErrorForLog: e => String(e?.message || e),
+    zhihuJson: async (ctx, url, opts) => zhihuHandler(ctx, url, opts),
+    postCommentsByRoot: async (contentPk, roots, opts = {}) => {
+      postRootCalls.push({ contentPk, count: roots.length, opts });
+      return { batches: 1, roots: roots.length, children: 0, aborted: postRootAborted };
+    }
+  };
+  const ctx = vm.createContext(sandbox);
+  vm.runInContext(`${fnCode}\nglobalThis.__run = runScraperBody;\nglobalThis.__syncHot = syncHotCommentsForContent;`, ctx);
+
+  // 1) M2: hot 模式在 runScraperBody 下即使根评论不足 1 页，绝不提交 partial: false
+  postRootCalls = [];
+  incompleteSet = new Set();
+  sandbox.cfg.commentsMyAnswers = "hot";
+  sandbox.stats = makeStats();
+  zhihuHandler = async (_c, url) => {
+    if (url.includes("/members/tester/answers")) {
+      return {
+        json: {
+          data: [{ id: "ans-hot", type: "answer", comment_count: 5, content: "<p>body</p>", question: { id: 1, title: "Q" } }],
+          paging: { is_end: true }
+        }
+      };
+    }
+    return { json: { data: makeRoots("hot", 2), paging: { is_end: true } } };
+  };
+  await ctx.__run({});
+  assert.equal(postRootCalls.length, 1);
+  assert.equal(postRootCalls[0].opts.partial, true, "hot 模式绝不允许提交 partial: false");
+
+  // 2) M2: full 模式 score 回退抓满 200 根后，两条链路都必须把 contentPk 保留在 commentSyncIncomplete
+  sandbox.cfg.commentsMyAnswers = "full";
+  postRootCalls = [];
+  incompleteSet = new Set();
+  sandbox.stats = makeStats();
+  zhihuHandler = async (_c, url) => {
+    if (url.includes("/members/tester/answers")) {
+      return {
+        json: {
+          data: [{ id: "ans-score-200", type: "answer", comment_count: 300, content: "<p>body</p>", question: { id: 1, title: "Q" } }],
+          paging: { is_end: true }
+        }
+      };
+    }
+    if (url.includes("order_by=ts")) return { json: { data: [], paging: { is_end: false } } };
+    const pageIdx = Number(new URL(url).searchParams.get("offset") || "0");
+    return {
+      json: {
+        data: makeRoots("s", 20, pageIdx * 20),
+        paging: pageIdx + 1 < 10
+          ? { is_end: false, next: `https://www.zhihu.com/api/v4/comment_v5/answers/ans-score-200/root_comment?order_by=score&limit=20&offset=${pageIdx + 1}` }
+          : { is_end: true }
+      }
+    };
+  };
+  await ctx.__run({});
+  assert.equal(incompleteSet.has("answer:ans-score-200"), true, "runScraperBody score 回退必须保留在 commentSyncIncomplete");
+
+  incompleteSet = new Set();
+  const hotScoreOutcome = await ctx.__syncHot({}, "article", "art-score-200", "full");
+  assert.equal(hotScoreOutcome, "failed");
+  assert.equal(incompleteSet.has("article:art-score-200"), true, "syncHotCommentsForContent score 回退必须保留在 commentSyncIncomplete");
+
+  // 3) M3: syncHotCommentsForContent full 模式首页空页二次确认（非 0 预期或未知预期时）
+  postRootCalls = [];
+  incompleteSet = new Set();
+  let emptyCalls = 0;
+  zhihuHandler = async () => {
+    emptyCalls++;
+    if (emptyCalls === 1) return { json: { data: [], paging: { is_end: true } } };
+    return { json: { data: makeRoots("rec", 1), paging: { is_end: true } } };
+  };
+  const failConfirmRes = await ctx.__syncHot({}, "answer", "ans-empty-fail", "full");
+  assert.equal(failConfirmRes, "failed");
+  assert.equal(emptyCalls, 2);
+  assert.equal(postRootCalls.length, 0, "二次确认未通过绝不得清零");
+  assert.equal(incompleteSet.has("answer:ans-empty-fail"), true);
+
+  // 确认两次均空，但 postCommentsByRoot 返回 aborted=true 时必须标 failed
+  postRootCalls = [];
+  incompleteSet = new Set();
+  emptyCalls = 0;
+  postRootAborted = true;
+  zhihuHandler = async () => {
+    emptyCalls++;
+    return { json: { data: [], paging: { is_end: true } } };
+  };
+  const abortedEmptyRes = await ctx.__syncHot({}, "answer", "ans-empty-aborted", "full");
+  assert.equal(abortedEmptyRes, "failed");
+  assert.equal(emptyCalls, 2);
+  assert.equal(postRootCalls.length, 1);
+  assert.equal(incompleteSet.has("answer:ans-empty-aborted"), true);
+
+  // 明确传入 expectedCommentCount = 0 时免二次确认直接清零
+  postRootCalls = [];
+  incompleteSet = new Set();
+  emptyCalls = 0;
+  postRootAborted = false;
+  const zeroExpectedRes = await ctx.__syncHot({}, "answer", "ans-empty-zero", "full", 0);
+  assert.equal(zeroExpectedRes, "ok");
+  assert.equal(emptyCalls, 1);
+  assert.equal(postRootCalls.length, 1);
+  assert.deepEqual(Array.from(postRootCalls[0].opts.allRootIds), []);
+});
+
+test("[M4] repair-local-images 在服务端钳制 limit=12 时连续消费 25 条图片任务直至清空", async () => {
+  const http = await import("node:http");
+  let remainingTasks = 25;
+  const batchSizesClaimed = [];
+  const server = http.createServer(async (req, res) => {
+    if (req.method === "POST" && req.url === "/ingest/image-batch") {
+      let bodyText = "";
+      for await (const chunk of req) bodyText += chunk;
+      const body = JSON.parse(bodyText || "{}");
+      const effectiveLimit = Math.min(Number(body.limit) || 6, 12);
+      const claimed = Math.min(effectiveLimit, remainingTasks);
+      remainingTasks -= claimed;
+      batchSizesClaimed.push(claimed);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ claimed, done: claimed, failed: 0, retry: 0, limit: effectiveLimit }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+
+  try {
+    const fnCode = [
+      extractFunction(repairImagesSrc, "normalizeBatchResult"),
+      "async " + extractFunction(repairImagesSrc, "consumeImageBatches")
+    ].join("\n");
+    const ctx = vm.createContext({
+      opts: { imageBatchSize: 20, imageMaxBatches: 0 },
+      IMAGE_BATCH_TIMEOUT_MS: 5000,
+      log() {},
+      localRequest: async (pathname, init) => {
+        const res = await fetch(`http://127.0.0.1:${port}${pathname}`, init);
+        const json = await res.json();
+        return { res, json };
+      }
+    });
+    vm.runInContext(`${fnCode}\nglobalThis.__consume = consumeImageBatches;`, ctx);
+    await ctx.__consume({ value: "sec" });
+    assert.equal(remainingTasks, 0, "25 条待消费任务必须在连续批中全部消费完");
+    assert.deepEqual(batchSizesClaimed, [12, 12, 1, 0], "服务端钳制 12 时不应因 12 < 20 而早停");
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
+test("[M8][M9][M15] local-sync 代理透传与双向强杀等待、run-comment-repair 启动期清理与 SIGHUP、full-local-harvest 清 signal", async () => {
+  // M8: local-sync 两处无条件 NODE_USE_ENV_PROXY=1 且 !isProxyParent 超时同样 SIGKILL + forceKillTimer
+  assert.match(localSyncSrc, /\.\.\.\(process\.env\.HTTPS_PROXY \? \{ NODE_USE_ENV_PROXY: "1" \} : \{\}\),/);
+  assert.match(localSyncSrc, /const hasHttpsProxy = Boolean\(process\.env\.HTTPS_PROXY\);[\s\S]{0,400}NODE_USE_ENV_PROXY: hasHttpsProxy \? "1" : \(process\.env\.NODE_USE_ENV_PROXY \|\| ""\),/);
+  assert.doesNotMatch(localSyncSrc, /if \(isProxyParent\) \{\s*try \{ childToStop\.kill\("SIGKILL"\)/);
+  assert.match(localSyncSrc, /try \{ childToStop\.kill\("SIGKILL"\); \} catch \{ \/\* ignore \*\/ \}\s*forceKillTimer = setTimeout/);
+
+  // M9: run-comment-repair 启动中登记 startingWorkerProc 并在失败/信号时停进程组，非 Windows 监听并解绑 SIGHUP
+  const repairCommentsSrc = readScript("scripts/run-comment-repair.mjs");
+  assert.match(repairCommentsSrc, /if \(process\.platform !== "win32"\) process\.once\("SIGHUP", handleSignal\)/);
+  assert.match(repairCommentsSrc, /if \(process\.platform !== "win32"\) process\.off\("SIGHUP", handleSignal\)/);
+  assert.match(repairCommentsSrc, /if \(startingWorkerProc\)/);
+
+  const spawnedProcs = [];
+  const stoppedProcs = [];
+  const startWorkerSrc = extractFunction(repairCommentsSrc, "startLocalWorker");
+  const repairCtx = vm.createContext({
+    WORKER_DIR: ".",
+    WRANGLER_BIN: "wrangler",
+    process: { execPath: "node", platform: "linux" },
+    spawn: () => {
+      const p = { pid: 5566, on() {}, stderr: { on() {} } };
+      spawnedProcs.push(p);
+      return p;
+    },
+    stopLocalWorker: p => stoppedProcs.push(p),
+    fetch: async () => { throw new Error("boot fail"); },
+    sleep: async () => {},
+    Date: { now: (() => { let t = 0; return () => (t += 65_000); })() }
+  });
+  vm.runInContext(`async ${startWorkerSrc}\nglobalThis.__start = startLocalWorker;`, repairCtx);
+  let recordedSpawn = null;
+  await assert.rejects(
+    () => repairCtx.__start(18787, proc => { recordedSpawn = proc; }),
+    /启动失败/
+  );
+  assert.equal(recordedSpawn, spawnedProcs[0], "spawn 后必须立即通过回调登记 proc");
+  assert.equal(stoppedProcs[0], spawnedProcs[0], "启动失败时必须调用 stopLocalWorker 清理 proc");
+
+  // M15: full-local-harvest 模板、resetProgress 与 runStageWithCooldown 均置 entry.signal = null
+  const stageConst = /const STAGES = \[[\s\S]*?\n\];/.exec(harvestSrc)[0];
+  const policyConst = /const GOLDEN_POLICY = Object\.freeze\(\{[\s\S]*?\}\);/.exec(harvestSrc)[0];
+  const harvestPure = loadPureFunctions(
+    harvestSrc,
+    ["emptyProgress", "resetProgress"],
+    `const LOCAL_WORKER_URL = "http://127.0.0.1:18787";\nfunction writeProgress() {}\n${stageConst}\n${policyConst}`
+  );
+  const prog = harvestPure.emptyProgress();
+  for (const id of Object.keys(prog.stages)) {
+    assert.equal(prog.stages[id].signal, null, `emptyProgress stages.${id}.signal 必须为 null`);
+    prog.stages[id].signal = "SIGTERM";
+  }
+  harvestPure.resetProgress(prog);
+  for (const id of Object.keys(prog.stages)) {
+    assert.equal(prog.stages[id].signal, null, `resetProgress 必须清零 stages.${id}.signal`);
+  }
+  assert.match(harvestSrc, /entry\.exitCode = null;\s*entry\.signal = null;/);
 });

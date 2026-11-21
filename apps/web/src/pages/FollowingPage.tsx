@@ -106,7 +106,8 @@ function FollowingHome() {
   const [error, setError] = useState("");
   const [togglingToken, setTogglingToken] = useState<string | null>(null);
   const [aiResults, setAiResults] = useState<Record<string, any>>(recommendStore.aiCache);
-  const [aiLoadingPk, setAiLoadingPk] = useState<string | null>(null);
+  const [aiLoadingPks, setAiLoadingPks] = useState<Record<string, boolean>>({});
+  const aiLoadingSetRef = useRef<Set<string>>(new Set());
   // 关注列表与动态流共用 loading/error，因此共用一个请求序号：
   // 切 tab/搜索/切换 onlyRisk 时旧回包不得再覆盖新列表或清掉新请求的 loading
   const listReqRef = useRef(0);
@@ -223,8 +224,9 @@ function FollowingHome() {
   const handleAiAssess = async (e: React.MouseEvent, pk: string) => {
     e.preventDefault();
     e.stopPropagation();
-    if (aiResults[pk] || aiLoadingPk === pk) return;
-    setAiLoadingPk(pk);
+    if (aiResults[pk] || aiLoadingSetRef.current.has(pk)) return;
+    aiLoadingSetRef.current.add(pk);
+    setAiLoadingPks(prev => ({ ...prev, [pk]: true }));
     const callAssess = (tokenStr?: string) => {
       const headers: Record<string, string> = { "content-type": "application/json" };
       if (tokenStr && tokenStr.trim()) headers.authorization = `Bearer ${tokenStr.trim()}`;
@@ -258,7 +260,13 @@ function FollowingHome() {
     } catch (err: any) {
       alert(`AI 评估失败: ${err?.message || err}`);
     } finally {
-      setAiLoadingPk(prev => (prev === pk ? null : prev));
+      aiLoadingSetRef.current.delete(pk);
+      setAiLoadingPks(prev => {
+        if (!prev[pk]) return prev;
+        const next = { ...prev };
+        delete next[pk];
+        return next;
+      });
     }
   };
 
@@ -494,7 +502,7 @@ function FollowingHome() {
                 <button
                   type="button"
                   onClick={e => handleAiAssess(e, item.pk)}
-                  disabled={aiLoadingPk === item.pk}
+                  disabled={Boolean(aiLoadingPks[item.pk])}
                   style={{
                     padding: "2px 10px",
                     borderRadius: 4,
@@ -505,7 +513,7 @@ function FollowingHome() {
                     cursor: "pointer"
                   }}
                 >
-                  {aiLoadingPk === item.pk ? "AI 鉴定中…" : aiResults[item.pk] ? "✅ 已鉴定" : "🛡️ AI 风险鉴定"}
+                  {aiLoadingPks[item.pk] ? "AI 鉴定中…" : aiResults[item.pk] ? "✅ 已鉴定" : "🛡️ AI 风险鉴定"}
                 </button>
                 <span className="footer-right">
                   {fmtDate(item.updated_time || item.created_time || item.last_seen_at)}

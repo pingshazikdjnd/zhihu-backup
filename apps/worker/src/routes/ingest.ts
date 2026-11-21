@@ -364,7 +364,7 @@ ingestRoutes.post("/image-batch", async c => {
     : IMAGE_TASK_BATCH_DEFAULT_LIMIT;
 
   const result = await processImageBatch(bucket, limit);
-  return c.json(result);
+  return c.json({ ...result, limit });
 });
 
 ingestRoutes.post("/comments", async c => {

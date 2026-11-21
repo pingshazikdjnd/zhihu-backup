@@ -34,7 +34,8 @@ export default function RecommendPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [aiResults, setAiResults] = useState<Record<string, any>>(recommendStore.aiCache);
-  const [aiLoadingPk, setAiLoadingPk] = useState<string | null>(null);
+  const [aiLoadingPks, setAiLoadingPks] = useState<Record<string, boolean>>({});
+  const aiLoadingSetRef = useRef<Set<string>>(new Set());
   const [similarMap, setSimilarMap] = useState<Record<string, any[]>>(recommendStore.similarCache);
   const [similarLoadingPk, setSimilarLoadingPk] = useState<string | null>(null);
   const [similarError, setSimilarError] = useState<Record<string, string>>({});
@@ -92,8 +93,9 @@ export default function RecommendPage() {
   const handleAiAssess = async (e: React.MouseEvent, pk: string) => {
     e.preventDefault();
     e.stopPropagation();
-    if (aiResults[pk] || aiLoadingPk === pk) return;
-    setAiLoadingPk(pk);
+    if (aiResults[pk] || aiLoadingSetRef.current.has(pk)) return;
+    aiLoadingSetRef.current.add(pk);
+    setAiLoadingPks(prev => ({ ...prev, [pk]: true }));
     const callAssess = (tokenStr?: string) => {
       const headers: Record<string, string> = { "content-type": "application/json" };
       if (tokenStr && tokenStr.trim()) headers.authorization = `Bearer ${tokenStr.trim()}`;
@@ -127,7 +129,13 @@ export default function RecommendPage() {
     } catch (err: any) {
       alert(`AI 风险鉴定失败: ${err?.message || err}`);
     } finally {
-      setAiLoadingPk(prev => (prev === pk ? null : prev));
+      aiLoadingSetRef.current.delete(pk);
+      setAiLoadingPks(prev => {
+        if (!prev[pk]) return prev;
+        const next = { ...prev };
+        delete next[pk];
+        return next;
+      });
     }
   };
 
@@ -380,7 +388,7 @@ export default function RecommendPage() {
                 <button
                   type="button"
                   onClick={e => handleAiAssess(e, item.pk)}
-                  disabled={aiLoadingPk === item.pk}
+                  disabled={Boolean(aiLoadingPks[item.pk])}
                   style={{
                     padding: "2px 10px",
                     borderRadius: 4,
@@ -391,7 +399,7 @@ export default function RecommendPage() {
                     cursor: "pointer"
                   }}
                 >
-                  {aiLoadingPk === item.pk ? "AI 鉴定中…" : aiResults[item.pk] ? "✅ 已鉴定" : "🛡️ AI 风险鉴定"}
+                  {aiLoadingPks[item.pk] ? "AI 鉴定中…" : aiResults[item.pk] ? "✅ 已鉴定" : "🛡️ AI 风险鉴定"}
                 </button>
                 <button
                   type="button"

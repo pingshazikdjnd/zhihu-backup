@@ -249,12 +249,13 @@ async function pickWorkerPort(startPort) {
   throw new Error(`端口 ${startPort}..${startPort + 19} 均不可用`);
 }
 
-async function startLocalWorker(port) {
+async function startLocalWorker(port, onSpawn) {
   const proc = spawn(process.execPath, [WRANGLER_BIN, "dev", "--local", "--port", String(port)], {
     cwd: WORKER_DIR,
     stdio: ["pipe", "pipe", "pipe"],
     detached: process.platform !== "win32"
   });
+  if (typeof onSpawn === "function") onSpawn(proc);
   let dead = false;
   let exitCode = null;
   let errTail = "";
@@ -266,24 +267,28 @@ async function startLocalWorker(port) {
     errTail = (errTail + d.toString()).slice(-3000);
   });
 
-  const baseUrl = `http://127.0.0.1:${port}`;
-  const deadline = Date.now() + 60_000;
-  let ready = false;
-  while (Date.now() < deadline && !dead) {
-    try {
-      const res = await fetch(`${baseUrl}/api/health`);
-      if (res.ok) {
-        ready = true;
-        break;
-      }
-    } catch {}
-    await sleep(500);
-  }
-  if (!ready) {
+  try {
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const deadline = Date.now() + 60_000;
+    let ready = false;
+    while (Date.now() < deadline && !dead) {
+      try {
+        const res = await fetch(`${baseUrl}/api/health`);
+        if (res.ok) {
+          ready = true;
+          break;
+        }
+      } catch {}
+      await sleep(500);
+    }
+    if (!ready) {
+      throw new Error(`本地 Worker (${baseUrl}) 启动失败 (exit=${exitCode}): ${errTail}`);
+    }
+    return { proc, baseUrl, isDead: () => dead };
+  } catch (err) {
     stopLocalWorker(proc);
-    throw new Error(`本地 Worker (${baseUrl}) 启动失败 (exit=${exitCode}): ${errTail}`);
+    throw err;
   }
-  return { proc, baseUrl, isDead: () => dead };
 }
 
 function stopLocalWorker(proc) {
@@ -553,18 +558,30 @@ async function main() {
 
   acquireLock();
   let worker = null;
+  let startingWorkerProc = null;
   let secret = "";
 
   const ensureWorker = async () => {
     if (worker && !worker.isDead()) return;
     const port = await pickWorkerPort(opts.preferredPort);
     log(`[worker] 正在端口 ${port} 启动单实例本地 Worker...`);
-    worker = await startLocalWorker(port);
+    try {
+      worker = await startLocalWorker(port, (proc) => {
+        startingWorkerProc = proc;
+      });
+    } finally {
+      startingWorkerProc = null;
+    }
     secret = await resolveWorkerSecret(worker.baseUrl, creds.secrets);
     log(`[worker] 本地 Worker 就绪 (${worker.baseUrl})，账号=${creds.username}`);
   };
 
   const cleanupWorker = () => {
+    if (startingWorkerProc) {
+      stopLocalWorker(startingWorkerProc);
+      startingWorkerProc = null;
+      log("[worker] 本地 Worker 已停止。");
+    }
     if (worker) {
       stopLocalWorker(worker.proc);
       worker = null;
@@ -592,6 +609,7 @@ async function main() {
   };
   process.once("SIGINT", handleSignal);
   process.once("SIGTERM", handleSignal);
+  if (process.platform !== "win32") process.once("SIGHUP", handleSignal);
 
   const markItemDone = (kind, pk) => {
     if (kind === "closed") {
@@ -726,6 +744,9 @@ async function main() {
 
     log(`🎉 第 4 步评论补采队列执行完成！累计已核销断点 ${completedSet.size} 条，跳过 ${skippedSet.size} 条。`);
   } finally {
+    process.off("SIGINT", handleSignal);
+    process.off("SIGTERM", handleSignal);
+    if (process.platform !== "win32") process.off("SIGHUP", handleSignal);
     if (progressDirty) saveProgress(progress);
     cleanupWorker();
     releaseLock();

@@ -1262,7 +1262,7 @@ authRoutes.get("/zhihu-status", async c => {
     activeTokenInfo = await getActiveWriteTokenInfo(c);
   } catch (e) {
     console.error("read write token failed (migration applied?):", e);
-    activeTokenInfo = { token: "", source: "none" };
+    return c.json({ error: "Auth storage unavailable" }, 503);
   }
   const syncConfig = await getSyncConfig(c.env.BUCKET);
   // 环境变量注入的 Key 同样算「已配置」，但明文永不回传：只暴露 hasFallbackAiKey
