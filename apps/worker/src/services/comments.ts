@@ -832,7 +832,7 @@ async function replaceCommentsByRootInner(
                 : stored.children)
             : legacyList;
         archivedChildren = archiveMergeChildren(prevChildren, [], true);
-        if (archivedChildren.length === 0 && !existingThread) {
+        if (archivedChildren.length === 0 && !existingThread && existingChildCount === 0) {
           continue;
         }
         nextThreadHash = await sha256(JSON.stringify({ children: archivedChildren, complete: true }));
@@ -858,7 +858,7 @@ async function replaceCommentsByRootInner(
       }
 
       if (r2Ready) {
-        const archivedCount = Math.max(archivedChildren.length, existingThread?.child_count ?? 0);
+        const archivedCount = Math.max(archivedChildren.length, existingThread?.child_count ?? 0, existingChildCount);
         threadStmts.push(database.prepare(`
           INSERT INTO comment_threads (
             root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at
@@ -1094,7 +1094,7 @@ async function replaceCommentsByRootInner(
 export async function listRootComments(
   database: D1Database,
   contentPk: string,
-  opts: { limit?: number; offset?: number } = {},
+  opts: { limit?: number; offset?: number; liveOnly?: boolean } = {},
   bucket?: any
 ): Promise<RootCommentRow[]> {
   // 上限 50：D1 单条 SQL 最多 100 个绑定参数，历史预览兜底查询要为每个根绑定
@@ -1102,6 +1102,9 @@ export async function listRootComments(
   // 前端每页只取 20，完全兼容。
   const limit = clampInt(opts.limit, 20, 1, 50);
   const offset = clampInt(opts.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+  const liveOnly = Boolean(opts.liveOnly);
+  const liveFilter = liveOnly ? " AND c.is_deleted = 0" : "";
+  const liveBareFilter = liveOnly ? " AND is_deleted = 0" : "";
 
   const result = await database.prepare(`
     SELECT c.id, c.content_pk, c.author_name, c.author_avatar, c.be_replied,
@@ -1119,7 +1122,7 @@ export async function listRootComments(
            t.synced_at AS thread_synced_at
     FROM comments c
     LEFT JOIN comment_threads t ON t.root_id = c.id
-    WHERE c.content_pk = ? AND c.parent_comment_id IS NULL
+    WHERE c.content_pk = ? AND c.parent_comment_id IS NULL${liveFilter}
     ORDER BY c.is_top DESC, c.likes DESC, c.id DESC
     LIMIT ? OFFSET ?
   `).bind(contentPk, limit, offset).all<RootCommentRow>();
@@ -1131,7 +1134,7 @@ export async function listRootComments(
   if (rows.length === 0) {
     if (offset > 0 && offloadTargets.length > 0) {
       const mainIdsResult = await database.prepare(
-        `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL`
+        `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL${liveBareFilter}`
       ).bind(contentPk).all<{ id: string }>().catch(() => ({ results: [] as Array<{ id: string }> }));
       const mainIds = new Set(
         (mainIdsResult.results ?? []).map(r => r.id).filter(Boolean)
@@ -1144,7 +1147,7 @@ export async function listRootComments(
         const seen = new Set(mainIds);
         const dedupedRemote: RootCommentRow[] = [];
         for (const target of offloadTargets) {
-          const remoteRows = await fetchOffloadRootComments(target, contentPk, fetchLimit, 0);
+          const remoteRows = await fetchOffloadRootComments(target, contentPk, fetchLimit, 0, liveOnly);
           for (const row of remoteRows) {
             if (seen.has(row.id)) continue;
             seen.add(row.id);
@@ -1157,7 +1160,7 @@ export async function listRootComments(
       }
     }
     for (const target of offloadTargets) {
-      const remoteRows = await fetchOffloadRootComments(target, contentPk, limit, offset);
+      const remoteRows = await fetchOffloadRootComments(target, contentPk, limit, offset, liveOnly);
       if (remoteRows.length > 0) return remoteRows;
     }
     return rows;
@@ -1183,7 +1186,7 @@ export async function listRootComments(
       SELECT id, parent_comment_id, author_name, be_replied, content_md, likes, is_author, is_deleted
       FROM (
         SELECT id, parent_comment_id, author_name, be_replied, content_md, likes, is_author, is_deleted,
-               ROW_NUMBER() OVER (PARTITION BY parent_comment_id ORDER BY first_seen_at ASC) AS rn
+               ROW_NUMBER() OVER (PARTITION BY parent_comment_id ORDER BY is_deleted ASC, first_seen_at ASC) AS rn
         FROM comments
         WHERE parent_comment_id IN (${placeholders})
       )
@@ -1227,14 +1230,14 @@ export async function listRootComments(
     const seen = new Set(finalRows.map(row => row.id));
     if (offset > 0) {
       const mainIdsResult = await database.prepare(
-        `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL`
+        `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL${liveBareFilter}`
       ).bind(contentPk).all<{ id: string }>().catch(() => ({ results: [] as Array<{ id: string }> }));
       for (const r of mainIdsResult.results ?? []) {
         if (r.id) seen.add(r.id);
       }
     }
     for (const target of offloadTargets) {
-      const remoteRows = await fetchOffloadRootComments(target, contentPk, limit + offset, 0);
+      const remoteRows = await fetchOffloadRootComments(target, contentPk, limit + offset, 0, liveOnly);
       for (const row of remoteRows) {
         if (seen.has(row.id)) continue;
         seen.add(row.id);
@@ -1249,7 +1252,9 @@ export async function listRootComments(
 }
 
 // 与主 D1 查询同构：外部库的 comments 存根评论行，comment_threads 存子评论数与预览
-const REMOTE_ROOT_COMMENTS_SQL = `
+function buildRemoteRootCommentsSql(liveOnly: boolean): string {
+  const liveFilter = liveOnly ? " AND c.is_deleted = 0" : "";
+  return `
   SELECT c.id, c.content_pk, c.author_name, c.author_avatar, c.be_replied,
          c.content_md, c.img_url, c.time_text, c.location, c.likes,
          c.is_author, c.is_top, c.is_featured, c.is_deleted, c.comment_hash,
@@ -1265,10 +1270,11 @@ const REMOTE_ROOT_COMMENTS_SQL = `
          t.synced_at AS thread_synced_at
   FROM comments c
   LEFT JOIN comment_threads t ON t.root_id = c.id
-  WHERE c.content_pk = ? AND c.parent_comment_id IS NULL
+  WHERE c.content_pk = ? AND c.parent_comment_id IS NULL${liveFilter}
   ORDER BY c.is_top DESC, c.likes DESC, c.id DESC
   LIMIT ? OFFSET ?
 `;
+}
 
 function normalizeRemoteRootRows(rows: Record<string, any>[]): RootCommentRow[] {
   const normalized: RootCommentRow[] = [];
@@ -1308,10 +1314,11 @@ async function fetchOffloadRootComments(
   target: ExternalStorageTarget,
   contentPk: string,
   limit: number,
-  offset: number
+  offset: number,
+  liveOnly = false
 ): Promise<RootCommentRow[]> {
   try {
-    const result = await executeRemoteSql(target, REMOTE_ROOT_COMMENTS_SQL, [contentPk, limit, offset]);
+    const result = await executeRemoteSql(target, buildRemoteRootCommentsSql(liveOnly), [contentPk, limit, offset]);
     return normalizeRemoteRootRows(result.rows);
   } catch (err) {
     console.warn(`[comments] 外部扩容库读取根评论失败 (${target.name}):`, err);
@@ -1696,6 +1703,8 @@ async function replaceCommentsByRootOffloaded(
   // 只有远端或主库确有旧楼中楼历史时，才为 0 回复根捞回旧数据并标已删归档，
   // 避免全新 0 回复根每批白白多发几十次子请求。
   const mainLegacyRootIds = new Set<string>();
+  const mainLegacyThreadChildCountByRoot = new Map<string, number>();
+  const mainLegacyChildrenByRoot = new Map<string, ChildCommentRecord[]>();
   let mainLegacyQueryFailed = false;
   const remoteLegacyRootIds = new Set<string>();
   let remoteLegacyQueryFailed = false;
@@ -1709,23 +1718,52 @@ async function replaceCommentsByRootOffloaded(
     );
   if (hasZeroReplyCompleteCandidate) {
     try {
-      const [mainThreadsRes, mainChildrenRes] = await Promise.all([
-        env.DB.prepare(`SELECT root_id FROM comment_threads WHERE content_pk = ?`)
+      const [mainThreadsRes, mainRootsRes, mainChildrenRes] = await Promise.all([
+        env.DB.prepare(`SELECT root_id, child_count FROM comment_threads WHERE content_pk = ?`)
           .bind(input.contentPk)
-          .all<{ root_id: string }>(),
+          .all<{ root_id: string; child_count: number }>(),
         env.DB.prepare(`
-          SELECT id AS root_id FROM comments
+          SELECT id AS root_id, child_count FROM comments
           WHERE content_pk = ? AND parent_comment_id IS NULL AND child_count > 0
-          UNION
-          SELECT DISTINCT parent_comment_id AS root_id FROM comments
+        `).bind(input.contentPk).all<{ root_id: string; child_count: number }>(),
+        env.DB.prepare(`
+          SELECT id, parent_comment_id, author_name, author_avatar, be_replied, content_md,
+                 img_url, time_text, location, likes, is_author, is_deleted
+          FROM comments
           WHERE content_pk = ? AND parent_comment_id IS NOT NULL
-        `).bind(input.contentPk, input.contentPk).all<{ root_id: string }>()
+          ORDER BY first_seen_at ASC
+        `).bind(input.contentPk).all<ChildSelectRow>()
       ]);
       for (const r of mainThreadsRes.results ?? []) {
-        if (r.root_id) mainLegacyRootIds.add(r.root_id);
+        if (!r.root_id) continue;
+        mainLegacyRootIds.add(r.root_id);
+        const count = Number(r.child_count ?? 0) || 0;
+        if (count > 0) {
+          mainLegacyThreadChildCountByRoot.set(
+            r.root_id,
+            Math.max(mainLegacyThreadChildCountByRoot.get(r.root_id) ?? 0, count)
+          );
+        }
       }
-      for (const r of mainChildrenRes.results ?? []) {
-        if (r.root_id) mainLegacyRootIds.add(r.root_id);
+      for (const r of mainRootsRes.results ?? []) {
+        if (!r.root_id) continue;
+        mainLegacyRootIds.add(r.root_id);
+        const count = Number(r.child_count ?? 0) || 0;
+        if (count > 0) {
+          mainLegacyThreadChildCountByRoot.set(
+            r.root_id,
+            Math.max(mainLegacyThreadChildCountByRoot.get(r.root_id) ?? 0, count)
+          );
+        }
+      }
+      for (const row of mainChildrenRes.results ?? []) {
+        const parentId = row.parent_comment_id;
+        if (!parentId) continue;
+        mainLegacyRootIds.add(parentId);
+        const child = mapStoredChildRow(row);
+        const list = mainLegacyChildrenByRoot.get(parentId);
+        if (list) list.push(child);
+        else mainLegacyChildrenByRoot.set(parentId, [child]);
       }
     } catch {
       mainLegacyQueryFailed = true;
@@ -1847,7 +1885,7 @@ async function replaceCommentsByRootOffloaded(
       }
 
       const raw = storedBlobByRoot.get(root.id);
-      if (raw === null || remoteLegacyReadFailed) {
+      if (mainLegacyQueryFailed || remoteLegacyQueryFailed || raw === null || remoteLegacyReadFailed) {
         if (existingThread) {
           const fallbackHash = existingThread.thread_hash ?? "";
           if (
@@ -1913,20 +1951,54 @@ async function replaceCommentsByRootOffloaded(
         continue;
       }
 
-      // 迁移前主库有历史线程/子评论而外部库尚无回复：从主 R2 捞回并标已删归档，防止切换 offload 后丢失旧楼中楼
+      // 迁移前主库有历史线程/子评论而外部库尚无回复：从主 R2 与主 D1 捞回并标已删归档，防止切换 offload 后丢失旧楼中楼
+      const mainLegacyList = mainLegacyChildrenByRoot.get(root.id) ?? [];
       if (prevChildren.length === 0 && hadMainLegacyData) {
         const mainStored = await readStoredChildThread(env.BUCKET, root.id, { bypassCache: true });
-        if (mainStored.status === "ok" && mainStored.children.length > 0) {
-          prevChildren = mainStored.children;
+        if (mainStored.status === "error") {
+          console.warn(`[comments] skip offload archive empty for ${root.id}: main R2 object unreadable`);
+          if (existingThread) {
+            const fallbackHash = existingThread.thread_hash ?? "";
+            if (
+              !(
+                existingThread.is_complete === 0 &&
+                existingThread.incoming_hash === "" &&
+                existingThread.thread_hash === fallbackHash
+              )
+            ) {
+              threadUpsertRows.push([
+                root.id,
+                input.contentPk,
+                childCommentsKey(root.id),
+                existingThread.child_count,
+                0,
+                fallbackHash,
+                "",
+                existingThread.preview_json ?? "[]",
+                now
+              ]);
+            }
+          }
+          continue;
+        }
+        if (mainStored.status === "ok") {
+          prevChildren = archiveMergeChildren(mainLegacyList, mainStored.children, false);
+        } else {
+          prevChildren = mainLegacyList;
         }
       }
 
       const archivedChildren = archiveMergeChildren(prevChildren, [], true);
-      if (archivedChildren.length === 0 && !existingThread && !hadMainLegacyData) {
+      if (archivedChildren.length === 0 && !existingThread && !hadMainLegacyData && existingRootChildCount === 0) {
         continue;
       }
       const archivedThreadHash = await sha256(JSON.stringify({ children: archivedChildren, complete: true }));
-      const archivedCount = Math.max(archivedChildren.length, existingThread?.child_count ?? 0);
+      const archivedCount = Math.max(
+        archivedChildren.length,
+        existingThread?.child_count ?? 0,
+        existingRootChildCount,
+        mainLegacyThreadChildCountByRoot.get(root.id) ?? 0
+      );
       const previewJson = JSON.stringify(buildPreviewReplies(archivedChildren));
       blobUpsertRows.push([
         root.id,

@@ -1523,6 +1523,7 @@ test("[P0-1][P1-4] crawler score 回退不触发全量删对账，畸形响应�
   }).outputText;
 
   const fnCode = [
+    extractFunction(crawlerJs, "explicitCommentCount"),
     extractFunction(crawlerJs, "pickCommentImageUrl"),
     extractFunction(crawlerJs, "normalizeCommentImage"),
     extractFunction(crawlerJs, "toChildComment"),
@@ -2139,6 +2140,7 @@ test("[M2][M3] crawler hot 模式不传 partial:false、score 回退保留在 co
   }).outputText;
 
   const fnCode = [
+    extractFunction(crawlerJs, "explicitCommentCount"),
     extractFunction(crawlerJs, "pickCommentImageUrl"),
     extractFunction(crawlerJs, "normalizeCommentImage"),
     extractFunction(crawlerJs, "toChildComment"),
@@ -2406,4 +2408,174 @@ test("[M8][M9][M15] local-sync 代理透传与双向强杀等待、run-comment-r
     assert.equal(prog.stages[id].signal, null, `resetProgress 必须清零 stages.${id}.signal`);
   }
   assert.match(harvestSrc, /entry\.exitCode = null;\s*entry\.signal = null;/);
+});
+
+test("[PR2-2][PR2-5] fetchStoredCommentState 带 live_only=1；缺失 comment_count 不归一为 0 跳过二次确认", async () => {
+  const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const crawlerRequire = createRequire(path.join(ROOT, "apps", "apify-crawler", "package.json"));
+  const tsMod = await import(pathToFileURL(crawlerRequire.resolve("typescript")).href);
+  const ts = tsMod.default ?? tsMod;
+  const crawlerJs = ts.transpileModule(crawlerSrc, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+  }).outputText;
+
+  // 1) 静态检查：所有 syncHotCommentsForContent 与 pendingCommentsQueue 均通过 explicitCommentCount 传递显式数字或 undefined
+  assert.match(crawlerSrc, /function explicitCommentCount\(raw: unknown\): number \| undefined/);
+  assert.match(crawlerSrc, /root-comments\?limit=50&live_only=1/);
+  assert.match(crawlerSrc, /if \(task\.explicitCommentCount === 0\) \{/);
+  assert.match(crawlerSrc, /let confirmedEmpty = task\.explicitCommentCount === 0;/);
+  assert.doesNotMatch(
+    crawlerSrc,
+    /syncHotCommentsForContent\([^;\n]*,\s*contentInput\.commentCount\s*\)/,
+    "不得再把已归零的 contentInput.commentCount 直接传给 syncHotCommentsForContent"
+  );
+  assert.doesNotMatch(
+    crawlerSrc,
+    /syncHotCommentsForContent\([^;\n]*\|\|\s*0\s*\)/,
+    "不得再把 || 0 传给 syncHotCommentsForContent"
+  );
+
+  // 2) VM 行为验证：explicitCommentCount、fetchStoredCommentState(?live_only=1) 与 syncHotCommentsForContent(undefined) 二次确认
+  const fnCode = [
+    extractFunction(crawlerJs, "explicitCommentCount"),
+    extractFunction(crawlerJs, "isStoredRootCommentRow"),
+    extractFunction(crawlerJs, "shouldSyncComments"),
+    "async " + extractFunction(crawlerJs, "fetchStoredCommentState"),
+    "async " + extractFunction(crawlerJs, "shouldSyncCommentsDeep"),
+    extractFunction(crawlerJs, "pickCommentImageUrl"),
+    extractFunction(crawlerJs, "normalizeCommentImage"),
+    extractFunction(crawlerJs, "toChildComment"),
+    extractFunction(crawlerJs, "toRootCommentGroup"),
+    "async " + extractFunction(crawlerJs.replace("export async function syncHotCommentsForContent(", "async function syncHotCommentsForContent("), "syncHotCommentsForContent")
+  ].join("\n");
+
+  const requestedUrls = [];
+  let zhihuCalls = 0;
+  let postRootCalls = [];
+  const sandbox = {
+    URL,
+    Set,
+    Map,
+    Array,
+    Number,
+    String,
+    Boolean,
+    Math,
+    encodeURIComponent,
+    setTimeout,
+    clearTimeout,
+    console: { log() {}, warn() {}, error() {} },
+    apiUrl: "http://127.0.0.1:8787",
+    apiSecret: "sec",
+    MAX_COMMENT_PAGES: 200,
+    cfg: { commentsMyAnswers: "full", commentsCollections: "full", commentsUpvotes: "full", commentsFollowing: "full" },
+    stats: {
+      saved: 0, failed: 0, authRejected: 0, riskEmpty: 0, zhihuRejected: 0,
+      riskFailStreak: 0, riskExhausted: false, riskPaused: false, riskPauseMs: 0,
+      consecutiveFailures: 0, circuitBroken: false, estimatedWrites: 0
+    },
+    commentSyncIncomplete: new Set(),
+    jitterSleep: async () => {},
+    sanitizeErrorForLog: e => String(e?.message || e),
+    fetch: async (url) => {
+      requestedUrls.push(String(url));
+      // 模拟服务端按 live_only=1 过滤掉 50 条已删归档根后，直接返回全部 10 条存活根评论
+      const liveRows = Array.from({ length: 10 }, () => ({ is_deleted: 0, child_count: 0, is_complete: 1 }));
+      return { ok: true, json: async () => ({ data: liveRows }) };
+    },
+    zhihuJson: async () => {
+      zhihuCalls++;
+      return { json: { data: [], paging: { is_end: true } } };
+    },
+    postCommentsByRoot: async (contentPk, roots, opts = {}) => {
+      postRootCalls.push({ contentPk, count: roots.length, opts });
+      return { batches: 1, roots: roots.length, children: 0, aborted: false };
+    }
+  };
+  const ctx = vm.createContext(sandbox);
+  vm.runInContext(
+    `${fnCode}
+    globalThis.__explicit = explicitCommentCount;
+    globalThis.__deep = shouldSyncCommentsDeep;
+    globalThis.__syncHot = syncHotCommentsForContent;`,
+    ctx
+  );
+
+  assert.equal(ctx.__explicit(undefined), undefined);
+  assert.equal(ctx.__explicit(null), undefined);
+  assert.equal(ctx.__explicit(NaN), undefined);
+  assert.equal(ctx.__explicit(-1), undefined);
+  assert.equal(ctx.__explicit("0"), undefined);
+  assert.equal(ctx.__explicit(0), 0);
+  assert.equal(ctx.__explicit(12), 12);
+
+  // live_only=1 拿到 10 条存活根评论（10 * 3 >= 20 且 10 * 2 >= 20）→ 不触发无限重抓
+  const needSync = await ctx.__deep("answer:123", 20, 20, "full");
+  assert.equal(needSync, false);
+  assert.match(requestedUrls[0], /\/api\/contents\/answer%3A123\/root-comments\?limit=50&live_only=1$/);
+
+  // 缺失 comment_count（undefined）即使第 1 页返回空数组 + is_end=true，也必须发起二次确认（2 次请求）
+  const syncRes = await ctx.__syncHot({}, "answer", "ans-missing-cc", "full", ctx.__explicit(undefined));
+  assert.equal(syncRes, "ok");
+  assert.equal(zhihuCalls, 2, "缺失 comment_count 时绝不能跳过空页二次确认");
+  assert.equal(postRootCalls.length, 1);
+  assert.deepEqual(Array.from(postRootCalls[0].opts.allRootIds), []);
+});
+
+test("[PR2-6][PR2-9] run-comment-repair finally 容错清理并最后解绑信号；local-sync 提示 Node >= 22.21 / >= 24.0", async () => {
+  const repairCommentsSrc = readScript("scripts/run-comment-repair.mjs").replace(/\r\n/g, "\n");
+
+  // 1) run-comment-repair：saveProgress 抛错时仍执行 cleanupWorker/rmSync/releaseLock，最后才 process.off
+  const finallyStart = repairCommentsSrc.indexOf("  } finally {\n    try {\n      if (progressDirty) saveProgress(progress);");
+  assert.ok(finallyStart >= 0, "run-comment-repair finally 必须先 try/catch saveProgress");
+  const finallyBlock = repairCommentsSrc.slice(finallyStart, repairCommentsSrc.indexOf("\n}\n\nmain().catch", finallyStart));
+  assert.ok(finallyBlock.indexOf("saveProgress(progress)") < finallyBlock.indexOf("cleanupWorker()"));
+  assert.ok(finallyBlock.indexOf("cleanupWorker()") < finallyBlock.indexOf("releaseLock()"));
+  assert.ok(finallyBlock.indexOf("releaseLock()") < finallyBlock.indexOf('process.off("SIGINT"'));
+  assert.ok(finallyBlock.indexOf("releaseLock()") < finallyBlock.indexOf('process.off("SIGHUP"'));
+
+  // 行为验证：把 main() 末尾 outer finally 逻辑抽到隔离 VM，注入抛错 saveProgress，验证执行顺序与完整清理
+  const events = [];
+  const offCalls = [];
+  const outerFinallyMarker = "  } finally {\n    try {\n      if (progressDirty) saveProgress(progress);";
+  const outerFinallyStart = "  } finally {";
+  const outerFinallyIdx = repairCommentsSrc.indexOf(outerFinallyMarker);
+  const outerFinallyEnd = repairCommentsSrc.indexOf("\n}\n\nmain().catch", outerFinallyIdx);
+  assert.ok(outerFinallyIdx >= 0 && outerFinallyEnd > outerFinallyIdx, "应定位到 run-comment-repair 末尾 outer finally");
+  const outerFinallyRaw = repairCommentsSrc.slice(outerFinallyIdx + outerFinallyStart.length, outerFinallyEnd).trimEnd();
+  assert.ok(outerFinallyRaw.endsWith("}"), "outer finally 必须以 } 结束");
+  const outerFinallyBody = outerFinallyRaw.slice(0, -1);
+  const cleanCtx = vm.createContext({
+    progressDirty: true,
+    progress: {},
+    INPUT_JSON_PATH: "fake-input.json",
+    handleSignal: () => {},
+    log: msg => events.push(`log:${msg}`),
+    saveProgress: () => { events.push("save"); throw new Error("EPERM"); },
+    cleanupWorker: () => { events.push("cleanupWorker"); },
+    fs: { rmSync: () => { events.push("rmInput"); } },
+    releaseLock: () => { events.push("releaseLock"); },
+    process: {
+      platform: "linux",
+      off: sig => { events.push(`off:${sig}`); offCalls.push(sig); }
+    }
+  });
+  vm.runInContext(`(function(){ try {} finally { ${outerFinallyBody} } })()`, cleanCtx);
+  assert.ok(events.includes("save"));
+  assert.ok(events.includes("cleanupWorker"), "saveProgress 抛错后仍必须调用 cleanupWorker");
+  assert.ok(events.includes("rmInput"), "saveProgress 抛错后仍必须清理 INPUT.json");
+  assert.ok(events.includes("releaseLock"), "saveProgress 抛错后仍必须调用 releaseLock");
+  assert.deepEqual(offCalls, ["SIGINT", "SIGTERM", "SIGHUP"]);
+  assert.ok(
+    events.indexOf("releaseLock") < events.indexOf("off:SIGINT"),
+    "信号处理器必须在全部清理完成后才注销"
+  );
+
+  // 2) local-sync：Node 20 代理降级文案修正，不阻断启动
+  assert.match(localSyncSrc, /原生 fetch 不支持 --use-env-proxy \/ NODE_USE_ENV_PROXY/);
+  assert.match(localSyncSrc, /本次将直连 Worker/);
+  assert.match(localSyncSrc, /Node >= 22\.21 或 >= 24\.0/);
+  assert.doesNotMatch(localSyncSrc, /仍设置 NODE_USE_ENV_PROXY=1|22\.16/);
 });

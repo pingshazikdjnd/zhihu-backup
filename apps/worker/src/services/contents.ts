@@ -370,7 +370,7 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
       UPDATE contents
       SET title = ?, author_name = ?, author_url_token = ?, author_avatar = ?, author_headline = ?,
           source_url = ?, question_id = ?, question_title = ?, content_html = ?, content_md = ?, excerpt = ?,
-          voteup_count = ?, comment_count = ?, archived_comment_count = ?, favorite_count = ?, visit_count = ?,
+          voteup_count = ?, comment_count = ?, archived_comment_count = MAX(COALESCE(archived_comment_count, 0), comment_count, ?), favorite_count = ?, visit_count = ?,
           is_collapsed = ?, is_labeled = ?, label_info = ?,
           created_time = ?, updated_time = ?, content_hash = ?, last_seen_at = ?, is_deleted = 0, deleted_at = NULL
       WHERE pk = ?
@@ -468,7 +468,7 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
     // 若同时有 profileChanges，在同一句里顺带写作者与元数据列，避免资料或修复字段不落库
     await db.prepare(`
       UPDATE contents
-      SET voteup_count = ?, comment_count = ?, archived_comment_count = ?, favorite_count = ?, visit_count = ?,
+      SET voteup_count = ?, comment_count = ?, archived_comment_count = MAX(COALESCE(archived_comment_count, 0), comment_count, ?), favorite_count = ?, visit_count = ?,
           author_name = ?, author_url_token = ?, author_avatar = ?, author_headline = ?,
           source_url = ?, question_id = ?, question_title = ?, label_info = ?,
           excerpt = ?, created_time = ?, updated_time = ?, last_seen_at = ?

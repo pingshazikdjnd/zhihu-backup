@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../lib/api.js";
+import { assessContentRisk } from "../lib/ai-assess.js";
 import { recommendStore } from "../lib/store.js";
 
 const fmtNum = (n: any) => {
@@ -17,14 +18,6 @@ const fmtDate = (val: any) => {
 
 const stripHtml = (html: string) =>
   html ? html.replace(/<[^>]+>/g, "").substring(0, 160) + "..." : "";
-
-function safeSetWriteToken(token: string) {
-  try {
-    localStorage.setItem("cookie_write_token", token);
-  } catch {
-    // 禁用存储/隐私模式不阻断当前请求
-  }
-}
 
 export default function RecommendPage() {
   const navigate = useNavigate();
@@ -93,50 +86,14 @@ export default function RecommendPage() {
   const handleAiAssess = async (e: React.MouseEvent, pk: string) => {
     e.preventDefault();
     e.stopPropagation();
-    if (aiResults[pk] || aiLoadingSetRef.current.has(pk)) return;
-    aiLoadingSetRef.current.add(pk);
-    setAiLoadingPks(prev => ({ ...prev, [pk]: true }));
-    const callAssess = (tokenStr?: string) => {
-      const headers: Record<string, string> = { "content-type": "application/json" };
-      if (tokenStr && tokenStr.trim()) headers.authorization = `Bearer ${tokenStr.trim()}`;
-      return api<any>(`/api/recommend/ai-assess`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ pk })
-      });
-    };
-    try {
-      let res: any;
-      try {
-        res = await callAssess();
-      } catch (err: any) {
-        const msg = String(err?.message || "");
-        const needAuth = msg.startsWith("401") || (msg.startsWith("403") && !/Forbidden origin/i.test(msg));
-        if (!needAuth) throw err;
-        const input = window.prompt("AI 风险鉴定需验证操作密码（验证后本浏览器自动记住）：", "");
-        const trimmed = input?.trim() || "";
-        if (!trimmed) return;
-        res = await callAssess(trimmed);
-        safeSetWriteToken(trimmed);
-      }
-      if (res?.ai) {
-        setAiResults(prev => {
-          const next = { ...prev, [pk]: res.ai };
-          recommendStore.aiCache = next;
-          return next;
-        });
-      }
-    } catch (err: any) {
-      alert(`AI 风险鉴定失败: ${err?.message || err}`);
-    } finally {
-      aiLoadingSetRef.current.delete(pk);
-      setAiLoadingPks(prev => {
-        if (!prev[pk]) return prev;
-        const next = { ...prev };
-        delete next[pk];
-        return next;
-      });
-    }
+    await assessContentRisk({
+      pk,
+      aiResults,
+      aiLoadingSetRef,
+      setAiLoadingPks,
+      setAiResults,
+      errorPrefix: "AI 风险鉴定失败"
+    });
   };
 
   const handleFindSimilar = async (e: React.MouseEvent, pk: string) => {

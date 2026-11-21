@@ -118,7 +118,9 @@ contentRoutes.get("/:pk/root-comments", async c => {
   const pk = c.req.param("pk");
   const limit = parseInt(c.req.query("limit") || "20", 10);
   const offset = parseInt(c.req.query("offset") || "0", 10);
-  const data = await listRootComments(c.env.DB, pk, { limit, offset }, c.env.BUCKET);
+  const liveOnlyParam = (c.req.query("live_only") || "").trim().toLowerCase();
+  const liveOnly = liveOnlyParam === "1" || liveOnlyParam === "true";
+  const data = await listRootComments(c.env.DB, pk, { limit, offset, liveOnly }, c.env.BUCKET);
   return c.json({
     data,
     limit: Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 20,

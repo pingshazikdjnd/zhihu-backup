@@ -61,6 +61,7 @@ function loadFunctions(src, names, sandbox, prelude = "") {
 }
 
 const apiSrc = read("apps/web/src/lib/api.ts");
+const aiAssessSrc = read("apps/web/src/lib/ai-assess.ts");
 const contentsSrc = read("apps/web/src/pages/ContentsPage.tsx");
 const questionsSrc = read("apps/web/src/pages/QuestionsPage.tsx");
 const followingSrc = read("apps/web/src/pages/FollowingPage.tsx");
@@ -528,21 +529,25 @@ test("前端边界与安全增强：ErrorBoundary 路由复位、sanitize 防御
 test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页去重、筛选切 Tab 重拉与空格/双击防护", async () => {
   const commentTreeSrc = read("apps/web/src/components/CommentTree.tsx");
 
-  // 1) FollowingPage & RecommendPage：首次请求不主动读 localStorage 传 Authorization，交由 api() 同源策略控制；
-  //    仅 401/403 弹窗输入非空/非纯空格口令重试后，才传入 Authorization 并 safeSetWriteToken（保留 try/catch 保护）
+  // 1) FollowingPage & RecommendPage & ai-assess.ts：首次请求不主动读 localStorage 传 Authorization，
+  //    交由 api() 同源策略控制；仅 401/403 弹窗输入非空/非纯空格口令重试后，才传入 Authorization 并 safeSetWriteToken（保留 try/catch 保护）
   for (const [label, src] of [["FollowingPage", followingSrc], ["RecommendPage", recommendSrc]]) {
     assert.doesNotMatch(src, /safeGetWriteToken/, `${label} 首次请求不得自行读取 localStorage 口令`);
-    assert.match(src, /function safeSetWriteToken\(/, `${label} 必须使用 safeSetWriteToken`);
     const directLsCalls = src.match(/\blocalStorage\.(getItem|setItem)/g) || [];
-    assert.equal(directLsCalls.length, 1, `${label} 只允许在 safeSetWriteToken 中调用 localStorage.setItem`);
-    assert.match(src, /if \(tokenStr && tokenStr\.trim\(\)\) headers\.authorization = `Bearer \$\{tokenStr\.trim\(\)\}`/);
-    assert.match(src, /window\.prompt\("AI 风险鉴定需验证操作密码/);
-    assert.match(src, /if \(aiResults\[pk\] \|\| aiLoadingSetRef\.current\.has\(pk\)\) return;/, `${label} handleAiAssess 必须拦截正在加载中的双击`);
-    assert.match(src, /const trimmed = input\?\.trim\(\) \|\| "";\s*if \(!trimmed\)/, `${label} prompt 必须拦截纯空格输入`);
+    assert.equal(directLsCalls.length, 0, `${label} 不得直接调用 localStorage，应复用 ai-assess.ts 的 safeSetWriteToken`);
+    assert.match(src, /from ["']\.\.\/lib\/ai-assess\.js["']/, `${label} 必须复用共享 ai-assess.ts 模块`);
+    assert.match(src, /await assessContentRisk\(/, `${label} handleAiAssess 必须调用共享 assessContentRisk`);
   }
+  assert.doesNotMatch(aiAssessSrc, /safeGetWriteToken/, "ai-assess.ts 首次请求不得自行读取 localStorage 口令");
+  assert.match(aiAssessSrc, /export function safeSetWriteToken\(/, "ai-assess.ts 必须导出 safeSetWriteToken");
+  const aiLsCalls = aiAssessSrc.match(/\blocalStorage\.(getItem|setItem)/g) || [];
+  assert.equal(aiLsCalls.length, 1, "ai-assess.ts 只允许在 safeSetWriteToken 中调用 localStorage.setItem");
+  assert.match(aiAssessSrc, /if \(tokenStr && tokenStr\.trim\(\)\) headers\.authorization = `Bearer \$\{tokenStr\.trim\(\)\}`/);
+  assert.match(aiAssessSrc, /window\.prompt\("AI 风险鉴定需验证操作密码/);
+  assert.match(aiAssessSrc, /if \(aiResults\[pk\] \|\| aiLoadingSetRef\.current\.has\(pk\)\) return;/, "assessContentRisk 必须拦截正在加载中的双击");
+  assert.match(aiAssessSrc, /const trimmed = input\?\.trim\(\) \|\| "";\s*if \(!trimmed\)/, "ai-assess.ts prompt 必须拦截纯空格输入");
+  assert.match(aiAssessSrc, /await callAssess\(\);/, "assessContentRisk 首次请求必须无参调用 callAssess()");
   assert.match(followingSrc, /await doCall\(\);/, "postUserModeWithAuth 首次请求必须无参调用 doCall()");
-  assert.match(followingSrc, /await callAssess\(\);/, "FollowingPage handleAiAssess 首次请求必须无参调用 callAssess()");
-  assert.match(recommendSrc, /await callAssess\(\);/, "RecommendPage handleAiAssess 首次请求必须无参调用 callAssess()");
 
   // 1b) 行为验证 [P1-1]：跨源 VITE_API_BASE + 预置 localStorage.cookie_write_token 时，
   //     postUserModeWithAuth 首次请求不携带 Authorization；prompt 纯空格取消不发请求；输入口令重试才携带
@@ -560,6 +565,9 @@ test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页�
     }).outputText;
 
   const apiJs = transpile(apiSrc);
+  const aiAssessJs = transpile(aiAssessSrc)
+    .replace(/^\s*import\s+[^;]+;\s*$/gm, "")
+    .replace(/\bexport\s+/g, "");
   const followingJs = transpile(followingSrc);
 
   const localStore = new Map([["cookie_write_token", "local-secret-token"]]);
@@ -598,7 +606,7 @@ test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页�
       return `function ${name}(${params.join(", ")}) {${body}}`;
     }),
     (() => {
-      const { params, body } = extractFunctionBody(followingJs, "safeSetWriteToken");
+      const { params, body } = extractFunctionBody(aiAssessJs, "safeSetWriteToken");
       return `function safeSetWriteToken(${params.join(", ")}) {${body}}`;
     })(),
     (() => {
@@ -642,32 +650,15 @@ test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页�
   assert.equal(fetchCalls[1].headers.authorization, "Bearer new-token-123");
   assert.equal(localStore.get("cookie_write_token"), "new-token-123");
 
-  // 1c) 行为验证 [P1-1][P2-6]：RecommendPage handleAiAssess 跨源首次请求不外泄口令，
+  // 1c) 行为验证 [P1-1][P2-6]：共享 assessContentRisk 跨源首次请求不外泄口令，
   //     401 后 prompt 输入才带 Bearer 重试；双击正在加载中的 pk 直接忽略
-  const recJs = transpile(recommendSrc);
-  const recSafeSetDecl = extractFunctionBody(recJs, "safeSetWriteToken");
-  const recAssessStart = recJs.indexOf("const handleAiAssess = async (e, pk) => {");
-  assert.ok(recAssessStart >= 0, "transpiled RecommendPage 缺少 handleAiAssess");
-  const braceOpen = recJs.indexOf("{", recAssessStart);
-  let recDepth = 0;
-  let braceEnd = -1;
-  for (let i = braceOpen; i < recJs.length; i++) {
-    if (recJs[i] === "{") recDepth++;
-    else if (recJs[i] === "}") {
-      recDepth--;
-      if (recDepth === 0) {
-        braceEnd = i;
-        break;
-      }
-    }
-  }
-  const recAssessBody = recJs.slice(braceOpen + 1, braceEnd);
   localStore.set("cookie_write_token", "local-secret-token");
   fetchCalls.length = 0;
   promptQueue = ["  rec-secret  "];
   let aiLoadingPksVal = {};
   const aiLoadingSet = new Set();
   let aiResultsVal = {};
+  const alertMsgs = [];
   let apiHandler = async (p, opts) => {
     const headersObj = Object.fromEntries(new Headers(opts?.headers).entries());
     fetchCalls.push({ url: p, headers: headersObj });
@@ -678,30 +669,33 @@ test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页�
     api: (p, opts) => apiHandler(p, opts),
     window: { prompt: () => promptQueue.shift() ?? null },
     localStorage: lsMock,
-    alert: msg => { throw new Error(`unexpected alert: ${msg}`); },
-    recommendStore: { aiCache: {} },
-    aiLoadingSetRef: { current: aiLoadingSet },
-    get aiResults() { return aiResultsVal; },
-    setAiLoadingPks: fn => { aiLoadingPksVal = typeof fn === "function" ? fn(aiLoadingPksVal) : fn; },
-    setAiResults: fn => { aiResultsVal = typeof fn === "function" ? fn(aiResultsVal) : fn; }
+    alert: msg => { alertMsgs.push(String(msg)); },
+    recommendStore: { aiCache: {} }
   });
   vm.runInContext(
-    `function safeSetWriteToken(${recSafeSetDecl.params.join(", ")}) {${recSafeSetDecl.body}}
-     async function handleAiAssess(e, pk) {${recAssessBody}}
-     globalThis.__handleAiAssess = handleAiAssess;`,
+    `${aiAssessJs}\nglobalThis.__assessContentRisk = assessContentRisk;`,
     recCtx
   );
-  const fakeEvent = { preventDefault() {}, stopPropagation() {} };
+  const callSharedAssess = (pk, errorPrefix = "AI 风险鉴定失败") =>
+    recCtx.__assessContentRisk({
+      pk,
+      aiResults: aiResultsVal,
+      aiLoadingSetRef: { current: aiLoadingSet },
+      setAiLoadingPks: fn => { aiLoadingPksVal = typeof fn === "function" ? fn(aiLoadingPksVal) : fn; },
+      setAiResults: fn => { aiResultsVal = typeof fn === "function" ? fn(aiResultsVal) : fn; },
+      errorPrefix
+    });
   // 模拟加载中双击：aiLoadingSet 已含 answer:1 时必须直接返回
   aiLoadingSet.add("answer:1");
-  await recCtx.__handleAiAssess(fakeEvent, "answer:1");
+  await callSharedAssess("answer:1");
   assert.equal(fetchCalls.length, 0, "加载中重复点击不得发起请求");
   aiLoadingSet.delete("answer:1");
-  await recCtx.__handleAiAssess(fakeEvent, "answer:1");
+  await callSharedAssess("answer:1");
   assert.equal(fetchCalls.length, 2);
-  assert.equal(fetchCalls[0].headers.authorization, undefined, "handleAiAssess 首次请求不得带本地口令");
+  assert.equal(fetchCalls[0].headers.authorization, undefined, "assessContentRisk 首次请求不得带本地口令");
   assert.equal(fetchCalls[1].headers.authorization, "Bearer rec-secret");
   assert.equal(localStore.get("cookie_write_token"), "rec-secret");
+  assert.equal(alertMsgs.length, 0);
 
   // 1d) 并发点击 A、B：重复点 A 被拦截，B 结束后 A 仍保持锁定直到 A 完成
   fetchCalls.length = 0;
@@ -714,14 +708,14 @@ test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页�
     fetchCalls.push({ url: p, pk: body.pk });
     return new Promise(resolve => { deferredByPk.set(body.pk, resolve); });
   };
-  const pA = recCtx.__handleAiAssess(fakeEvent, "answer:A");
-  const pB = recCtx.__handleAiAssess(fakeEvent, "answer:B");
+  const pA = callSharedAssess("answer:A");
+  const pB = callSharedAssess("answer:B");
   assert.equal(fetchCalls.length, 2);
   assert.equal(aiLoadingSet.has("answer:A"), true);
   assert.equal(aiLoadingSet.has("answer:B"), true);
   assert.equal(aiLoadingPksVal["answer:A"], true);
   assert.equal(aiLoadingPksVal["answer:B"], true);
-  await recCtx.__handleAiAssess(fakeEvent, "answer:A");
+  await callSharedAssess("answer:A");
   assert.equal(fetchCalls.length, 2, "A 加载中再次点击 A 必须被拦截");
   deferredByPk.get("answer:B")({ ai: { model: "m", analysis: "B ok" } });
   await pB;
@@ -773,6 +767,6 @@ test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页�
 
   // 4) [防删归档] CommentTree 为已删除根评论、预览回复、展开子评论渲染「已删除」徽标
   assert.match(commentTreeSrc, /comment\.is_deleted === 1[\s\S]{0,200}已删除/);
-  assert.match(commentTreeSrc, /reply\.isDeleted[\s\S]{0,200}已删除/);
+  assert.match(commentTreeSrc, /\{reply\.isDeleted\s*&&\s*<span[^>]*>已删除<\/span>\}/);
   assert.match(commentTreeSrc, /child\.isDeleted[\s\S]{0,200}已删除/);
 });

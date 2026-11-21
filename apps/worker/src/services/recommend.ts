@@ -345,7 +345,7 @@ async function buildScoredPool(env: Bindings): Promise<ScoredPool> {
   const candidates = await db.prepare(`
     SELECT c.pk, c.source_type, c.source_id, c.title, c.question_id, c.question_title,
            c.source_url, c.author_name, c.author_url_token, c.author_avatar, c.author_headline,
-           c.excerpt, c.voteup_count, MAX(c.comment_count, COALESCE(c.archived_comment_count, 0)) AS comment_count, c.favorite_count, c.visit_count,
+           c.excerpt, c.voteup_count, MAX(c.comment_count, COALESCE(c.archived_comment_count, 0)) AS comment_count, c.comment_count AS live_comment_count, c.archived_comment_count, c.favorite_count, c.visit_count,
            c.is_deleted, c.is_collapsed, c.is_labeled, c.label_info,
            c.created_time, c.updated_time, c.last_seen_at,
            u.upvote_time,
@@ -562,7 +562,7 @@ export async function getSimilarContents(pk: string) {
   const rows = await db.prepare(`
     SELECT c.pk, c.source_type, c.source_id, c.title, c.question_id, c.question_title,
            c.source_url, c.author_name, c.author_url_token, c.author_avatar, c.author_headline,
-           c.excerpt, c.voteup_count, MAX(c.comment_count, COALESCE(c.archived_comment_count, 0)) AS comment_count, c.favorite_count,
+           c.excerpt, c.voteup_count, MAX(c.comment_count, COALESCE(c.archived_comment_count, 0)) AS comment_count, c.comment_count AS live_comment_count, c.archived_comment_count, c.favorite_count,
            c.is_deleted, c.is_collapsed, c.is_labeled, c.label_info,
            c.updated_time, c.last_seen_at
     FROM contents c
@@ -611,7 +611,7 @@ export async function getSimilarContents(pk: string) {
 export async function assessContentWithWorkersAI(env: Bindings, pk: string) {
   const row = await db.prepare(`
     SELECT pk, source_type, source_id, title, question_title, author_name,
-           excerpt, content_hash, voteup_count, MAX(comment_count, COALESCE(archived_comment_count, 0)) AS comment_count, favorite_count,
+           excerpt, content_hash, voteup_count, MAX(comment_count, COALESCE(archived_comment_count, 0)) AS comment_count, comment_count AS live_comment_count, archived_comment_count, favorite_count,
            is_deleted, is_collapsed, is_labeled, label_info
     FROM contents WHERE pk = ?
   `).get<any>(pk);
@@ -680,6 +680,12 @@ export async function assessContentWithWorkersAI(env: Bindings, pk: string) {
     return bodySnippet;
   };
 
+  const liveComments = Number(row.live_comment_count ?? row.comment_count) || 0;
+  const displayComments = Number(row.comment_count) || 0;
+  const commentSummary = liveComments !== displayComments
+    ? `现网 ${liveComments} 评论 / 归档 ${displayComments} 评论`
+    : `${displayComments} 评论`;
+
   const buildAssessmentPrompt = (bodySnippet: string) =>
     `你是一个专业的知乎内容归档与防和谐风险评估助手。请分析以下已备份的知乎回答，用简洁犀利的中文给出评估（控制在 180 字以内，分三点输出）：
 1. 【和谐风险鉴定】：判断该回答在知乎原站被折叠/删除的风险（高/中/低），点明具体容易触发审核的敏感点或争议点；
@@ -687,7 +693,7 @@ export async function assessContentWithWorkersAI(env: Bindings, pk: string) {
 3. 【归档建议】：给出抢救备份级别建议。
 
 问题标题：${row.question_title || row.title}
-答主：${row.author_name || "匿名"}（${row.voteup_count} 赞同 / ${row.favorite_count} 收藏 / ${row.comment_count} 评论）
+答主：${row.author_name || "匿名"}（${row.voteup_count} 赞同 / ${row.favorite_count} 收藏 / ${commentSummary}）
 原站状态：${row.is_deleted ? "已被删除" : row.is_collapsed ? "已被折叠" : "正常"}
 正文摘录：${wrapUntrustedText(bodySnippet, 1200)}`;
 

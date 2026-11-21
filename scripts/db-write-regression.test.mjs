@@ -180,7 +180,7 @@ class Hono {
   get(path, handler) { this.handlers.set("GET " + path, handler); return this }
   post(path, handler) { this.handlers.set("POST " + path, handler); return this }
   route() { return this }
-  async __call(method, path, { body, headers, url, executionCtx } = {}, env = {}) {
+  async __call(method, path, { body, headers, url, executionCtx, params } = {}, env = {}) {
     const handler = this.handlers.get(method + " " + path);
     if (!handler) throw new Error("no handler for " + method + " " + path);
     let status = 200;
@@ -193,6 +193,7 @@ class Hono {
       req: {
         url: url || ("http://127.0.0.1/api/auth" + path),
         header: name => lower[String(name).toLowerCase()],
+        param: name => (params || {})[name],
         query: name => new URL(url || ("http://127.0.0.1/api/auth" + path)).searchParams.get(name) ?? undefined,
         json: async () => body
       },
@@ -1732,7 +1733,7 @@ test("外部存储目标：保存脱敏、编辑保留 token、isolate 缓存命
   const afterSave = await runWithDb(countingD1, () => auth.getExternalTargetsRaw(bucket));
   assert.equal(afterSave.length, 1);
   assert.equal(afterSave[0].authToken, "secret-turso-token-1234", "服务端内部仍需保留 token 用于转发");
-  assert.equal(d1Selects, 1, "保存后应命中内存缓存，不再查 D1");
+  assert.equal(d1Selects, 2, "保存锁内重读 1 次 D1 后，读取应直接命中内存缓存（不再多查 D1）");
 
   // 4) GET 列表同样只返回脱敏字段
   const listRes = await call("GET", "/external-targets");
@@ -1786,7 +1787,7 @@ test("外部存储目标：保存脱敏、编辑保留 token、isolate 缓存命
   const denied = await call("POST", "/external-targets/delete", { body: { id: savedId } });
   assert.equal(denied.status, 401);
 
-  // 8) 删除：缓存立即刷新，D1 与 R2 都清空
+  // 8) 删除：锁内失效缓存重读一次 D1 并写回最新状态，随后读取命中缓存不再查 D1
   // 上面的 401 分支会查一次写口令（app_settings SELECT），从这里重新计数
   d1Selects = 0;
   const delRes = await call("POST", "/external-targets/delete", {
@@ -1795,8 +1796,10 @@ test("外部存储目标：保存脱敏、编辑保留 token、isolate 缓存命
   });
   assert.equal(delRes.status, 200);
   assert.deepEqual(delRes.body.targets, []);
+  const selectsAfterDelete = d1Selects;
+  assert.equal(selectsAfterDelete, 1, "delete 锁内失效缓存后应精确重读 1 次 D1");
   assert.deepEqual(await runWithDb(countingD1, () => auth.getExternalTargetsRaw(bucket)), []);
-  assert.equal(d1Selects, 0, "删除与读取全部命中缓存/early-return，不应产生 D1 SELECT");
+  assert.equal(d1Selects, selectsAfterDelete, "删除刷新缓存后读取应直接命中缓存，不再产生 D1 SELECT");
   assert.equal(
     JSON.parse(sqlite.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(auth.EXTERNAL_TARGETS_KEY).value).length,
     0
@@ -3619,7 +3622,11 @@ test("[P1-5] localizeImage 全局并发槽位 <= 4 且异常归还；processImag
     const totalOps = selectOps + nonBatchRunOps + batchOps + bucketOps + fetchOps;
     assert.equal(batchRes.claimed, imageTasksModule.IMAGE_TASK_BATCH_DEFAULT_LIMIT);
     assert.equal(batchRes.done, imageTasksModule.IMAGE_TASK_BATCH_DEFAULT_LIMIT);
-    assert.equal(batchOps, 2, "领取与状态回写必须各走 1 次 db.batch");
+    assert.equal(
+      batchOps,
+      1 + Math.ceil(imageTasksModule.IMAGE_TASK_BATCH_DEFAULT_LIMIT / 4),
+      "领取走 1 次 db.batch，随后按并发分组（<=4）每组完成后立刻各提交 1 次 db.batch"
+    );
     assert.equal(nonBatchRunOps, 0, "状态更新不得逐条调用 db.prepare().run()");
     assert.ok(totalOps < 50, `默认批总子请求/操作次数必须 < 50，实际=${totalOps}`);
     assert.equal(sqlite.prepare(`SELECT COUNT(*) AS n FROM image_tasks WHERE status = 'done'`).get().n, imageTasksModule.IMAGE_TASK_BATCH_DEFAULT_LIMIT);
@@ -5678,4 +5685,741 @@ test("[M11] GET /zhihu-status 在 D1 故障且无 env 写口令兜底时返回 5
   );
   assert.equal(res.status, 503);
   assert.deepEqual(res.body, { error: "Auth storage unavailable" });
+});
+
+test("[PR2-1][PR2-7] offload 0 回复归档：主 R2 报错保留可重试、主 D1 独有旧子评论迁移归档、查询失败不写死空快照，且保留旧 child_count", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+
+  const remoteSqlite = new Database(":memory:");
+  const offloadTarget = {
+    id: "ext-pr2-p0",
+    name: "Turso PR2 P0",
+    provider: "turso",
+    enabled: true,
+    syncScopes: ["comments"],
+    storageRole: "offload",
+    overflowThresholdRows: 1500000,
+    endpointUrl: "https://ext-pr2-p0.example.com",
+    authToken: "tok",
+    createdAt: NOW_ISO,
+    updatedAt: NOW_ISO
+  };
+
+  const originalFetch = globalThis.fetch;
+  let failRemoteLegacyQuery = false;
+  globalThis.fetch = async (_url, init = {}) => {
+    const body = JSON.parse(String(init.body));
+    const results = [];
+    for (const req of body.requests) {
+      if (req.type === "close") { results.push({ type: "ok", response: { type: "close" } }); continue; }
+      const sql = req.stmt.sql;
+      if (failRemoteLegacyQuery && /SELECT root_id FROM child_comment_blobs WHERE content_pk = \?/i.test(sql)) {
+        throw new Error("remote legacy query failed");
+      }
+      const args = (req.stmt.args || []).map(a => (!a || a.type === "null") ? null : (a.type === "integer" || a.type === "float") ? Number(a.value) : String(a.value));
+      const st = remoteSqlite.prepare(sql);
+      if (st.reader) {
+        const cols = st.columns().map(c => ({ name: c.name }));
+        const rows = st.all(...args).map(r => cols.map(c => tursoCell(r[c.name])));
+        results.push({ type: "ok", response: { type: "execute", result: { cols, rows, affected_row_count: 0, last_insert_rowid: null } } });
+      } else {
+        const info = st.run(...args);
+        results.push({ type: "ok", response: { type: "execute", result: { cols: [], rows: [], affected_row_count: info.changes, last_insert_rowid: null } } });
+      }
+    }
+    return { ok: true, status: 200, json: async () => ({ results }), text: async () => "" };
+  };
+
+  const makeZeroRoot = id => ({
+    id,
+    author: "Root",
+    authorAvatar: "",
+    content: "root",
+    img: "",
+    time: NOW_ISO,
+    location: "",
+    likes: 1,
+    isAuthor: false,
+    isTop: false,
+    isFeatured: false,
+    childCount: 0,
+    isChildrenComplete: true,
+    children: []
+  });
+
+  try {
+    await auth.ensureRemoteCommentSchema(offloadTarget);
+
+    // 1) 主库路径 [PR2-7]：0 回复根无 comment_threads 但 comments.child_count = 4 → archivedCount 必须保留 4
+    {
+      const { sqlite: sMain, d1: d1Main } = createMemoryDb();
+      seedContent(sMain);
+      sMain.prepare(`
+        INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, child_count, first_seen_at, last_seen_at, is_deleted)
+        VALUES ('r-main-cnt', ?, NULL, 'U', 'root', 1, 'h', 4, ?, ?, 0)
+      `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+      const mainR2 = new Map();
+      const mainBucket = {
+        async get(k) { const v = mainR2.get(k); return v === undefined ? null : { async text() { return v; } }; },
+        async put(k, v) { mainR2.set(k, String(v)); },
+        async delete() {}
+      };
+      await runWithDb(d1Main, () =>
+        commentsModule.replaceCommentsByRoot({
+          contentPk: CONTENT_PK,
+          partial: false,
+          allRootIds: ["r-main-cnt"],
+          roots: [makeZeroRoot("r-main-cnt")]
+        }, { DB: d1Main, BUCKET: mainBucket })
+      );
+      const th = sMain.prepare(`SELECT child_count, is_complete FROM comment_threads WHERE root_id = 'r-main-cnt'`).get();
+      assert.equal(th.child_count, 4, "主路径 0 回复归档必须保留根表旧 child_count");
+      assert.equal(th.is_complete, 1);
+    }
+
+    // 2) offload 场景：准备主 D1 与主 R2 各类迁移前状态（清除前面主库用例留下的空目标缓存）
+    auth.invalidateExternalTargetsCache();
+    const { sqlite, d1 } = createMemoryDb();
+    seedContent(sqlite);
+    // 2a) 主 R2 存在旧回复，但首轮主 R2 读取抛错（r-r2-err）
+    sqlite.prepare(`
+      INSERT INTO comment_threads (root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at)
+      VALUES ('r-r2-err', ?, 'childcomments/r-r2-err.json', 3, 0, 'th-old', 'in-old', '[]', ?)
+    `).run(CONTENT_PK, NOW_ISO);
+    // 2b) 主 D1 独有旧扁平子评论（主 R2 missing），且主根有历史 child_count = 5（r-d1-only）
+    sqlite.prepare(`
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, child_count, first_seen_at, last_seen_at, is_deleted)
+      VALUES ('r-d1-only', ?, NULL, 'U', 'root d1', 1, 'h1', 5, ?, ?, 0)
+    `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+    sqlite.prepare(`
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+      VALUES ('c-main-flat-1', ?, 'r-d1-only', 'Child', 'from main d1 only', 2, 'hc1', ?, ?, 0)
+    `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+    // 2c) 主 comment_threads 有 child_count = 6 但 R2/D1 无子行（r-main-th-cnt）
+    sqlite.prepare(`
+      INSERT INTO comment_threads (root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at)
+      VALUES ('r-main-th-cnt', ?, 'childcomments/r-main-th-cnt.json', 6, 0, 'th6', 'in6', '[]', ?)
+    `).run(CONTENT_PK, NOW_ISO);
+
+    const r2Store = new Map([
+      [auth.R2_EXTERNAL_TARGETS_KEY, JSON.stringify([offloadTarget])],
+      ["childcomments/r-r2-err.json", JSON.stringify({ children: [{ id: "rescued-r2-1", author: "A", content: "old r2 reply", likes: 9 }], complete: true })]
+    ]);
+    let failR2Key = "childcomments/r-r2-err.json";
+    const bucket = {
+      async get(k) {
+        if (failR2Key && k === failR2Key) throw new Error("R2 transient read error");
+        const v = r2Store.get(k);
+        return v === undefined ? null : { async text() { return v; } };
+      },
+      async put(k, v) { r2Store.set(k, String(v)); },
+      async delete() {}
+    };
+
+    // 预置远端 existingThread（使 r-r2-err 在报错时可观测到被置为可重试 is_complete=0, incoming_hash=""）
+    remoteSqlite.prepare(`
+      INSERT INTO comment_threads (root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at)
+      VALUES ('r-r2-err', ?, 'childcomments/r-r2-err.json', 3, 0, 'th-rem', 'stale-in', '[]', ?)
+    `).run(CONTENT_PK, NOW_ISO);
+    // 2c-bis) 外部库根表已有 child_count=7，但尚无 comment_threads 行且无主库历史（r-remote-cnt）
+    remoteSqlite.prepare(`
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, child_count, first_seen_at, last_seen_at, is_deleted)
+      VALUES ('r-remote-cnt', ?, NULL, 'U', 'remote root', 1, 'h-rc', 7, ?, ?, 0)
+    `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+
+    // 2d) 先模拟远端 legacy 查询失败：不得写死 complete=1 空快照
+    failRemoteLegacyQuery = true;
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        allRootIds: ["r-r2-err", "r-d1-only", "r-main-th-cnt"],
+        roots: [makeZeroRoot("r-r2-err"), makeZeroRoot("r-d1-only"), makeZeroRoot("r-main-th-cnt")]
+      }, { DB: d1, BUCKET: bucket })
+    );
+    assert.equal(
+      remoteSqlite.prepare(`SELECT payload_json FROM child_comment_blobs WHERE root_id = 'r-d1-only'`).get(),
+      undefined,
+      "远端 legacy 查询失败时绝不能写死 complete=1 空快照"
+    );
+    const r2ErrThAfterQueryFail = remoteSqlite.prepare(`SELECT is_complete, incoming_hash FROM comment_threads WHERE root_id = 'r-r2-err'`).get();
+    assert.equal(r2ErrThAfterQueryFail.is_complete, 0);
+    assert.equal(r2ErrThAfterQueryFail.incoming_hash, "");
+    failRemoteLegacyQuery = false;
+
+    // 2e) 模拟主 D1 legacy 查询失败：同样不得写死 complete=1 空快照
+    const failMainLegacyD1 = {
+      prepare(sql) {
+        if (/SELECT root_id, child_count FROM comment_threads/i.test(sql)) {
+          return {
+            bind: () => ({ all: async () => { throw new Error("main D1 read outage"); } }),
+            all: async () => { throw new Error("main D1 read outage"); }
+          };
+        }
+        return d1.prepare(sql);
+      },
+      batch: stmts => d1.batch(stmts)
+    };
+    await runWithDb(failMainLegacyD1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        allRootIds: ["r-d1-only"],
+        roots: [makeZeroRoot("r-d1-only")]
+      }, { DB: failMainLegacyD1, BUCKET: bucket })
+    );
+    assert.equal(
+      remoteSqlite.prepare(`SELECT payload_json FROM child_comment_blobs WHERE root_id = 'r-d1-only'`).get(),
+      undefined,
+      "主 D1 legacy 查询失败时绝不能写死 complete=1 空快照"
+    );
+
+    // 2f) 正常 D1 + 主 R2 r-r2-err 仍报错：r-r2-err 保持可重试、r-d1-only 捞出主 D1 独有扁平子评论、r-main-th-cnt 保留 child_count=6、r-remote-cnt 保留 child_count=7
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        allRootIds: ["r-r2-err", "r-d1-only", "r-main-th-cnt", "r-remote-cnt"],
+        roots: [makeZeroRoot("r-r2-err"), makeZeroRoot("r-d1-only"), makeZeroRoot("r-main-th-cnt"), makeZeroRoot("r-remote-cnt")]
+      }, { DB: d1, BUCKET: bucket })
+    );
+    assert.equal(
+      remoteSqlite.prepare(`SELECT payload_json FROM child_comment_blobs WHERE root_id = 'r-r2-err'`).get(),
+      undefined,
+      "主 R2 读取报错时绝不能往外部库落 complete=1 空快照"
+    );
+    const thErr = remoteSqlite.prepare(`SELECT is_complete, incoming_hash FROM comment_threads WHERE root_id = 'r-r2-err'`).get();
+    assert.equal(thErr.is_complete, 0);
+    assert.equal(thErr.incoming_hash, "");
+
+    const blobD1Only = remoteSqlite.prepare(`SELECT payload_json, complete FROM child_comment_blobs WHERE root_id = 'r-d1-only'`).get();
+    const parsedD1Only = JSON.parse(blobD1Only.payload_json);
+    assert.deepEqual(parsedD1Only.children.map(c => c.id), ["c-main-flat-1"]);
+    assert.equal(parsedD1Only.children[0].isDeleted, true);
+    assert.equal(blobD1Only.complete, 1);
+    const thD1Only = remoteSqlite.prepare(`SELECT child_count FROM comment_threads WHERE root_id = 'r-d1-only'`).get();
+    assert.equal(thD1Only.child_count, 5, "offload 0 回复归档必须保留主 D1 根表旧 child_count");
+
+    const thMainCnt = remoteSqlite.prepare(`SELECT child_count FROM comment_threads WHERE root_id = 'r-main-th-cnt'`).get();
+    assert.equal(thMainCnt.child_count, 6, "offload 0 回复归档必须保留 mainLegacyThreadChildCountByRoot");
+
+    const thRemoteCnt = remoteSqlite.prepare(`SELECT child_count, is_complete FROM comment_threads WHERE root_id = 'r-remote-cnt'`).get();
+    assert.equal(thRemoteCnt?.child_count, 7, "外部库无 comment_threads 且无主库历史时仍必须保留 existingRootChildCount");
+    assert.equal(thRemoteCnt?.is_complete, 1);
+
+    // 2g) 主 R2 恢复后重跑同步：r-r2-err 成功抢救出旧 R2 回复并标 isDeleted=true 落盘外部库
+    failR2Key = null;
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        allRootIds: ["r-r2-err", "r-d1-only", "r-main-th-cnt"],
+        roots: [makeZeroRoot("r-r2-err"), makeZeroRoot("r-d1-only"), makeZeroRoot("r-main-th-cnt")]
+      }, { DB: d1, BUCKET: bucket })
+    );
+    const blobRecovered = remoteSqlite.prepare(`SELECT payload_json, complete FROM child_comment_blobs WHERE root_id = 'r-r2-err'`).get();
+    const parsedRecovered = JSON.parse(blobRecovered.payload_json);
+    assert.deepEqual(parsedRecovered.children.map(c => c.id), ["rescued-r2-1"]);
+    assert.equal(parsedRecovered.children[0].isDeleted, true);
+    assert.equal(blobRecovered.complete, 1);
+    const childrenAfterRecover = await runWithDb(d1, () =>
+      commentsModule.getChildComments(bucket, "r-r2-err", d1)
+    );
+    assert.deepEqual(childrenAfterRecover.map(c => c.id), ["rescued-r2-1"]);
+    assert.equal(childrenAfterRecover[0].isDeleted, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
+
+test("[PR2-2][PR2-8] listRootComments 与 /root-comments 的 live_only=1 过滤（含 offload），且 D1 预览优先展示存活回复", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+
+  const contentsRoute = await loadTs(
+    path.join(workerSrc, "routes", "contents.ts"),
+    new Map([["hono", honoMockUrl]])
+  );
+
+  // 1) 主 D1：50 条高赞已删归档根 + 3 条低赞存活根，外加 D1 扁平子评论（前 2 条已删、第 3 条存活）
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  for (let i = 0; i < 50; i++) {
+    sqlite.prepare(`
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+      VALUES (?, ?, NULL, 'Del', 'deleted root', ?, ?, ?, ?, 1)
+    `).run(`del-${i}`, CONTENT_PK, 1000 + i, `hd-${i}`, NOW_ISO, NOW_ISO);
+  }
+  for (let i = 0; i < 3; i++) {
+    sqlite.prepare(`
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, child_count, first_seen_at, last_seen_at, is_deleted)
+      VALUES (?, ?, NULL, 'Live', 'live root', ?, ?, ?, ?, ?, 0)
+    `).run(`live-${i}`, CONTENT_PK, 10 + i, `hl-${i}`, i === 0 ? 3 : 0, NOW_ISO, NOW_ISO);
+  }
+  // live-0 下无 comment_threads：最早 2 条子评论已删，第 3 条存活 → 预览必须优先展示存活回复
+  sqlite.prepare(`
+    INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+    VALUES
+      ('ch-del-1', ?, 'live-0', 'C1', 'deleted reply 1', 1, 'hc1', '2024-01-01T00:00:01.000Z', ?, 1),
+      ('ch-del-2', ?, 'live-0', 'C2', 'deleted reply 2', 1, 'hc2', '2024-01-01T00:00:02.000Z', ?, 1),
+      ('ch-live-3', ?, 'live-0', 'C3', 'surviving reply 3', 1, 'hc3', '2024-01-01T00:00:03.000Z', ?, 0)
+  `).run(CONTENT_PK, NOW_ISO, CONTENT_PK, NOW_ISO, CONTENT_PK, NOW_ISO);
+
+  // 前端不传 live_only：仍看到高赞已删归档根
+  const frontendRes = await runWithDb(d1, () =>
+    contentsRoute.contentRoutes.__call("/:pk/root-comments", {
+      pk: CONTENT_PK,
+      limit: "50"
+    }, { DB: d1 })
+  );
+  assert.equal(frontendRes.status, 200);
+  assert.equal(frontendRes.body.data.length, 50);
+  assert.ok(frontendRes.body.data.every(r => r.is_deleted === 1));
+
+  // 爬虫传 live_only=1：直接跳过 50 条已删归档，返回全部 3 条存活根
+  const crawlerRes = await runWithDb(d1, () =>
+    contentsRoute.contentRoutes.__call("/:pk/root-comments", {
+      pk: CONTENT_PK,
+      limit: "50",
+      live_only: "1"
+    }, { DB: d1 })
+  );
+  assert.equal(crawlerRes.status, 200);
+  assert.deepEqual(crawlerRes.body.data.map(r => r.id), ["live-2", "live-1", "live-0"]);
+  const live0 = crawlerRes.body.data.find(r => r.id === "live-0");
+  assert.equal(live0.preview_replies[0].id, "ch-live-3", "D1 兜底预览必须优先展示存活回复");
+
+  // 2) offload 混合/远端路径：live_only=1 同样过滤已删根评论
+  const remoteSqlite = new Database(":memory:");
+  const offloadTarget = {
+    id: "ext-live-only",
+    name: "Turso LiveOnly",
+    provider: "turso",
+    enabled: true,
+    syncScopes: ["comments"],
+    storageRole: "offload",
+    overflowThresholdRows: 1500000,
+    endpointUrl: "https://ext-live-only.example.com",
+    authToken: "tok",
+    createdAt: NOW_ISO,
+    updatedAt: NOW_ISO
+  };
+  const offloadBucket = {
+    async get(k) {
+      if (k === auth.R2_EXTERNAL_TARGETS_KEY) {
+        return { async text() { return JSON.stringify([offloadTarget]); } };
+      }
+      return null;
+    },
+    async put() {},
+    async delete() {}
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init = {}) => {
+    const body = JSON.parse(String(init.body));
+    const results = [];
+    for (const req of body.requests) {
+      if (req.type === "close") { results.push({ type: "ok", response: { type: "close" } }); continue; }
+      const args = (req.stmt.args || []).map(a => (!a || a.type === "null") ? null : (a.type === "integer" || a.type === "float") ? Number(a.value) : String(a.value));
+      const st = remoteSqlite.prepare(req.stmt.sql);
+      if (st.reader) {
+        const cols = st.columns().map(c => ({ name: c.name }));
+        const rows = st.all(...args).map(r => cols.map(c => tursoCell(r[c.name])));
+        results.push({ type: "ok", response: { type: "execute", result: { cols, rows, affected_row_count: 0, last_insert_rowid: null } } });
+      } else {
+        const info = st.run(...args);
+        results.push({ type: "ok", response: { type: "execute", result: { cols: [], rows: [], affected_row_count: info.changes, last_insert_rowid: null } } });
+      }
+    }
+    return { ok: true, status: 200, json: async () => ({ results }), text: async () => "" };
+  };
+  try {
+    await auth.ensureRemoteCommentSchema(offloadTarget);
+    const { sqlite: sOff, d1: d1Off } = createMemoryDb();
+    seedContent(sOff);
+    // 主 D1 放 1 条已删 + 1 条存活（验证 offset=1 混合过渡态 mainIds 也只计存活根）
+    sOff.prepare(`
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+      VALUES
+        ('m-del', ?, NULL, 'U', 'md', 999, 'hmd', ?, ?, 1),
+        ('m-live', ?, NULL, 'U', 'ml', 50, 'hml', ?, ?, 0)
+    `).run(CONTENT_PK, NOW_ISO, NOW_ISO, CONTENT_PK, NOW_ISO, NOW_ISO);
+    remoteSqlite.prepare(`
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
+      VALUES
+        ('r-del', ?, NULL, 'U', 'rd', 888, 'hrd', ?, ?, 1),
+        ('r-live', ?, NULL, 'U', 'rl', 20, 'hrl', ?, ?, 0)
+    `).run(CONTENT_PK, NOW_ISO, NOW_ISO, CONTENT_PK, NOW_ISO, NOW_ISO);
+
+    const offLive = await runWithDb(d1Off, () =>
+      commentsModule.listRootComments(d1Off, CONTENT_PK, { limit: 10, offset: 0, liveOnly: true }, offloadBucket)
+    );
+    assert.deepEqual(offLive.map(r => r.id), ["m-live", "r-live"]);
+
+    const offPage2 = await runWithDb(d1Off, () =>
+      commentsModule.listRootComments(d1Off, CONTENT_PK, { limit: 10, offset: 1, liveOnly: true }, offloadBucket)
+    );
+    assert.deepEqual(offPage2.map(r => r.id), ["r-live"], "offset=1 混合过渡态按 live_only=1 精准切到 r-live");
+  } finally {
+    globalThis.fetch = originalFetch;
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
+
+test("[PR2-3] recommend 与 following 使用 live_comment_count 触发零评风控预警，同时保留归档展示计数", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  const { sqlite, d1 } = createMemoryDb();
+
+  const recommendModule = await loadTs(path.join(workerSrc, "services", "recommend.ts"));
+  const followingModule = await loadTs(path.join(workerSrc, "services", "following.ts"));
+
+  // 种子：高赞 (1500)、现网 comment_count = 0、归档 archived_comment_count = 200 的答主内容
+  sqlite.prepare(`
+    INSERT INTO contents (
+      pk, source_type, source_id, title, question_id, question_title, source_url,
+      author_name, author_url_token, excerpt, content_hash,
+      voteup_count, comment_count, archived_comment_count, favorite_count, visit_count,
+      is_deleted, is_collapsed, is_labeled, first_seen_at, last_seen_at
+    ) VALUES (
+      'answer:risk-zero', 'answer', 'risk-zero', '高赞被清评回答', 'q1', '高赞被清评问题', 'https://www.zhihu.com/question/q1/answer/risk-zero',
+      '答主A', 'author-a', '普通文本不含敏感词', 'hash-rz',
+      1500, 0, 200, 10, 1000,
+      0, 0, 0, ?, ?
+    ), (
+      'answer:sim-peer', 'answer', 'sim-peer', '同答主另一篇', 'q1', '高赞被清评问题', 'https://www.zhihu.com/question/q1/answer/sim-peer',
+      '答主A', 'author-a', '相似内容', 'hash-sp',
+      2000, 0, 80, 10, 1000,
+      0, 0, 0, ?, ?
+    )
+  `).run(NOW_ISO, NOW_ISO, NOW_ISO, NOW_ISO);
+
+  const r2Map = new Map([
+    ["meta/followed_users.json", JSON.stringify({
+      "author-a": {
+        url_token: "author-a",
+        name: "答主A",
+        answer_count: 10,
+        articles_count: 0,
+        sync_mode: "default"
+      }
+    })]
+  ]);
+  const bucket = {
+    async get(k) { const v = r2Map.get(k); return v === undefined ? null : { async text() { return v; } }; },
+    async put(k, v) { r2Map.set(k, String(v)); },
+    async delete() {}
+  };
+
+  // 1) recommend.getRecommendFeed（内部调 buildScoredPool）
+  const recFeed = await runWithDb(d1, () =>
+    recommendModule.getRecommendFeed({ DB: d1, BUCKET: bucket, ZHIHU_USERNAME: "me" }, { channel: "risk", limit: 20, seed: 1 })
+  );
+  const recItem = recFeed.data.find(x => x.pk === "answer:risk-zero");
+  assert.ok(recItem);
+  assert.equal(recItem.comment_count, 200, "前端展示 comment_count 必须保留归档水位 200");
+  assert.equal(recItem.live_comment_count, 0);
+  assert.ok(recItem.risk_tags.some(t => t.includes("千赞零评")), `recommend 必须命中千赞零评预警，实际=${JSON.stringify(recItem.risk_tags)}`);
+
+  // 2) recommend.getSimilarContents
+  const simRes = await runWithDb(d1, () => recommendModule.getSimilarContents("answer:sim-peer"));
+  const simItem = simRes.data.find(x => x.pk === "answer:risk-zero");
+  assert.ok(simItem);
+  assert.equal(simItem.comment_count, 200);
+  assert.ok(simItem.risk_tags.some(t => t.includes("千赞零评")));
+
+  // 3) recommend.assessContentWithWorkersAI prompt 体现现网 0 评论 / 归档 200 评论
+  let capturedPrompt = "";
+  const mockAiEnv = {
+    DB: d1,
+    BUCKET: bucket,
+    AI: {
+      run: async (_model, opts) => {
+        capturedPrompt = String(opts?.messages?.[1]?.content || "");
+        return { response: "1. 高风险\n2. 核心看点\n3. 建议留存" };
+      }
+    }
+  };
+  const aiRes = await runWithDb(d1, () => recommendModule.assessContentWithWorkersAI(mockAiEnv, "answer:risk-zero"));
+  assert.equal(aiRes.ok, true);
+  assert.ok(aiRes.risk_tags.some(t => t.includes("千赞零评")));
+  assert.match(capturedPrompt, /现网 0 评论 \/ 归档 200 评论/);
+
+  // 4) following.getFollowedUserContents & listFollowingFeed
+  const userContents = await runWithDb(d1, () =>
+    followingModule.getFollowedUserContents(bucket, "author-a", { onlyRisk: true })
+  );
+  const userItem = userContents.data.find(x => x.pk === "answer:risk-zero");
+  assert.ok(userItem);
+  assert.equal(userItem.comment_count, 200);
+  assert.ok(userItem.risk_tags.some(t => t.includes("千赞零评")));
+
+  const followFeed = await runWithDb(d1, () =>
+    followingModule.listFollowingFeed(bucket, { onlyRisk: true })
+  );
+  const feedItem = followFeed.data.find(x => x.pk === "answer:risk-zero");
+  assert.ok(feedItem);
+  assert.equal(feedItem.comment_count, 200);
+  assert.ok(feedItem.risk_tags.some(t => t.includes("千赞零评")));
+});
+
+test("[PR2-4] contents.ts upsertContent 更新 archived_comment_count 并发交错写入不回滚", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  const bucket = { async get() { return null; }, async put() {}, async delete() {} };
+
+  const baseInput = {
+    sourceType: "answer",
+    sourceId: "race-1",
+    title: "T",
+    sourceUrl: "https://www.zhihu.com/question/1/answer/race-1",
+    authorName: "A",
+    contentHtml: "<p>v1</p>",
+    contentMd: "v1",
+    excerpt: "v1",
+    voteupCount: 10,
+    commentCount: 5,
+    favoriteCount: 1,
+    visitCount: 20
+  };
+  await runWithDb(d1, () => contentsModule.upsertContent(baseInput, bucket));
+
+  // 模拟在 upsertContent SELECT 读到 archived_comment_count=5 之后、UPDATE 执行之前，
+  // 并发的 replaceCommentsByRoot 把库里 archived_comment_count 抬高到了 88
+  let bumpedDuringRace = false;
+  const raceD1 = {
+    prepare(sql) {
+      if (!bumpedDuringRace && /^\s*UPDATE contents\b/i.test(sql)) {
+        bumpedDuringRace = true;
+        sqlite.prepare(`UPDATE contents SET archived_comment_count = 88 WHERE pk = 'answer:race-1'`).run();
+      }
+      return d1.prepare(sql);
+    },
+    batch(stmts) {
+      if (!bumpedDuringRace && stmts.some(s => /^\s*UPDATE contents\b/i.test(s.sql))) {
+        bumpedDuringRace = true;
+        sqlite.prepare(`UPDATE contents SET archived_comment_count = 88 WHERE pk = 'answer:race-1'`).run();
+      }
+      return d1.batch(stmts);
+    }
+  };
+
+  // 1) counterChanges 分支并发交错：archived_comment_count 必须保持 88 不回滚
+  await runWithDb(raceD1, () =>
+    contentsModule.upsertContent({ ...baseInput, voteupCount: 11, commentCount: 0 }, bucket)
+  );
+  assert.equal(bumpedDuringRace, true);
+  assert.equal(
+    sqlite.prepare(`SELECT archived_comment_count FROM contents WHERE pk = 'answer:race-1'`).get().archived_comment_count,
+    88,
+    "counterChanges 分支不得把并发抬高的 archived_comment_count 回滚成 5"
+  );
+
+  // 2) bodyChanges 分支并发交错：同样抬高到 120 后，archived_comment_count 必须保持 120
+  bumpedDuringRace = false;
+  sqlite.prepare(`UPDATE contents SET archived_comment_count = 88 WHERE pk = 'answer:race-1'`).run();
+  const raceBodyD1 = {
+    prepare(sql) {
+      return d1.prepare(sql);
+    },
+    batch(stmts) {
+      if (!bumpedDuringRace && stmts.some(s => /^\s*UPDATE contents\b/i.test(s.sql))) {
+        bumpedDuringRace = true;
+        sqlite.prepare(`UPDATE contents SET archived_comment_count = 120 WHERE pk = 'answer:race-1'`).run();
+      }
+      return d1.batch(stmts);
+    }
+  };
+  await runWithDb(raceBodyD1, () =>
+    contentsModule.upsertContent({ ...baseInput, contentHtml: "<p>v2</p>", contentMd: "v2", commentCount: 0 }, bucket)
+  );
+  assert.equal(bumpedDuringRace, true);
+  assert.equal(
+    sqlite.prepare(`SELECT archived_comment_count FROM contents WHERE pk = 'answer:race-1'`).get().archived_comment_count,
+    120,
+    "bodyChanges 分支不得把并发抬高的 archived_comment_count 回滚成 88"
+  );
+});
+
+test("[PR2-10] auth.ts 外部存储 /test 慢探测期间并发编辑/新增/删除不会覆盖或复活，且拒绝旧时间戳覆盖", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  const { sqlite, d1 } = createMemoryDb();
+  const r2Store = new Map();
+  const bucket = {
+    async get(k) { const v = r2Store.get(k); return v === undefined ? null : { async text() { return v; } }; },
+    async put(k, v) { r2Store.set(k, String(v)); }
+  };
+  const env = { API_SECRET: "unit-secret", BUCKET: bucket };
+  const authHeaders = { authorization: "Bearer unit-secret" };
+  const call = (method, p, init) => runWithDb(d1, () => auth.authRoutes.__call(method, p, init, env));
+
+  // 创建目标 A
+  const createA = await call("POST", "/external-targets", {
+    headers: authHeaders,
+    body: { name: "Target A", provider: "turso", endpointUrl: "https://a.turso.io", authToken: "tokA", syncScopes: ["comments"] }
+  });
+  const idA = createA.body.target.id;
+
+  const originalFetch = globalThis.fetch;
+  let releaseProbe;
+  let probeStartedResolve;
+  const probeStarted = new Promise(r => { probeStartedResolve = r; });
+
+  try {
+    globalThis.fetch = async () => {
+      probeStartedResolve();
+      await new Promise(r => { releaseProbe = r; });
+      return { ok: true, status: 200, json: async () => ({ results: [{ type: "ok" }] }), text: async () => "" };
+    };
+
+    // 1) 发起针对 A 的慢探测，在探测等待期间并发重命名 A 并新增 B
+    const testPromise = call("POST", "/external-targets/test", {
+      headers: authHeaders,
+      body: { id: idA }
+    });
+    await probeStarted;
+
+    await call("POST", "/external-targets", {
+      headers: authHeaders,
+      body: { id: idA, name: "Target A Renamed", provider: "turso", endpointUrl: "https://a-new.turso.io", syncScopes: ["comments"] }
+    });
+    await call("POST", "/external-targets", {
+      headers: authHeaders,
+      body: { name: "Target B", provider: "turso", endpointUrl: "https://b.turso.io", authToken: "tokB", syncScopes: ["contents"] }
+    });
+
+    releaseProbe();
+    const testRes = await testPromise;
+    assert.equal(testRes.status, 200);
+    assert.equal(testRes.body.ok, true);
+
+    auth.invalidateExternalTargetsCache();
+    const afterConcurrentEdit = await runWithDb(d1, () => auth.getExternalTargetsRaw(bucket));
+    assert.equal(afterConcurrentEdit.length, 2, "新增的目标 B 不得被探测写回覆盖丢失");
+    const targetA = afterConcurrentEdit.find(t => t.id === idA);
+    assert.equal(targetA.name, "Target A Renamed", "并发重命名不得被探测前的旧快照覆盖");
+    assert.equal(targetA.endpointUrl, "https://a-new.turso.io");
+    assert.equal(targetA.lastTestOk, true);
+
+    // 2) 探测期间并发删除目标 A：探测结束后跳过写回，绝不复活 A
+    let probeStarted2Resolve;
+    const probeStarted2 = new Promise(r => { probeStarted2Resolve = r; });
+    globalThis.fetch = async () => {
+      probeStarted2Resolve();
+      await new Promise(r => { releaseProbe = r; });
+      return { ok: true, status: 200, json: async () => ({ results: [{ type: "ok" }] }), text: async () => "" };
+    };
+    const testDeletePromise = call("POST", "/external-targets/test", {
+      headers: authHeaders,
+      body: { id: idA }
+    });
+    await probeStarted2;
+    await call("POST", "/external-targets/delete", {
+      headers: authHeaders,
+      body: { id: idA }
+    });
+    releaseProbe();
+    const testAfterDelRes = await testDeletePromise;
+    assert.equal(testAfterDelRes.status, 200);
+    assert.equal(testAfterDelRes.body.target, undefined);
+
+    auth.invalidateExternalTargetsCache();
+    const afterConcurrentDelete = await runWithDb(d1, () => auth.getExternalTargetsRaw(bucket));
+    assert.equal(afterConcurrentDelete.some(t => t.id === idA), false, "探测期间已删除的目标 A 绝不可复活");
+    assert.equal(afterConcurrentDelete.length, 1);
+
+    // 3) saveExternalTargetsRaw：D1 已有更晚时间戳时拒绝旧写倒灌并失效缓存
+    sqlite.prepare(`UPDATE app_settings SET updated_at = '2099-01-01T00:00:00.000Z' WHERE key = ?`).run(auth.EXTERNAL_TARGETS_KEY);
+    await runWithDb(d1, () => auth.saveExternalTargetsRaw(bucket, []));
+    const stillKept = await runWithDb(d1, () => auth.getExternalTargetsRaw(bucket));
+    assert.equal(stillKept.length, 1, "过期时间戳写入被 D1 拒绝后，缓存不得保留过期空数组");
+  } finally {
+    globalThis.fetch = originalFetch;
+    auth.invalidateExternalTargetsCache();
+  }
+});
+
+test("[PR2-11][PR2-12.1] image-tasks 按并发分组及时落库；/ingest/image-batch 小数 limit=0.5 归一为 1", async () => {
+  const ingest = await loadTs(
+    path.join(workerSrc, "routes", "ingest.ts"),
+    new Map([["hono", honoMockUrl]])
+  );
+  const originalFetch = globalThis.fetch;
+
+  try {
+    // 1) 8 条任务分 2 组（每组 4 条）：第 1 组 db.batch 立刻落库为 done，第 2 组 db.batch 抛错时第 1 组不受回滚影响
+    const { sqlite: s1, d1: d1_1 } = createMemoryDb();
+    seedContent(s1);
+    for (let i = 0; i < 8; i++) {
+      seedImageTask(s1, {
+        imageUrl: `https://picx.zhimg.com/chunk-${i}.jpg`,
+        objectKey: `images/${String(i).padStart(64, "d")}.jpg`,
+        status: "pending",
+        attempts: 0,
+        updatedAt: NOW_ISO
+      });
+    }
+    let doneBatchCalls = 0;
+    const chunkFailD1 = {
+      prepare: sql => d1_1.prepare(sql),
+      batch: async stmts => {
+        if (stmts.some(st => /UPDATE image_tasks SET status = 'done'/i.test(st.sql))) {
+          doneBatchCalls++;
+          if (doneBatchCalls === 2) {
+            throw new Error("chunk 2 batch write failed");
+          }
+        }
+        return d1_1.batch(stmts);
+      }
+    };
+    const okBucket = { async head() { return null; }, async get() { return null; }, async put() {}, async delete() {} };
+    globalThis.fetch = async () =>
+      new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { "content-type": "image/jpeg", "content-length": "3" }
+      });
+
+    await assert.rejects(
+      () => runWithDb(chunkFailD1, () => imageTasksModule.processImageBatch(okBucket, 8)),
+      /chunk 2 batch write failed/
+    );
+    assert.equal(doneBatchCalls, 2);
+    assert.equal(
+      s1.prepare(`SELECT COUNT(*) AS n FROM image_tasks WHERE status = 'done'`).get().n,
+      4,
+      "第 1 并发分组的 4 条任务必须在第 2 组失败前已及时持久化为 done"
+    );
+
+    // 2) POST /ingest/image-batch 传入小数 limit: 0.5 → 实际执行 1 条且返回 limit: 1
+    const { sqlite: s2, d1: d1_2 } = createMemoryDb();
+    seedContent(s2);
+    for (let i = 0; i < 3; i++) {
+      seedImageTask(s2, {
+        imageUrl: `https://picx.zhimg.com/frac-${i}.jpg`,
+        objectKey: `images/${String(i).padStart(64, "e")}.jpg`,
+        status: "pending",
+        attempts: 0,
+        updatedAt: NOW_ISO
+      });
+    }
+    const fracRes = await runWithDb(d1_2, () =>
+      ingest.ingestRoutes.__call("POST", "/image-batch", {
+        headers: { authorization: "Bearer img-secret" },
+        body: { limit: 0.5 }
+      }, { DB: d1_2, BUCKET: okBucket, API_SECRET: "img-secret" })
+    );
+    assert.equal(fracRes.status, 200);
+    assert.equal(fracRes.body.limit, 1, "limit: 0.5 必须统一钳制返回 limit: 1");
+    assert.equal(fracRes.body.claimed, 1, "limit: 0.5 必须实际领取并处理 1 条");
+    assert.equal(fracRes.body.done, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    workerModules.auth.invalidateExternalTargetsCache();
+  }
 });

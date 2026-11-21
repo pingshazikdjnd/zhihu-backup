@@ -292,7 +292,7 @@ async function runMain() {
       const proxyOk = await isProxyReachable(process.env.HTTPS_PROXY);
       if (proxyOk) {
         if (!SUPPORTS_USE_ENV_PROXY) {
-          console.warn(`⚠️ 当前 Node (${process.version}) 不支持 --use-env-proxy，将不附加该启动参数继续运行（仍设置 NODE_USE_ENV_PROXY=1；建议升级至 Node >= 22.16 / 24）`);
+          console.warn(`⚠️ 当前 Node (${process.version}) 原生 fetch 不支持 --use-env-proxy / NODE_USE_ENV_PROXY，本次将直连 Worker；若当前网络环境必须经代理访问 Worker，请升级至 Node >= 22.21 或 >= 24.0`);
         }
         const childArgs = SUPPORTS_USE_ENV_PROXY
           ? ["--use-env-proxy", fileURLToPath(import.meta.url), ...process.argv.slice(2)]

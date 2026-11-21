@@ -360,7 +360,7 @@ ingestRoutes.post("/image-batch", async c => {
   const body = await c.req.json().catch(() => null) as { limit?: unknown } | null;
   const rawLimit = Number(body?.limit);
   const limit = Number.isFinite(rawLimit) && rawLimit > 0
-    ? Math.min(Math.trunc(rawLimit), IMAGE_TASK_ROUTE_MAX_LIMIT)
+    ? Math.max(1, Math.min(Math.trunc(rawLimit), IMAGE_TASK_ROUTE_MAX_LIMIT))
     : IMAGE_TASK_BATCH_DEFAULT_LIMIT;
 
   const result = await processImageBatch(bucket, limit);

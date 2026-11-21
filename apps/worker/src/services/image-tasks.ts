@@ -171,8 +171,8 @@ function markTaskFailed(id: number, message: string, updatedAt: string, claimedA
 }
 
 /**
- * 消费一批图片任务：下载并写 R2，整批通过单次 db.batch 更新任务状态。
- * 单条下载失败只影响自己；但末尾批量状态落库 db.batch 失败时清零统计并重抛异常。
+ * 消费一批图片任务：下载并写 R2，每个并发分组完成后立即通过 db.batch 更新状态。
+ * 单条下载失败只影响自己；若某组状态落库 db.batch 失败则不计入该组并重抛异常。
  */
 export async function processImageBatch(
   bucket: R2Bucket,
@@ -187,25 +187,25 @@ export async function processImageBatch(
 
   // 质量设置在每个 isolate 内缓存 60 秒，整批只读一次
   const quality = await getImageQualitySetting(bucket);
-  const updateOps: Array<{ stmt: unknown; kind: "done" | "failed" | "retry" }> = [];
 
-  // 与下载并发保持一致地分批：槽位闸门本身也会限流，这里分批是为了把
-  // HEAD/失败判断的节奏摊平，避免一次拉起过多并行请求
+  // 与下载并发保持一致地分批：每组 ≤ IMAGE_FETCH_CONCURRENCY 条完成下载后立刻持久化，
+  // 避免后续分组卡死中断时把前面已上传 R2 的任务留在 processing 等 10 分钟陈旧窗口重领
   for (let i = 0; i < rows.length; i += IMAGE_FETCH_CONCURRENCY) {
     const chunk = rows.slice(i, i + IMAGE_FETCH_CONCURRENCY);
+    const chunkOps: Array<{ stmt: unknown; kind: "done" | "failed" | "retry" }> = [];
     await Promise.all(chunk.map(async row => {
       try {
         const localPath = await localizeImage(row.image_url, bucket, quality);
         const now = new Date().toISOString();
         if (localPath) {
-          updateOps.push({ stmt: markTaskDone(row.id, now, row.updated_at), kind: "done" });
+          chunkOps.push({ stmt: markTaskDone(row.id, now, row.updated_at), kind: "done" });
           return;
         }
         // 领取时 attempts 已 +1，这里用 +1 后的值判断是否耗尽重试
         if (row.attempts + 1 >= MAX_IMAGE_TASK_ATTEMPTS) {
-          updateOps.push({ stmt: markTaskFailed(row.id, "download failed", now, row.updated_at), kind: "failed" });
+          chunkOps.push({ stmt: markTaskFailed(row.id, "download failed", now, row.updated_at), kind: "failed" });
         } else {
-          updateOps.push({ stmt: markTaskRetry(row.id, now, row.updated_at), kind: "retry" });
+          chunkOps.push({ stmt: markTaskRetry(row.id, now, row.updated_at), kind: "retry" });
         }
       } catch (err) {
         // 任务层任何异常都不能让整批失败，但也必须受 MAX_IMAGE_TASK_ATTEMPTS 上限约束防止无限重试
@@ -213,32 +213,29 @@ export async function processImageBatch(
         const errMsg = err instanceof Error ? err.message : String(err || "download error");
         const now = new Date().toISOString();
         if (row.attempts + 1 >= MAX_IMAGE_TASK_ATTEMPTS) {
-          updateOps.push({ stmt: markTaskFailed(row.id, errMsg.slice(0, 200), now, row.updated_at), kind: "failed" });
+          chunkOps.push({ stmt: markTaskFailed(row.id, errMsg.slice(0, 200), now, row.updated_at), kind: "failed" });
         } else {
-          updateOps.push({ stmt: markTaskRetry(row.id, now, row.updated_at), kind: "retry" });
+          chunkOps.push({ stmt: markTaskRetry(row.id, now, row.updated_at), kind: "retry" });
         }
       }
     }));
-  }
 
-  if (updateOps.length > 0) {
-    try {
-      const batchResults = await db.batch(updateOps.map(op => op.stmt));
-      if (Array.isArray(batchResults)) {
-        for (let i = 0; i < updateOps.length; i++) {
-          if (Number(batchResults[i]?.meta?.changes ?? 0) > 0) {
-            summary[updateOps[i].kind] += 1;
+    if (chunkOps.length > 0) {
+      try {
+        const batchResults = await db.batch(chunkOps.map(op => op.stmt));
+        if (Array.isArray(batchResults)) {
+          for (let j = 0; j < chunkOps.length; j++) {
+            if (Number(batchResults[j]?.meta?.changes ?? 0) > 0) {
+              summary[chunkOps[j].kind] += 1;
+            }
           }
+        } else {
+          for (const op of chunkOps) summary[op.kind] += 1;
         }
-      } else {
-        for (const op of updateOps) summary[op.kind] += 1;
+      } catch (err) {
+        warnTasks("batch status update failed", err);
+        throw err;
       }
-    } catch (err) {
-      summary.done = 0;
-      summary.failed = 0;
-      summary.retry = 0;
-      warnTasks("batch status update failed", err);
-      throw err;
     }
   }
 

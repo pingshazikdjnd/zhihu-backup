@@ -744,12 +744,33 @@ async function main() {
 
     log(`🎉 第 4 步评论补采队列执行完成！累计已核销断点 ${completedSet.size} 条，跳过 ${skippedSet.size} 条。`);
   } finally {
-    process.off("SIGINT", handleSignal);
-    process.off("SIGTERM", handleSignal);
-    if (process.platform !== "win32") process.off("SIGHUP", handleSignal);
-    if (progressDirty) saveProgress(progress);
-    cleanupWorker();
-    releaseLock();
+    try {
+      if (progressDirty) saveProgress(progress);
+    } catch (err) {
+      log(`[cleanup] 保存进度失败，继续执行清理: ${err?.message || err}`);
+    } finally {
+      try {
+        try {
+          cleanupWorker();
+        } catch (err) {
+          log(`[cleanup] 停止 Worker 失败: ${err?.message || err}`);
+        }
+        try {
+          fs.rmSync(INPUT_JSON_PATH, { force: true });
+        } catch (err) {
+          log(`[cleanup] 清理 INPUT.json 失败: ${err?.message || err}`);
+        }
+        try {
+          releaseLock();
+        } catch (err) {
+          log(`[cleanup] 释放锁失败: ${err?.message || err}`);
+        }
+      } finally {
+        process.off("SIGINT", handleSignal);
+        process.off("SIGTERM", handleSignal);
+        if (process.platform !== "win32") process.off("SIGHUP", handleSignal);
+      }
+    }
   }
 }
 

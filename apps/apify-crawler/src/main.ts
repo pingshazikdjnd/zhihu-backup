@@ -535,6 +535,10 @@ async function postCommentsByRoot(
  * - 被删（now < prev，含删光为 0）也要抓，否则本地会永久残留已删评论；
  * - prev === now === 0 时不发无意义请求。
  */
+function explicitCommentCount(raw: unknown): number | undefined {
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : undefined;
+}
+
 function shouldSyncComments(commentCount: number, prevCommentCount: number | null | undefined): boolean {
   const now = Number(commentCount) || 0;
   const prev = Number(prevCommentCount) || 0;
@@ -562,7 +566,7 @@ async function fetchStoredCommentState(contentPk: string): Promise<StoredComment
   if (apiSecret) headers.authorization = `Bearer ${apiSecret}`;
   try {
     const res = await fetch(
-      `${base}/api/contents/${encodeURIComponent(contentPk)}/root-comments?limit=50`,
+      `${base}/api/contents/${encodeURIComponent(contentPk)}/root-comments?limit=50&live_only=1`,
       { headers }
     );
     if (!res.ok) return null;
@@ -832,7 +836,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
   const context = await createStealthContext(browser);
   await context.addCookies(getCookiesArray());
 
-  const pendingCommentsQueue: Array<{ answerId: string; url: string; commentCount: number }> = [];
+  const pendingCommentsQueue: Array<{ answerId: string; url: string; commentCount: number; explicitCommentCount?: number }> = [];
 
   let isEnd = false;
   let existingCount = 0;
@@ -907,7 +911,9 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       const finalVoteup = trueStats?.voteupCount ?? item.voteup_count ?? item.reaction?.statistics?.like_count ?? 0;
       const finalFavorite = item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0;
       const finalVisit = trueStats?.visitCount ?? item.visit_count ?? 0;
-      const finalCommentCount = trueStats?.commentCount ?? item.comment_count ?? 0;
+      const rawCommentCount = trueStats?.commentCount ?? item.comment_count;
+      const explicitCount = explicitCommentCount(rawCommentCount);
+      const finalCommentCount = explicitCount ?? 0;
 
 
       const { sourceUrl: answerSourceUrl, question: normalizedQuestion } = resolveAnswerQuestionMeta(item.question, item.id);
@@ -952,7 +958,8 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           pendingCommentsQueue.push({
             answerId: String(item.id),
             url: contentInput.sourceUrl,
-            commentCount: contentInput.commentCount
+            commentCount: contentInput.commentCount,
+            explicitCommentCount: explicitCount
           });
           existingCount = 0;
         } else if (!dbRes.created && !dbRes.changed) {
@@ -1011,7 +1018,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       const contentPk = `answer:${task.answerId}`;
       // 评论被彻底删光（comment_count === 0 且此前 > 0）：无须再请求知乎评论接口，
       // 直接发一次空 roots 的全量对账，让 Worker 软删旧根、清零 comment_count 与线程索引。
-      if ((task.commentCount || 0) === 0) {
+      if (task.explicitCommentCount === 0) {
         try {
           await postCommentsByRoot(contentPk, [], { partial: false, allRootIds: [] });
           console.log(`🧹 评论已清零，完成删除对账 (回答 ID: ${task.answerId})`);
@@ -1119,7 +1126,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
         if (cJson.data.length === 0) {
           const emptyIsEnd = cJson.paging?.is_end === true;
           if (rootPages === 0 && emptyIsEnd && !fellBackToScore && cfg.commentsMyAnswers === "full") {
-            let confirmedEmpty = (task.commentCount || 0) === 0;
+            let confirmedEmpty = task.explicitCommentCount === 0;
             if (!confirmedEmpty) {
               // task.commentCount > 0 时必须复用爬虫请求封装二次确认，防止偶发空响应清空历史评论
               try {
@@ -1424,6 +1431,7 @@ async function runArticleScraperBody(browser: Awaited<ReturnType<typeof setupBro
       if (seenArticleIds.has(articleIdStr)) continue;
       seenArticleIds.add(articleIdStr);
 
+      const articleExplicitCommentCount = explicitCommentCount(art.comment_count);
       // 自有文章不做风险/价值过滤：用户自己写的内容必须全部无条件存档
       const contentInput = {
         sourceType: "article" as const,
@@ -1439,7 +1447,7 @@ async function runArticleScraperBody(browser: Awaited<ReturnType<typeof setupBro
           headline: art.author?.headline || ""
         },
         voteupCount: Number(art.voteup_count ?? 0) || 0,
-        commentCount: Number(art.comment_count ?? 0) || 0,
+        commentCount: articleExplicitCommentCount ?? 0,
         favoriteCount: Number(art.favorite_count ?? art.reaction?.statistics?.favorites ?? 0) || 0,
         visitCount: Number(art.visit_count ?? 0) || 0,
         isCollapsed: typeof art.is_collapsed === "boolean" ? art.is_collapsed : undefined,
@@ -1464,7 +1472,7 @@ async function runArticleScraperBody(browser: Awaited<ReturnType<typeof setupBro
           !stats.circuitBroken &&
           !stats.riskExhausted
         ) {
-          await syncHotCommentsForContent(context, "article", articleIdStr, cfg.commentsMyAnswers, contentInput.commentCount);
+          await syncHotCommentsForContent(context, "article", articleIdStr, cfg.commentsMyAnswers, articleExplicitCommentCount);
         }
         // 极速模式的连续无变化计数：res?.changed === false 才算无变化
         if (isFast && res?.changed === false) {
@@ -2080,6 +2088,7 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
               const rawContent = Array.isArray(item.content)
                 ? (item.content as any[]).map(b => (typeof b?.content === "string" ? b.content : "")).filter(Boolean).join("\n")
                 : item.content;
+              const itemExplicitCommentCount = explicitCommentCount(item.comment_count);
               const contentInput = {
                 sourceType: item.type as "answer" | "article" | "pin",
                 sourceId: String(item.id),
@@ -2092,7 +2101,7 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
                 // 收藏夹里的专栏文章没有 excerpt，摘要只在 excerpt_title（13-live-collections 实测）
                 excerpt: item.excerpt || item.excerpt_title || "",
                 voteupCount: item.voteup_count || item.reaction?.statistics?.like_count || 0,
-                commentCount: item.comment_count || 0,
+                commentCount: itemExplicitCommentCount ?? 0,
                 favoriteCount: item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0,
                 visitCount: item.visit_count ?? 0,
                 isCollapsed: item.is_collapsed,
@@ -2115,7 +2124,7 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
                     cfg.commentsCollections
                   );
                 if (needHotComments && !stats.circuitBroken) {
-                  await syncHotCommentsForContent(context, item.type as "answer" | "article" | "pin", String(item.id), cfg.commentsCollections, contentInput.commentCount);
+                  await syncHotCommentsForContent(context, item.type as "answer" | "article" | "pin", String(item.id), cfg.commentsCollections, itemExplicitCommentCount);
                   // 每抓完一篇带新评论的条目额外缓冲：收藏夹是「条目 → 评论 → 楼中楼」
                   // 三连请求最密集的链路，最容易连续高频触发 40352
                   await jitterSleep(600, 1200);
@@ -2399,7 +2408,8 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
       let contentHtml = cleanHtml(target.content);
       let effectiveExcerpt = target.excerpt || "";
       let voteupCount = target.voteup_count || target.reaction?.statistics?.like_count || 0;
-      let commentCount = target.comment_count || 0;
+      let explicitCount = explicitCommentCount(target.comment_count);
+      let commentCount = explicitCount ?? 0;
       let favoriteCount = target.favorite_count ?? target.reaction?.statistics?.favorites ?? 0;
       let visitCount = target.visit_count ?? 0;
 
@@ -2409,7 +2419,12 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
           contentHtml = detail.contentHtml;
           if (detail.excerpt) effectiveExcerpt = detail.excerpt;
           if (typeof detail.voteupCount === "number" && detail.voteupCount > 0) voteupCount = detail.voteupCount;
-          if (typeof detail.commentCount === "number" && detail.commentCount > 0) commentCount = detail.commentCount;
+          if (typeof detail.commentCount === "number" && detail.commentCount > 0) {
+            commentCount = detail.commentCount;
+            explicitCount = detail.commentCount;
+          } else if (explicitCount === undefined) {
+            explicitCount = explicitCommentCount(detail.commentCount);
+          }
           if (typeof detail.favoriteCount === "number" && detail.favoriteCount > 0) favoriteCount = detail.favoriteCount;
           if (typeof detail.visitCount === "number" && detail.visitCount > 0) visitCount = detail.visitCount;
         }
@@ -2453,7 +2468,7 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
              !stats.circuitBroken &&
              !stats.riskExhausted
            ) {
-             await syncHotCommentsForContent(context, sourceType, sourceId, cfg.commentsUpvotes, contentInput.commentCount);
+             await syncHotCommentsForContent(context, sourceType, sourceId, cfg.commentsUpvotes, explicitCount);
            }
            const upvoteTime = toIsoOrNull(item.created_time);
            // created_time 缺失时为空串：/ingest/upvote 对空串返回 400，
@@ -2557,6 +2572,7 @@ type FollowingAiCandidate = {
   excerpt: string;
   voteupCount: number;
   commentCount: number;
+  explicitCommentCount?: number;
   favoriteCount: number;
   isCollapsed: boolean;
   isLabeled: boolean;
@@ -2865,12 +2881,14 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
    * 被规则跳过的成千上万条水贴不额外打详情接口（否则每条 250~550ms 节流会拖垮整轮同步），
    * 只有 forceSave 前 60 篇 / 规则通过 / AI 复核通过的回答才值得多一次详情请求。
    */
-  async function fillTrueAnswerStats(contentInput: any, answerId: string): Promise<void> {
+  async function fillTrueAnswerStats(contentInput: any, answerId: string): Promise<number | undefined> {
     const trueStats = await fetchAnswerTrueStats(context, answerId);
-    if (!trueStats) return;
+    if (!trueStats) return undefined;
     contentInput.voteupCount = trueStats.voteupCount;
     contentInput.visitCount = trueStats.visitCount;
-    if (trueStats.commentCount !== undefined) contentInput.commentCount = trueStats.commentCount;
+    const explicit = explicitCommentCount(trueStats.commentCount);
+    if (explicit !== undefined) contentInput.commentCount = explicit;
+    return explicit;
   }
 
   const reportUserProgress = (urlToken: string, resumeOffset: number, historyDone: boolean, lastCheckedAnswerId?: string) =>
@@ -3063,6 +3081,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             }
 
             const { sourceUrl: answerSourceUrl, question: normalizedQuestion } = resolveAnswerQuestionMeta(item.question, item.id);
+            const answerExplicitCommentCount = explicitCommentCount(item.comment_count);
             const contentInput = {
               sourceType: "answer" as const,
               sourceId: String(item.id),
@@ -3083,7 +3102,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               // 真正入库前会由 fillTrueAnswerStats 用 /api/v4/answers/{id} 覆盖成
               // 真实 voteup_count 与真实 visit_count（like_count 是「喜欢数」不是赞同数）。
               voteupCount: item.voteup_count ?? item.reaction?.statistics?.like_count ?? 0,
-              commentCount: item.comment_count || 0,
+              commentCount: answerExplicitCommentCount ?? 0,
               favoriteCount: item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0,
               visitCount: item.visit_count ?? 0,
               isCollapsed: item.is_collapsed,
@@ -3112,7 +3131,8 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
                       questionTitle: item.question?.title || "",
                       excerpt: item.excerpt || "",
                       voteupCount: voteup,
-                      commentCount: Number(item.comment_count) || 0,
+                      commentCount: answerExplicitCommentCount ?? 0,
+                      explicitCommentCount: answerExplicitCommentCount,
                       favoriteCount: Number(item.favorite_count ?? item.reaction?.statistics?.favorites) || 0,
                       isCollapsed: Boolean(item.is_collapsed),
                       isLabeled: Boolean(item.is_labeled) || Boolean(item.label_info),
@@ -3130,7 +3150,8 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
 
             try {
               // 入库前补真实赞同数/真实浏览量：列表里的 like_count 只是「❤️ 喜欢数」
-              await fillTrueAnswerStats(contentInput, String(item.id));
+              const trueCommentCount = await fillTrueAnswerStats(contentInput, String(item.id));
+              const finalExplicitCommentCount = trueCommentCount ?? answerExplicitCommentCount;
               const dbRes = await sendContent(contentInput);
               if (
                 cfg.commentsFollowing !== "none" &&
@@ -3143,7 +3164,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
                 !stats.circuitBroken &&
                 !stats.riskExhausted
               ) {
-                await syncHotCommentsForContent(context, "answer", String(item.id), cfg.commentsFollowing, contentInput.commentCount);
+                await syncHotCommentsForContent(context, "answer", String(item.id), cfg.commentsFollowing, finalExplicitCommentCount);
               }
               savedForUser++;
               if (!dbRes.created && !dbRes.changed) {
@@ -3198,7 +3219,10 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
           if (stats.circuitBroken) break;
           try {
             // AI 复核通过、真正要入库的回答：补真实赞同数与真实浏览量后再提交
-            if (cand.sourceType === "answer") await fillTrueAnswerStats(cand.contentInput, cand.sourceId);
+            const trueCommentCount = cand.sourceType === "answer"
+              ? await fillTrueAnswerStats(cand.contentInput, cand.sourceId)
+              : undefined;
+            const finalExplicitCommentCount = trueCommentCount ?? cand.explicitCommentCount;
             const dbRes = await sendContent(cand.contentInput);
             if (
               cfg.commentsFollowing !== "none" &&
@@ -3211,7 +3235,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               !stats.circuitBroken &&
               !stats.riskExhausted
             ) {
-              await syncHotCommentsForContent(context, "answer", cand.sourceId, cfg.commentsFollowing, Number(cand.contentInput.commentCount ?? cand.commentCount) || 0);
+              await syncHotCommentsForContent(context, "answer", cand.sourceId, cfg.commentsFollowing, finalExplicitCommentCount);
             }
             savedForUser++;
           } catch (err) {
@@ -3279,6 +3303,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
           seenArticleIds.add(articleIdStr);
           const cleanedHtml = cleanHtml(item.content);
           const evalRes = isUserFull ? null : evaluateForAutoBackup(item, cleanedHtml);
+          const articleExplicitCommentCount = explicitCommentCount(item.comment_count);
           const contentInput = {
             sourceType: "article" as const,
             sourceId: String(item.id),
@@ -3299,7 +3324,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             // visit_count 在文章列表/详情都拿不到，reaction.statistics.visit_count 也不存在，缺失即 0。
             // 注意：文章 reaction.statistics.like_count 是伪值（恒 0，不是赞同数），仅作兜底。
             voteupCount: item.voteup_count ?? item.reaction?.statistics?.like_count ?? 0,
-            commentCount: item.comment_count || 0,
+            commentCount: articleExplicitCommentCount ?? 0,
             favoriteCount: item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0,
             visitCount: item.visit_count ?? 0,
             // 仅在接口显式下发布尔值时透传；缺省保持 undefined，避免覆盖库中既有折叠/黄标标记
@@ -3326,7 +3351,8 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
                     questionTitle: "",
                     excerpt: item.excerpt || "",
                     voteupCount: voteup,
-                    commentCount: Number(item.comment_count) || 0,
+                    commentCount: articleExplicitCommentCount ?? 0,
+                    explicitCommentCount: articleExplicitCommentCount,
                     favoriteCount: Number(item.favorite_count ?? item.reaction?.statistics?.favorites) || 0,
                     isCollapsed: Boolean(item.is_collapsed),
                     isLabeled: Boolean(item.is_labeled) || Boolean(item.label_info),
@@ -3356,7 +3382,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               !stats.circuitBroken &&
               !stats.riskExhausted
             ) {
-              await syncHotCommentsForContent(context, "article", articleIdStr, cfg.commentsFollowing, contentInput.commentCount);
+              await syncHotCommentsForContent(context, "article", articleIdStr, cfg.commentsFollowing, articleExplicitCommentCount);
             }
             savedForUser++;
             if (!dbRes.created && !dbRes.changed) {
@@ -3406,7 +3432,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               !stats.circuitBroken &&
               !stats.riskExhausted
             ) {
-              await syncHotCommentsForContent(context, "article", cand.sourceId, cfg.commentsFollowing, Number(cand.contentInput.commentCount ?? cand.commentCount) || 0);
+              await syncHotCommentsForContent(context, "article", cand.sourceId, cfg.commentsFollowing, cand.explicitCommentCount);
             }
             savedForUser++;
           } catch (err) {

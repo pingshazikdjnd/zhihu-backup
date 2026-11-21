@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { db } from "../db.js";
+import { withKeyLock } from "../services/lock.js";
 import type { Bindings } from "../types.js";
 
 export const authRoutes = new Hono<{ Bindings: Bindings }>();
@@ -98,7 +99,9 @@ export function maskTargetForClient(t: ExternalStorageTarget): ClientExternalSto
 // 爬虫连续入库几百条就是几百次无意义的读放大。这里做 isolate 内存 60 秒缓存，
 // 写接口保存/删除/测试后立即刷新，保证配置变更在本 isolate 内即时生效。
 const EXTERNAL_TARGETS_CACHE_TTL_MS = 60_000;
+const EXTERNAL_TARGETS_LOCK_KEY = "external_storage_targets";
 let cachedExternalTargets: { at: number; list: ExternalStorageTarget[] } | null = null;
+let lastExternalTargetsWriteMs = 0;
 
 export function invalidateExternalTargetsCache(): void {
   cachedExternalTargets = null;
@@ -214,9 +217,33 @@ export async function getExternalTargetsRaw(bucket?: any): Promise<ExternalStora
 export async function saveExternalTargetsRaw(bucket: any, targets: ExternalStorageTarget[]): Promise<void> {
   const saved = targets.slice(0, 10);
   const payload = JSON.stringify(saved);
-  // 先刷新内存缓存：即使下面的 D1/R2 写入失败，本 isolate 内也必须立刻看到新配置
-  cachedExternalTargets = { at: Date.now(), list: cloneTargets(saved) };
-  const now = new Date().toISOString();
+  const writeMs = Math.max(Date.now(), lastExternalTargetsWriteMs + 1, resolveTargetsUpdatedMs(saved));
+  lastExternalTargetsWriteMs = writeMs;
+  const now = new Date(writeMs).toISOString();
+
+  let d1Err: unknown = null;
+  let d1StaleRejected = false;
+  try {
+    const d1Res = await db.prepare(`
+      INSERT INTO app_settings (key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      WHERE excluded.updated_at >= app_settings.updated_at
+    `).run(EXTERNAL_TARGETS_KEY, payload, now) as any;
+    const d1Changes = d1Res?.meta?.changes ?? d1Res?.changes;
+    if (d1Changes === 0) {
+      d1StaleRejected = true;
+    }
+  } catch (err) {
+    d1Err = err;
+  }
+
+  if (d1StaleRejected) {
+    // D1 已存在更新时间戳的配置，拒绝用过期快照覆盖 R2 与内存缓存
+    cachedExternalTargets = null;
+    return;
+  }
+
   let r2Ok = false;
   let r2Err: unknown = null;
   if (bucket) {
@@ -230,20 +257,12 @@ export async function saveExternalTargetsRaw(bucket: any, targets: ExternalStora
       r2Err = err;
     }
   }
-  let d1Err: unknown = null;
-  try {
-    await db.prepare(`
-      INSERT INTO app_settings (key, value, updated_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-    `).run(EXTERNAL_TARGETS_KEY, payload, now);
-  } catch (err) {
-    d1Err = err;
-  }
   if (d1Err && (!bucket || !r2Ok)) {
     cachedExternalTargets = null;
     throw d1Err instanceof Error ? d1Err : (r2Err instanceof Error ? r2Err : new Error("保存外部存储目标失败"));
   }
+  // 写入成功后刷新本 isolate 缓存（仅在 D1 未拒绝且至少一方落盘成功时）
+  cachedExternalTargets = { at: Date.now(), list: cloneTargets(saved) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1386,74 +1405,77 @@ authRoutes.post("/external-targets", async c => {
     : (["contents", "comments"] as ExternalSyncScope[]);
   const syncScopes: ExternalSyncScope[] = scopes.length ? scopes : ["contents", "comments"];
 
-  const currentTargets = await getExternalTargetsRaw(c.env.BUCKET);
-  const now = new Date().toISOString();
+  return await withKeyLock(EXTERNAL_TARGETS_LOCK_KEY, async () => {
+    invalidateExternalTargetsCache();
+    const currentTargets = await getExternalTargetsRaw(c.env.BUCKET);
+    const now = new Date().toISOString();
 
-  let targetId = typeof body.id === "string" ? body.id.trim() : "";
-  const existingIdx = targetId ? currentTargets.findIndex(t => t.id === targetId) : -1;
-  const existingTarget = existingIdx >= 0 ? currentTargets[existingIdx] : undefined;
+    let targetId = typeof body.id === "string" ? body.id.trim() : "";
+    const existingIdx = targetId ? currentTargets.findIndex(t => t.id === targetId) : -1;
+    const existingTarget = existingIdx >= 0 ? currentTargets[existingIdx] : undefined;
 
-  // 老前端（未传 storageRole）编辑时保留原值；新建时默认直接分流扩容
-  const storageRole = normalizeStorageRole(
-    body.storageRole,
-    existingTarget?.storageRole ?? DEFAULT_STORAGE_ROLE
-  );
-  const overflowThresholdRows = normalizeOverflowThreshold(
-    body.overflowThresholdRows,
-    existingTarget?.overflowThresholdRows ?? DEFAULT_OVERFLOW_THRESHOLD_ROWS
-  );
+    // 老前端（未传 storageRole）编辑时保留原值；新建时默认直接分流扩容
+    const storageRole = normalizeStorageRole(
+      body.storageRole,
+      existingTarget?.storageRole ?? DEFAULT_STORAGE_ROLE
+    );
+    const overflowThresholdRows = normalizeOverflowThreshold(
+      body.overflowThresholdRows,
+      existingTarget?.overflowThresholdRows ?? DEFAULT_OVERFLOW_THRESHOLD_ROWS
+    );
 
-  let savedTarget: ExternalStorageTarget;
+    let savedTarget: ExternalStorageTarget;
 
-  if (existingIdx >= 0) {
-    const existing = currentTargets[existingIdx];
-    // 如果前端传来的 authToken 为空串或 undefined，保留旧的 existing.authToken
-    const finalToken = rawAuthToken ? rawAuthToken : existing.authToken;
-    savedTarget = {
-      ...existing,
-      name,
-      provider,
-      enabled,
-      syncScopes,
-      storageRole,
-      overflowThresholdRows,
-      endpointUrl,
-      databaseId,
-      authToken: finalToken,
-      updatedAt: now
-    };
-    currentTargets[existingIdx] = savedTarget;
-  } else {
-    if (currentTargets.length >= 10) {
-      return c.json({ error: "外部存储目标已达到上限（最多 10 个）" }, 400);
+    if (existingIdx >= 0) {
+      const existing = currentTargets[existingIdx];
+      // 如果前端传来的 authToken 为空串或 undefined，保留旧的 existing.authToken
+      const finalToken = rawAuthToken ? rawAuthToken : existing.authToken;
+      savedTarget = {
+        ...existing,
+        name,
+        provider,
+        enabled,
+        syncScopes,
+        storageRole,
+        overflowThresholdRows,
+        endpointUrl,
+        databaseId,
+        authToken: finalToken,
+        updatedAt: now
+      };
+      currentTargets[existingIdx] = savedTarget;
+    } else {
+      if (currentTargets.length >= 10) {
+        return c.json({ error: "外部存储目标已达到上限（最多 10 个）" }, 400);
+      }
+      targetId = "ext-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
+      savedTarget = {
+        id: targetId,
+        name,
+        provider,
+        enabled,
+        syncScopes,
+        storageRole,
+        overflowThresholdRows,
+        endpointUrl,
+        databaseId,
+        authToken: rawAuthToken || undefined,
+        createdAt: now,
+        updatedAt: now,
+        lastTestAt: null,
+        lastTestOk: null,
+        lastTestMsg: null
+      };
+      currentTargets.push(savedTarget);
     }
-    targetId = "ext-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
-    savedTarget = {
-      id: targetId,
-      name,
-      provider,
-      enabled,
-      syncScopes,
-      storageRole,
-      overflowThresholdRows,
-      endpointUrl,
-      databaseId,
-      authToken: rawAuthToken || undefined,
-      createdAt: now,
-      updatedAt: now,
-      lastTestAt: null,
-      lastTestOk: null,
-      lastTestMsg: null
-    };
-    currentTargets.push(savedTarget);
-  }
 
-  await saveExternalTargetsRaw(c.env.BUCKET, currentTargets);
+    await saveExternalTargetsRaw(c.env.BUCKET, currentTargets);
 
-  return c.json({
-    ok: true,
-    target: maskTargetForClient(savedTarget),
-    targets: currentTargets.map(maskTargetForClient)
+    return c.json({
+      ok: true,
+      target: maskTargetForClient(savedTarget),
+      targets: currentTargets.map(maskTargetForClient)
+    });
   });
 });
 
@@ -1471,13 +1493,16 @@ authRoutes.post("/external-targets/delete", async c => {
     return c.json({ error: "缺少目标 ID" }, 400);
   }
 
-  const currentTargets = await getExternalTargetsRaw(c.env.BUCKET);
-  const remaining = currentTargets.filter(t => t.id !== id);
-  await saveExternalTargetsRaw(c.env.BUCKET, remaining);
+  return await withKeyLock(EXTERNAL_TARGETS_LOCK_KEY, async () => {
+    invalidateExternalTargetsCache();
+    const currentTargets = await getExternalTargetsRaw(c.env.BUCKET);
+    const remaining = currentTargets.filter(t => t.id !== id);
+    await saveExternalTargetsRaw(c.env.BUCKET, remaining);
 
-  return c.json({
-    ok: true,
-    targets: remaining.map(maskTargetForClient)
+    return c.json({
+      ok: true,
+      targets: remaining.map(maskTargetForClient)
+    });
   });
 });
 
@@ -1677,14 +1702,21 @@ authRoutes.post("/external-targets/test", async c => {
   const now = new Date().toISOString();
 
   let updatedTarget: ExternalStorageTarget | undefined;
-  if (existing) {
-    existing.lastTestAt = now;
-    existing.lastTestOk = testOk;
+  if (targetId) {
     // 目标服务的错误响应可能回显 Authorization；落库前抹掉 token，避免 GET 列表二次泄漏
     const safeMsg = authToken ? testMsg.split(authToken).join("***") : testMsg;
-    existing.lastTestMsg = `${safeMsg} (${latencyMs}ms)`;
-    updatedTarget = existing;
-    await saveExternalTargetsRaw(c.env.BUCKET, currentTargets);
+    updatedTarget = await withKeyLock(EXTERNAL_TARGETS_LOCK_KEY, async () => {
+      invalidateExternalTargetsCache();
+      const latestTargets = await getExternalTargetsRaw(c.env.BUCKET);
+      const latestExisting = latestTargets.find(t => t.id === targetId);
+      // 若探测期间该目标已被删除，跳过写回、不复活已删目标
+      if (!latestExisting) return undefined;
+      latestExisting.lastTestAt = now;
+      latestExisting.lastTestOk = testOk;
+      latestExisting.lastTestMsg = `${safeMsg} (${latencyMs}ms)`;
+      await saveExternalTargetsRaw(c.env.BUCKET, latestTargets);
+      return latestExisting;
+    });
   }
 
   return c.json({
