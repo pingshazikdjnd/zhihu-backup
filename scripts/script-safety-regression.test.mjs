@@ -1754,6 +1754,7 @@ test("[P1-7][P2-9] local-sync 代理 IPC 软停/等 close 再放锁/幂等、cra
   assert.match(localSyncSrc, /childToStop\.connected/);
   assert.match(localSyncSrc, /type:\s*"graceful-shutdown"/);
   assert.match(localSyncSrc, /process\.disconnect\(\)/);
+  assert.match(localSyncSrc, /allowedNodeEnvironmentFlags\?\.has\("--use-env-proxy"\)/);
 
   // 3) 真实代理父子进程联调（全程限定在 os.tmpdir()）：验证 IPC 软停、等 close 再放锁、叠加信号幂等、超时强杀等 close
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-local-sync-ipc-"));
@@ -1830,10 +1831,38 @@ if (process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_CHILD_SIGN
   await new Promise(resolve => workerServer.listen(0, "127.0.0.1", resolve));
   const workerPort = workerServer.address().port;
 
-  const waitUntilFile = async (file, timeoutMs = 10_000) => {
+  const spawnWithLogs = extraEnv => {
+    const proc = spawn(process.execPath, [testScriptPath], {
+      cwd: dir,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        WORKER_URL: `http://127.0.0.1:${workerPort}`,
+        API_SECRET: "sec",
+        HTTPS_PROXY: `http://127.0.0.1:${proxyPort}`,
+        ...extraEnv
+      }
+    });
+    let output = "";
+    const append = chunk => {
+      output = (output + chunk.toString("utf8")).slice(-4000);
+    };
+    proc.stdout?.on("data", append);
+    proc.stderr?.on("data", append);
+    return { proc, getOutput: () => output.trim() };
+  };
+
+  const waitUntilFile = async (file, proc, getOutput, timeoutMs = 10_000) => {
     const deadline = Date.now() + timeoutMs;
     while (!fs.existsSync(file)) {
-      if (Date.now() > deadline) throw new Error(`timeout waiting for ${file}`);
+      if (proc.exitCode !== null || proc.signalCode !== null) {
+        throw new Error(
+          `process exited before creating ${file} (exit=${proc.exitCode}, signal=${proc.signalCode}):\n${getOutput()}`
+        );
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`timeout waiting for ${file}:\n${getOutput()}`);
+      }
       await new Promise(r => setTimeout(r, 20));
     }
   };
@@ -1847,20 +1876,13 @@ if (process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_CHILD_SIGN
     lockExistsDuringRelease = [];
     const readyA = path.join(dir, "ready-a");
     const parentSigA = path.join(dir, "parent-sig-a");
-    spawnedProc = spawn(process.execPath, [testScriptPath], {
-      cwd: dir,
-      stdio: "ignore",
-      env: {
-        ...process.env,
-        WORKER_URL: `http://127.0.0.1:${workerPort}`,
-        API_SECRET: "sec",
-        HTTPS_PROXY: `http://127.0.0.1:${proxyPort}`,
-        LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS: "6000",
-        __TEST_CRAWLER_READY_FILE: readyA,
-        __TEST_PARENT_SIGNAL_FILE: parentSigA
-      }
+    const procA = spawnWithLogs({
+      LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS: "6000",
+      __TEST_CRAWLER_READY_FILE: readyA,
+      __TEST_PARENT_SIGNAL_FILE: parentSigA
     });
-    await waitUntilFile(readyA);
+    spawnedProc = procA.proc;
+    await waitUntilFile(readyA, procA.proc, procA.getOutput);
     assert.equal(fs.existsSync(lockFile), true);
     const tStartA = Date.now();
     fs.writeFileSync(parentSigA, "SIGTERM");
@@ -1880,21 +1902,14 @@ if (process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_CHILD_SIGN
     const readyB = path.join(dir, "ready-b");
     const parentSigB = path.join(dir, "parent-sig-b");
     const childSigB = path.join(dir, "child-sig-b");
-    spawnedProc = spawn(process.execPath, [testScriptPath], {
-      cwd: dir,
-      stdio: "ignore",
-      env: {
-        ...process.env,
-        WORKER_URL: `http://127.0.0.1:${workerPort}`,
-        API_SECRET: "sec",
-        HTTPS_PROXY: `http://127.0.0.1:${proxyPort}`,
-        LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS: "5000",
-        __TEST_CRAWLER_READY_FILE: readyB,
-        __TEST_PARENT_SIGNAL_FILE: parentSigB,
-        __TEST_CHILD_SIGNAL_FILE: childSigB
-      }
+    const procB = spawnWithLogs({
+      LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS: "5000",
+      __TEST_CRAWLER_READY_FILE: readyB,
+      __TEST_PARENT_SIGNAL_FILE: parentSigB,
+      __TEST_CHILD_SIGNAL_FILE: childSigB
     });
-    await waitUntilFile(readyB);
+    spawnedProc = procB.proc;
+    await waitUntilFile(readyB, procB.proc, procB.getOutput);
     fs.writeFileSync(childSigB, "SIGINT");
     fs.writeFileSync(parentSigB, "SIGINT");
     const exitB = await waitForExit(spawnedProc);
@@ -1908,21 +1923,14 @@ if (process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_CHILD_SIGN
     releaseCalls = 0;
     const readyC = path.join(dir, "ready-c");
     const parentSigC = path.join(dir, "parent-sig-c");
-    spawnedProc = spawn(process.execPath, [testScriptPath], {
-      cwd: dir,
-      stdio: "ignore",
-      env: {
-        ...process.env,
-        WORKER_URL: `http://127.0.0.1:${workerPort}`,
-        API_SECRET: "sec",
-        HTTPS_PROXY: `http://127.0.0.1:${proxyPort}`,
-        LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS: "250",
-        LOCAL_SYNC_FORCE_KILL_WAIT_MS: "1000",
-        __TEST_CRAWLER_READY_FILE: readyC,
-        __TEST_PARENT_SIGNAL_FILE: parentSigC
-      }
+    const procC = spawnWithLogs({
+      LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS: "250",
+      LOCAL_SYNC_FORCE_KILL_WAIT_MS: "1000",
+      __TEST_CRAWLER_READY_FILE: readyC,
+      __TEST_PARENT_SIGNAL_FILE: parentSigC
     });
-    await waitUntilFile(readyC);
+    spawnedProc = procC.proc;
+    await waitUntilFile(readyC, procC.proc, procC.getOutput);
     const tStartC = Date.now();
     fs.writeFileSync(parentSigC, "SIGTERM");
     const exitC = await waitForExit(spawnedProc);
@@ -1936,6 +1944,7 @@ if (process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED && process.env.__TEST_CHILD_SIGN
       spawnedProc.kill();
     }
     proxyServer.close();
+    workerServer.closeAllConnections?.();
     workerServer.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }

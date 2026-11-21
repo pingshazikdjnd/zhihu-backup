@@ -51,6 +51,7 @@ function resolveTimeoutMs(envName, fallbackMs, minMs = 1) {
 const PROXY_SHUTDOWN_TIMEOUT_MS = resolveTimeoutMs("LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS", 18_000);
 const CRAWLER_STOP_TIMEOUT_MS = 5_000;
 const FORCE_KILL_CLOSE_WAIT_MS = resolveTimeoutMs("LOCAL_SYNC_FORCE_KILL_WAIT_MS", 3_000);
+const SUPPORTS_USE_ENV_PROXY = Boolean(process.allowedNodeEnvironmentFlags?.has("--use-env-proxy"));
 
 function disconnectIpcSafely() {
   if (typeof process.disconnect === "function" && process.connected) {
@@ -230,11 +231,10 @@ async function runMain() {
             finish();
             return;
           }
-          // 代理父进程优先等子进程自行放云端锁并退出；超时后强杀并继续等 close（带保底）再放本地锁
+          // 代理父进程优先等子进程自行放云端锁并退出；超时后直接强杀并继续等 close（带保底）再放本地锁
           if (isProxyParent) {
-            try { childToStop.kill("SIGTERM"); } catch { /* ignore */ }
+            try { childToStop.kill("SIGKILL"); } catch { /* ignore */ }
             forceKillTimer = setTimeout(() => {
-              try { childToStop.kill("SIGKILL"); } catch { /* ignore */ }
               finish();
             }, FORCE_KILL_CLOSE_WAIT_MS);
             return;
@@ -289,16 +289,22 @@ async function runMain() {
     if (process.env.HTTPS_PROXY && !process.env.__LOCAL_SYNC_PROXY_BOOTSTRAPPED) {
       const proxyOk = await isProxyReachable(process.env.HTTPS_PROXY);
       if (proxyOk) {
+        if (!SUPPORTS_USE_ENV_PROXY) {
+          console.warn(`⚠️ 当前 Node (${process.version}) 不支持 --use-env-proxy，将不附加该启动参数继续运行`);
+        }
+        const childArgs = SUPPORTS_USE_ENV_PROXY
+          ? ["--use-env-proxy", fileURLToPath(import.meta.url), ...process.argv.slice(2)]
+          : [fileURLToPath(import.meta.url), ...process.argv.slice(2)];
         const code = await new Promise(resolve => {
           const child = spawn(
             process.execPath,
-            ["--use-env-proxy", fileURLToPath(import.meta.url), ...process.argv.slice(2)],
+            childArgs,
             {
               cwd: ROOT,
               stdio: ["inherit", "inherit", "inherit", "ipc"],
               env: {
                 ...process.env,
-                NODE_USE_ENV_PROXY: "1",
+                ...(SUPPORTS_USE_ENV_PROXY ? { NODE_USE_ENV_PROXY: "1" } : {}),
                 __LOCAL_SYNC_PROXY_BOOTSTRAPPED: "1",
                 ...(ownsLocalLock ? { __LOCAL_SYNC_LOCK_INHERITED: "1" } : {})
               }
@@ -536,14 +542,15 @@ async function runMain() {
       // 6. 启动本地爬虫（dist/main.js）
       if (signalHandled) return;
       console.log("🚀 开始本地同步（Playwright 直连知乎 + 自动写入云端 D1/R2，零 Apify 额度消耗）...\n");
-      const nodeArgs = process.env.HTTPS_PROXY ? ["--use-env-proxy", "dist/main.js"] : ["dist/main.js"];
+      const useEnvProxy = Boolean(process.env.HTTPS_PROXY && SUPPORTS_USE_ENV_PROXY);
+      const nodeArgs = useEnvProxy ? ["--use-env-proxy", "dist/main.js"] : ["dist/main.js"];
       const code = await new Promise(resolve => {
         const runProc = spawn(process.execPath, nodeArgs, {
           cwd: CRAWLER_DIR,
           stdio: "inherit",
           env: {
             ...process.env,
-            NODE_USE_ENV_PROXY: process.env.HTTPS_PROXY ? "1" : (process.env.NODE_USE_ENV_PROXY || ""),
+            NODE_USE_ENV_PROXY: useEnvProxy ? "1" : (process.env.NODE_USE_ENV_PROXY || ""),
             // 双保险：即使 Actor input schema 剥离未知字段，环境变量也能把租约持有者带到爬虫
             ...(cloudLockAcquired ? { SYNC_OWNER_ID: syncOwnerId } : {}),
             APIFY_LOCAL_STORAGE_DIR: STORAGE_DIR,
