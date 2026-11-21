@@ -1,7 +1,7 @@
 import { db } from "../db.js";
 import { buildChangeStatement } from "./changes.js";
 import { hasOffloadedComments } from "./comments.js";
-import { normalizeForHash, sha256 } from "../utils/hash.js";
+import { isAvatarUrlChanged, normalizeForHash, sha256 } from "../utils/hash.js";
 import { withKeyLock } from "./lock.js";
 import { buildSearchText, safeTruncate } from "shared";
 import type { IngestContentInput } from "shared";
@@ -87,7 +87,7 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
   // 就会被清空，全文搜索逐步失效且不可逆。
   const existing = await db.prepare(`
     SELECT pk, title, source_url, excerpt, question_id, question_title, author_url_token, created_time, updated_time,
-           content_hash, voteup_count, comment_count, favorite_count, visit_count,
+           content_hash, voteup_count, comment_count, archived_comment_count, favorite_count, visit_count,
            author_name, author_avatar, author_headline,
            content_html, content_md,
            is_collapsed, is_labeled, label_info
@@ -105,10 +105,10 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
         pk, source_type, source_id, source_url, title,
         author_name, author_url_token, author_avatar, author_headline,
         question_id, question_title, content_html, content_md, excerpt,
-        voteup_count, comment_count, favorite_count, visit_count,
+        voteup_count, comment_count, archived_comment_count, favorite_count, visit_count,
         is_collapsed, is_labeled, label_info,
         created_time, updated_time, content_hash, first_seen_at, last_seen_at, is_deleted, deleted_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
     `).raw(
       pk,
       input.sourceType,
@@ -127,6 +127,7 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
       searchText,   // content_md 存纯文本，供检索
       input.excerpt,
       input.voteupCount,
+      input.commentCount,
       input.commentCount,
       input.favoriteCount || 0,
       input.visitCount || 0,
@@ -241,10 +242,16 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
     (input.commentCount === 0 && existing.comment_count > 0 && isWeakCommentPayload)
       ? existing.comment_count
       : input.commentCount;
+  const nextArchivedCommentCount = Math.max(
+    Number(existing.archived_comment_count ?? 0) || 0,
+    Number(existing.comment_count ?? 0) || 0,
+    safeCommentCount
+  );
   const safeFavoriteCount = (!input.favoriteCount && existing.favorite_count > 0) ? existing.favorite_count : (input.favoriteCount || 0);
   const safeVisitCount = (!input.visitCount && existing.visit_count > 0) ? existing.visit_count : (input.visitCount || 0);
 
-  const safeAuthorAvatar = (input.author?.avatarUrl || existing.author_avatar) || null;
+  const avatarChanged = isAvatarUrlChanged(existing.author_avatar, input.author?.avatarUrl);
+  const safeAuthorAvatar = (avatarChanged ? input.author?.avatarUrl : existing.author_avatar) || null;
   const safeAuthorHeadline = (input.author?.headline || existing.author_headline) || null;
   const rawAuthorName = input.author?.name || "";
   const safeAuthorName =
@@ -288,7 +295,7 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
   if (existing.visit_count !== safeVisitCount) {
     counterChanges.push(`浏览量(${existing.visit_count} -> ${safeVisitCount})`);
   }
-  if ((existing.author_avatar || null) !== safeAuthorAvatar) {
+  if (avatarChanged) {
     profileChanges.push("作者头像更新");
   }
   if ((existing.author_headline || null) !== safeAuthorHeadline) {
@@ -363,7 +370,7 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
       UPDATE contents
       SET title = ?, author_name = ?, author_url_token = ?, author_avatar = ?, author_headline = ?,
           source_url = ?, question_id = ?, question_title = ?, content_html = ?, content_md = ?, excerpt = ?,
-          voteup_count = ?, comment_count = ?, favorite_count = ?, visit_count = ?,
+          voteup_count = ?, comment_count = ?, archived_comment_count = MAX(COALESCE(archived_comment_count, 0), comment_count, ?), favorite_count = ?, visit_count = ?,
           is_collapsed = ?, is_labeled = ?, label_info = ?,
           created_time = ?, updated_time = ?, content_hash = ?, last_seen_at = ?, is_deleted = 0, deleted_at = NULL
       WHERE pk = ?
@@ -381,6 +388,7 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
       safeExcerpt,
       safeVoteupCount,
       safeCommentCount,
+      nextArchivedCommentCount,
       safeFavoriteCount,
       safeVisitCount,
       nextCollapsed,
@@ -460,7 +468,7 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
     // 若同时有 profileChanges，在同一句里顺带写作者与元数据列，避免资料或修复字段不落库
     await db.prepare(`
       UPDATE contents
-      SET voteup_count = ?, comment_count = ?, favorite_count = ?, visit_count = ?,
+      SET voteup_count = ?, comment_count = ?, archived_comment_count = MAX(COALESCE(archived_comment_count, 0), comment_count, ?), favorite_count = ?, visit_count = ?,
           author_name = ?, author_url_token = ?, author_avatar = ?, author_headline = ?,
           source_url = ?, question_id = ?, question_title = ?, label_info = ?,
           excerpt = ?, created_time = ?, updated_time = ?, last_seen_at = ?
@@ -468,6 +476,7 @@ async function upsertContentInner(input: IngestContentInput, bucket?: R2Bucket) 
     `).run(
       safeVoteupCount,
       safeCommentCount,
+      nextArchivedCommentCount,
       safeFavoriteCount,
       safeVisitCount,
       safeAuthorName,
@@ -537,7 +546,8 @@ export async function listContents(params: { type?: string; q?: string; author?:
   const rows = await db.prepare(`
     SELECT c.pk, c.source_type, c.source_id, c.title, c.question_title, c.source_url,
            c.author_name, c.author_url_token, c.author_avatar, c.author_headline, c.excerpt,
-           c.voteup_count, c.comment_count, c.favorite_count, c.visit_count,
+           c.voteup_count, MAX(c.comment_count, COALESCE(c.archived_comment_count, 0)) AS comment_count,
+           c.archived_comment_count, c.favorite_count, c.visit_count,
            c.created_time, c.updated_time, c.last_seen_at, c.is_deleted, u.upvote_time
     FROM contents c
     LEFT JOIN upvotes u ON u.content_pk = c.pk
@@ -554,7 +564,15 @@ export async function getContentDetail(pk: string) {
     SELECT *
     FROM contents
     WHERE pk = ?
-  `).get(pk);
+  `).get(pk) as any;
+
+  if (content) {
+    const liveCount = Number(content.comment_count ?? 0) || 0;
+    const archivedCount = Number(content.archived_comment_count ?? 0) || 0;
+    content.live_comment_count = liveCount;
+    content.archived_comment_count = Math.max(liveCount, archivedCount);
+    content.comment_count = content.archived_comment_count;
+  }
 
   const versions = await db.prepare(`
     SELECT id, version_hash, snapshot_at, voteup_count, comment_count

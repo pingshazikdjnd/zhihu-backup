@@ -9,6 +9,7 @@ export type PreviewReply = {
   content: string;
   likes: number;
   isAuthor?: boolean;
+  isDeleted?: boolean;
 };
 
 export type RootComment = {
@@ -43,6 +44,7 @@ export type ChildComment = {
   location?: string;
   likes: number;
   isAuthor?: boolean;
+  isDeleted?: boolean;
 };
 
 // 兼容旧接口扁平数据结构
@@ -306,9 +308,10 @@ function RootCommentItemView({ comment, contentPk }: { comment: RootComment; con
             }}
           >
             {comment.preview_replies.map(reply => (
-              <div key={reply.id} style={{ margin: "3px 0" }}>
+              <div key={reply.id} style={{ margin: "3px 0", opacity: reply.isDeleted ? 0.72 : undefined }}>
                 <span style={{ fontWeight: 600 }}>{reply.author || "匿名"}</span>
                 {reply.isAuthor && <span className="comment-badge" style={{ marginLeft: 4 }}>作者</span>}
+                {reply.isDeleted && <span className="comment-badge deleted" style={{ marginLeft: 4 }}>已删除</span>}
                 {reply.beReplied && (
                   <span style={{ color: "var(--zhihu-meta)", margin: "0 2px" }}>
                     {" "}回复 @{reply.beReplied}
@@ -413,6 +416,7 @@ function RootCommentItemView({ comment, contentPk }: { comment: RootComment; con
               <div
                 id={`comment-${child.id}`}
                 key={child.id}
+                className={child.isDeleted ? "comment is-deleted" : undefined}
                 style={{
                   display: "flex",
                   gap: 10,
@@ -440,6 +444,7 @@ function RootCommentItemView({ comment, contentPk }: { comment: RootComment; con
                   <div className="comment-head" style={{ fontSize: 13 }}>
                     <span className="name">{child.author || "匿名"}</span>
                     {child.isAuthor && <span className="comment-badge">答主</span>}
+                    {child.isDeleted && <span className="comment-badge deleted">已删除</span>}
                     <span className="time">{fmtTime(child.time)}</span>
                     {child.location && <span className="loc">IP 属地 {child.location}</span>}
                   </div>
@@ -536,8 +541,10 @@ function RootCommentList({
   );
   const [offset, setOffset] = useState(initialComments.length);
   const [loadError, setLoadError] = useState("");
+  const loadMoreSeqRef = useRef(0);
 
   useEffect(() => {
+    loadMoreSeqRef.current++;
     setRootComments(initialComments);
     setOffset(initialComments.length);
     setHasMore(initialHasMore !== undefined ? initialHasMore : initialComments.length >= 20);
@@ -553,23 +560,34 @@ function RootCommentList({
   const handleLoadMore = async () => {
     if (loadingMore || !resolvedPk) return;
     const reqPk = resolvedPk;
+    const reqSeq = ++loadMoreSeqRef.current;
     setLoadingMore(true);
     setLoadError("");
     try {
       const limit = 20;
       const res = await fetchRootComments(reqPk, { limit, offset });
-      if (reqPk !== resolvedPkRef.current) return;
+      if (reqPk !== resolvedPkRef.current || reqSeq !== loadMoreSeqRef.current) return;
       const newItems: RootComment[] = res.data || [];
-      setRootComments(prev => [...prev, ...newItems]);
+      setRootComments(prev => {
+        const seen = new Set(prev.map(item => item.id));
+        return [
+          ...prev,
+          ...newItems.filter(item => {
+            if (seen.has(item.id)) return false;
+            seen.add(item.id);
+            return true;
+          })
+        ];
+      });
       setOffset(prev => prev + newItems.length);
       if (newItems.length < limit) {
         setHasMore(false);
       }
     } catch (e: any) {
-      if (reqPk !== resolvedPkRef.current) return;
+      if (reqPk !== resolvedPkRef.current || reqSeq !== loadMoreSeqRef.current) return;
       setLoadError(e?.message || "加载更多评论失败");
     } finally {
-      if (reqPk === resolvedPkRef.current) {
+      if (reqPk === resolvedPkRef.current && reqSeq === loadMoreSeqRef.current) {
         setLoadingMore(false);
       }
     }

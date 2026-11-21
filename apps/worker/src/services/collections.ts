@@ -281,7 +281,7 @@ export async function listAllCollectionItems(params?: { page?: number; sort?: st
              WHEN c.content_md IS NOT NULL AND c.content_md != '' THEN SUBSTR(c.content_md, 1, 300) 
              ELSE SUBSTR(c.content_html, 1, 300) 
            END as excerpt, 
-           c.voteup_count, c.comment_count, c.favorite_count, c.visit_count, c.author_url_token, c.author_avatar,
+           c.voteup_count, MAX(c.comment_count, c.archived_comment_count) AS comment_count, c.favorite_count, c.visit_count, c.author_url_token, c.author_avatar,
            COALESCE(c.pk, ci.content_pk) as content_pk
     FROM collection_items ci
     LEFT JOIN contents c ON ci.content_pk = c.pk
@@ -305,7 +305,7 @@ export async function getCollectionDetail(collectionId: string) {
              WHEN c.content_md IS NOT NULL AND c.content_md != '' THEN SUBSTR(c.content_md, 1, 300) 
              ELSE SUBSTR(c.content_html, 1, 300) 
            END as excerpt,
-           COALESCE(NULLIF(c.author_name, ''), ci.author_name) as author_name, c.voteup_count, c.comment_count, c.favorite_count, c.visit_count
+           COALESCE(NULLIF(c.author_name, ''), ci.author_name) as author_name, c.voteup_count, MAX(c.comment_count, c.archived_comment_count) AS comment_count, c.favorite_count, c.visit_count
     FROM collection_items ci
     LEFT JOIN contents c ON ci.content_pk = c.pk
     WHERE ci.collection_id = ?

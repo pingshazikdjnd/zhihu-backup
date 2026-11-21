@@ -146,12 +146,18 @@ export async function runAndRecord(
 
   const now = new Date().toISOString();
 
-  const insert = await db.prepare(`
-    INSERT INTO sync_runs (job_type, status, message, started_at, finished_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(jobType, "running", "Triggered Apify", now, null);
-
-  const runId = (insert as any)?.meta?.last_row_id ?? (insert as any)?.lastInsertRowid;
+  let runId: unknown;
+  try {
+    const insert = await db.prepare(`
+      INSERT INTO sync_runs (job_type, status, message, started_at, finished_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(jobType, "running", "Triggered Apify", now, null);
+    runId = (insert as any)?.meta?.last_row_id ?? (insert as any)?.lastInsertRowid;
+  } catch (e: any) {
+    console.error("failed to insert sync_runs:", e);
+    await releaseSyncLock(lock.ownerId);
+    return { ok: false, error: `failed to record sync_runs: ${e?.message || String(e)}` };
+  }
 
   // 触发请求本身可能抛网络异常；不兜住的话 sync_runs 会永远停在 running
   let res: { ok: boolean; runId?: string; error?: string };

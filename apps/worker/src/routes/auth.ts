@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { db } from "../db.js";
+import { withKeyLock } from "../services/lock.js";
 import type { Bindings } from "../types.js";
 
 export const authRoutes = new Hono<{ Bindings: Bindings }>();
@@ -98,7 +99,18 @@ export function maskTargetForClient(t: ExternalStorageTarget): ClientExternalSto
 // 爬虫连续入库几百条就是几百次无意义的读放大。这里做 isolate 内存 60 秒缓存，
 // 写接口保存/删除/测试后立即刷新，保证配置变更在本 isolate 内即时生效。
 const EXTERNAL_TARGETS_CACHE_TTL_MS = 60_000;
-let cachedExternalTargets: { at: number; list: ExternalStorageTarget[] } | null = null;
+const EXTERNAL_TARGETS_LOCK_KEY = "external_storage_targets";
+const EXTERNAL_TARGETS_MAX_CAS_RETRIES = 2;
+let cachedExternalTargets: { at: number; list: ExternalStorageTarget[]; d1UpdatedAt: string | null } | null = null;
+let lastExternalTargetsWriteMs = 0;
+
+export class ExternalTargetsConflictError extends Error {
+  readonly code = "CONFLICT";
+  constructor(message = "外部存储配置已被并发修改，请刷新后重试") {
+    super(message);
+    this.name = "ExternalTargetsConflictError";
+  }
+}
 
 export function invalidateExternalTargetsCache(): void {
   cachedExternalTargets = null;
@@ -109,33 +121,81 @@ function cloneTargets(list: ExternalStorageTarget[]): ExternalStorageTarget[] {
   return list.map(t => ({ ...t, syncScopes: [...t.syncScopes] }));
 }
 
-export async function getExternalTargetsRaw(bucket?: any): Promise<ExternalStorageTarget[]> {
+function parseIsoMs(value: unknown): number {
+  if (typeof value !== "string" || !value.trim()) return 0;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function resolveTargetsUpdatedMs(list: any[], explicitUpdatedAt?: unknown): number {
+  let maxMs = explicitUpdatedAt instanceof Date
+    ? (Number.isFinite(explicitUpdatedAt.getTime()) ? explicitUpdatedAt.getTime() : 0)
+    : parseIsoMs(explicitUpdatedAt);
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    maxMs = Math.max(
+      maxMs,
+      parseIsoMs(item.updatedAt),
+      parseIsoMs(item.lastTestAt),
+      parseIsoMs(item.createdAt)
+    );
+  }
+  return maxMs;
+}
+
+async function readExternalTargetsWithVersion(
+  bucket?: any
+): Promise<{ targets: ExternalStorageTarget[]; d1UpdatedAt: string | null }> {
   if (cachedExternalTargets && Date.now() - cachedExternalTargets.at < EXTERNAL_TARGETS_CACHE_TTL_MS) {
-    return cloneTargets(cachedExternalTargets.list);
+    return {
+      targets: cloneTargets(cachedExternalTargets.list),
+      d1UpdatedAt: cachedExternalTargets.d1UpdatedAt
+    };
   }
 
-  let targets: any[] = [];
-  let d1Found = false;
+  let d1Targets: any[] | null = null;
+  let d1UpdatedMs = 0;
+  let d1UpdatedAt: string | null = null;
   try {
     const row = await db.prepare(
-      `SELECT value FROM app_settings WHERE key = ?`
-    ).get<{ value: string }>(EXTERNAL_TARGETS_KEY);
+      `SELECT value, updated_at FROM app_settings WHERE key = ?`
+    ).get<{ value: string; updated_at?: string | null }>(EXTERNAL_TARGETS_KEY);
+    if (row) {
+      d1UpdatedAt = typeof row.updated_at === "string" ? row.updated_at : null;
+    }
     if (row?.value) {
       const parsed = JSON.parse(row.value);
       if (Array.isArray(parsed)) {
-        d1Found = true;
-        targets = parsed;
+        d1Targets = parsed;
+        d1UpdatedMs = resolveTargetsUpdatedMs(parsed, row.updated_at);
       }
     }
   } catch { /* ignore D1 read error */ }
 
-  if (!d1Found && bucket) {
+  let r2Targets: any[] | null = null;
+  let r2UpdatedMs = 0;
+  if (bucket) {
     try {
       const obj = await bucket.get(R2_EXTERNAL_TARGETS_KEY);
       if (obj) {
-        targets = JSON.parse(await obj.text());
+        const parsed = JSON.parse(await obj.text());
+        if (Array.isArray(parsed)) {
+          r2Targets = parsed;
+          r2UpdatedMs = resolveTargetsUpdatedMs(
+            parsed,
+            obj.customMetadata?.updatedAt ?? obj.uploaded
+          );
+        }
       }
     } catch { /* ignore R2 read error */ }
+  }
+
+  // 同时读取 D1 与 R2 并按最新 updatedAt 择新：D1 满额降级只写入 R2 后缓存过期时不会静默回滚到旧 D1 值
+  let targets: any[] = [];
+  if (d1Targets && r2Targets) {
+    targets = r2UpdatedMs > d1UpdatedMs ? r2Targets : d1Targets;
+  } else {
+    targets = d1Targets ?? r2Targets ?? [];
   }
 
   if (!Array.isArray(targets)) targets = [];
@@ -168,42 +228,111 @@ export async function getExternalTargetsRaw(bucket?: any): Promise<ExternalStora
     if (cleaned.length >= 10) break;
   }
 
-  cachedExternalTargets = { at: Date.now(), list: cloneTargets(cleaned) };
-  return cleaned;
+  cachedExternalTargets = { at: Date.now(), list: cloneTargets(cleaned), d1UpdatedAt };
+  return { targets: cleaned, d1UpdatedAt };
 }
 
-export async function saveExternalTargetsRaw(bucket: any, targets: ExternalStorageTarget[]): Promise<void> {
+export async function getExternalTargetsRaw(bucket?: any): Promise<ExternalStorageTarget[]> {
+  const { targets } = await readExternalTargetsWithVersion(bucket);
+  return targets;
+}
+
+export async function saveExternalTargetsRaw(
+  bucket: any,
+  targets: ExternalStorageTarget[],
+  opts?: { expectedUpdatedAt?: string | null }
+): Promise<void> {
   const saved = targets.slice(0, 10);
   const payload = JSON.stringify(saved);
-  // 先刷新内存缓存：即使下面的 D1/R2 写入失败，本 isolate 内也必须立刻看到新配置
-  cachedExternalTargets = { at: Date.now(), list: cloneTargets(saved) };
-  const now = new Date().toISOString();
+  const expectedMs = parseIsoMs(opts?.expectedUpdatedAt);
+  const writeMs = Math.max(Date.now(), lastExternalTargetsWriteMs + 1, resolveTargetsUpdatedMs(saved), expectedMs + 1);
+  lastExternalTargetsWriteMs = writeMs;
+  const now = new Date(writeMs).toISOString();
+  const hasExpected = Boolean(opts && "expectedUpdatedAt" in opts);
+
+  let d1Err: unknown = null;
+  let d1Conflict = false;
+  try {
+    let d1Res: any;
+    if (hasExpected) {
+      if (opts!.expectedUpdatedAt === null) {
+        d1Res = await db.prepare(`
+          INSERT OR IGNORE INTO app_settings (key, value, updated_at)
+          VALUES (?, ?, ?)
+        `).run(EXTERNAL_TARGETS_KEY, payload, now);
+      } else {
+        d1Res = await db.prepare(`
+          UPDATE app_settings
+          SET value = ?, updated_at = ?
+          WHERE key = ? AND updated_at = ?
+        `).run(payload, now, EXTERNAL_TARGETS_KEY, opts!.expectedUpdatedAt);
+      }
+    } else {
+      d1Res = await db.prepare(`
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        WHERE excluded.updated_at >= app_settings.updated_at
+      `).run(EXTERNAL_TARGETS_KEY, payload, now);
+    }
+    const d1Changes = d1Res?.meta?.changes ?? d1Res?.changes;
+    if (d1Changes === 0) {
+      d1Conflict = true;
+    }
+  } catch (err) {
+    d1Err = err;
+  }
+
+  if (d1Err === null && d1Conflict) {
+    // D1 CAS 未命中：拒绝覆盖 R2，清空本地缓存并显式抛出冲突错误
+    cachedExternalTargets = null;
+    throw new ExternalTargetsConflictError();
+  }
+
   let r2Ok = false;
   let r2Err: unknown = null;
   if (bucket) {
     try {
       await bucket.put(R2_EXTERNAL_TARGETS_KEY, payload, {
-        httpMetadata: { contentType: "application/json; charset=utf-8" }
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+        customMetadata: { updatedAt: now }
       });
       r2Ok = true;
     } catch (err) {
       r2Err = err;
     }
   }
-  let d1Err: unknown = null;
-  try {
-    await db.prepare(`
-      INSERT INTO app_settings (key, value, updated_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-    `).run(EXTERNAL_TARGETS_KEY, payload, now);
-  } catch (err) {
-    d1Err = err;
-  }
   if (d1Err && (!bucket || !r2Ok)) {
     cachedExternalTargets = null;
     throw d1Err instanceof Error ? d1Err : (r2Err instanceof Error ? r2Err : new Error("保存外部存储目标失败"));
   }
+  // 写入成功后刷新本 isolate 缓存（若本次是 D1 不可用降级写 R2，不伪造 d1UpdatedAt）
+  cachedExternalTargets = {
+    at: Date.now(),
+    list: cloneTargets(saved),
+    d1UpdatedAt: d1Err ? (opts?.expectedUpdatedAt ?? null) : now
+  };
+}
+
+async function runWithExternalTargetsCas<T>(
+  bucket: any,
+  fn: (currentTargets: ExternalStorageTarget[], expectedUpdatedAt: string | null) => Promise<T>
+): Promise<T> {
+  return await withKeyLock(EXTERNAL_TARGETS_LOCK_KEY, async () => {
+    for (let attempt = 0; attempt <= EXTERNAL_TARGETS_MAX_CAS_RETRIES; attempt++) {
+      invalidateExternalTargetsCache();
+      const { targets, d1UpdatedAt } = await readExternalTargetsWithVersion(bucket);
+      try {
+        return await fn(targets, d1UpdatedAt);
+      } catch (err) {
+        if (err instanceof ExternalTargetsConflictError && attempt < EXTERNAL_TARGETS_MAX_CAS_RETRIES) {
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new ExternalTargetsConflictError();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +417,7 @@ async function executeTursoBatch(
   const url = `${target.endpointUrl.replace(/\/+$/, "")}/v2/pipeline`;
   const res = await fetch(url, {
     method: "POST",
+    redirect: "manual",
     headers: {
       "Content-Type": "application/json",
       ...(target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {})
@@ -326,6 +456,7 @@ async function executeD1Statement(
   const url = `${base}/client/v4/accounts/${ids.accId}/d1/database/${ids.dbId}/query`;
   const res = await fetch(url, {
     method: "POST",
+    redirect: "manual",
     headers: {
       "Content-Type": "application/json",
       ...(target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {})
@@ -432,6 +563,7 @@ const REMOTE_SCHEMA_STATEMENTS: string[] = [
     complete INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
   )`,
+  `CREATE INDEX IF NOT EXISTS idx_ext_child_comment_blobs_content ON child_comment_blobs(content_pk);`,
   // 正文大体积 HTML 存外部库：主 R2 的 html/* 也就不必再写
   `CREATE TABLE IF NOT EXISTS content_blobs (
     pk TEXT PRIMARY KEY,
@@ -564,6 +696,7 @@ export async function putOffloadedContentHtml(
     const objectUrl = `${base}/html/${encodeURIComponent(pk)}/${encodeURIComponent(hash || "latest")}`;
     const res = await fetch(objectUrl, {
       method: "PUT",
+      redirect: "manual",
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         ...(target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {})
@@ -594,6 +727,7 @@ export async function readOffloadedContentHtml(
       : [`${base}/html/${encodeURIComponent(pk)}`];
     for (const objectUrl of candidates) {
       const res = await fetch(objectUrl, {
+        redirect: "manual",
         headers: target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {}
       }).catch(() => null);
       if (res?.ok) {
@@ -875,18 +1009,28 @@ const ALWAYS_BLOCKED_HOSTS = new Set([
   "169.254.169.254",        // AWS / GCP / Azure / 阿里云元数据
   "100.100.100.200",        // 阿里云元数据
   "fd00:ec2::254",          // AWS IPv6 元数据
+  "::ffff:a9fe:a9fe",       // 169.254.169.254 的 IPv4-mapped IPv6 归一化形式
+  "::ffff:169.254.169.254",
+  "::ffff:6464:64c8",       // 100.100.100.200 的 IPv4-mapped IPv6 归一化形式
+  "::ffff:100.100.100.200",
   "metadata.google.internal",
   "metadata"
 ]);
 
+/** 归一化 SSRF 检查用 host：小写、剥离 IPv6 方括号及域名尾点 */
+function normalizeHostForSsrf(host: string): string {
+  return host.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+}
+
 /** 是否为内网 / 回环 / 链路本地地址（不含元数据判断）。 */
-function isPrivateOrLoopbackHost(host: string): boolean {
-  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+export function isPrivateOrLoopbackHost(host: string): boolean {
+  const h = normalizeHostForSsrf(host);
   if (h === "localhost" || h.endsWith(".localhost")) return true;
   // IPv6 字面量必须带冒号：否则 "fc-xxx.turso.io" 这类正常域名会被误判为 fc00::/7
   if (h.includes(":")) {
     if (h === "::1" || h === "::") return true;
-    if (/^(fc|fd|fe80)/.test(h)) return true;
+    if (/^::ffff:/i.test(h)) return true;
+    if (/^(fc|fd|fe[89ab]|64:ff9b:)/.test(h)) return true;
   }
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
   if (!m) return false;
@@ -928,7 +1072,7 @@ function validateExternalTargetUrl(c: any, rawUrl: string): string | null {
   if (parsed.username || parsed.password) {
     return "连接地址不能包含账号密码，请把凭据填写到访问凭据( authToken )中";
   }
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const host = normalizeHostForSsrf(parsed.hostname);
   if (ALWAYS_BLOCKED_HOSTS.has(host)) {
     return "不允许访问云元数据或链路本地地址";
   }
@@ -954,6 +1098,7 @@ export type WriteTokenSource = "db" | "env" | "api_secret" | "none";
 export async function getActiveWriteTokenInfo(
   c: any
 ): Promise<{ token: string; source: WriteTokenSource }> {
+  let dbError: unknown = null;
   try {
     const row = await db.prepare(
       `SELECT value FROM app_settings WHERE key = ?`
@@ -961,13 +1106,16 @@ export async function getActiveWriteTokenInfo(
     if (row?.value && row.value.trim()) {
       return { token: row.value.trim(), source: "db" };
     }
-  } catch {
-    // 忽略表未就绪
+  } catch (err) {
+    dbError = err;
   }
   const envToken = String(c.env.COOKIE_WRITE_TOKEN || "").trim();
   if (envToken) return { token: envToken, source: "env" };
   const apiSecret = String(c.env.API_SECRET || "").trim();
   if (apiSecret) return { token: apiSecret, source: "api_secret" };
+  if (dbError !== null) {
+    throw new Error("Auth storage unavailable");
+  }
   return { token: "", source: "none" };
 }
 
@@ -980,7 +1128,7 @@ export async function getActiveWriteToken(c: any): Promise<string> {
  * - 必须携带 `Authorization: Bearer <token>`，不存在「仅 Origin 免密」分支；
  * - 带了 Origin 就必须命中白名单（CLI 无 Origin 时凭口令即可）；
  * - 依次接受 API_SECRET / 写入口令（D1 在线设置 > COOKIE_WRITE_TOKEN > API_SECRET）；
- * - 连 API_SECRET 都没配的空环境直接拒绝，绝不默认放行。
+ * - 连 API_SECRET 都没配的空环境或 D1 不可用且无 env 兜底时直接拒绝，绝不默认放行。
  */
 export async function authorizeWrite(c: any): Promise<{ ok: boolean }> {
   const apiSecret = c.env.API_SECRET;
@@ -993,7 +1141,12 @@ export async function authorizeWrite(c: any): Promise<{ ok: boolean }> {
 
   if (apiSecret && auth === `Bearer ${apiSecret}`) return { ok: true };
 
-  const writeToken = await getActiveWriteToken(c);
+  let writeToken = "";
+  try {
+    writeToken = await getActiveWriteToken(c);
+  } catch {
+    return { ok: false };
+  }
   if (!writeToken) return { ok: false };
 
   return { ok: auth === `Bearer ${writeToken}` };
@@ -1007,8 +1160,12 @@ export const NO_WRITE_TOKEN_HINT =
  * 给出「先去设置页初始化操作密码」的可操作提示，而不是含糊的「密码错误」。
  */
 async function denyWrite(c: any, fallback: string) {
-  const token = await getActiveWriteToken(c);
-  return c.json({ error: token ? fallback : NO_WRITE_TOKEN_HINT, needToken: true }, 401);
+  try {
+    const token = await getActiveWriteToken(c);
+    return c.json({ error: token ? fallback : NO_WRITE_TOKEN_HINT, needToken: true }, 401);
+  } catch {
+    return c.json({ error: "Auth storage unavailable" }, 503);
+  }
 }
 
 /**
@@ -1069,7 +1226,12 @@ authRoutes.post("/write-token", async c => {
     return c.json({ error: "新密码长度需在 4 到 128 个字符之间" }, 400);
   }
 
-  const activeToken = await getActiveWriteToken(c);
+  let activeToken = "";
+  try {
+    activeToken = await getActiveWriteToken(c);
+  } catch {
+    return c.json({ error: "Auth storage unavailable" }, 503);
+  }
   const auth = c.req.header("authorization") || "";
   const hasApiSecret = Boolean(c.env.API_SECRET && auth === `Bearer ${c.env.API_SECRET}`);
   // 环境变量口令作为应急恢复主钥：D1 里的口令被写坏/忘记时可从 env 恢复
@@ -1184,7 +1346,13 @@ authRoutes.get("/zhihu-status", async c => {
     if (!Number.isNaN(t)) ageHours = Math.round((Date.now() - t) / 3600_000);
   }
 
-  const activeTokenInfo = await getActiveWriteTokenInfo(c);
+  let activeTokenInfo: { token: string; source: WriteTokenSource };
+  try {
+    activeTokenInfo = await getActiveWriteTokenInfo(c);
+  } catch (e) {
+    console.error("read write token failed (migration applied?):", e);
+    return c.json({ error: "Auth storage unavailable" }, 503);
+  }
   const syncConfig = await getSyncConfig(c.env.BUCKET);
   // 环境变量注入的 Key 同样算「已配置」，但明文永不回传：只暴露 hasFallbackAiKey
   const hasFallbackAiKey =
@@ -1307,75 +1475,83 @@ authRoutes.post("/external-targets", async c => {
     : (["contents", "comments"] as ExternalSyncScope[]);
   const syncScopes: ExternalSyncScope[] = scopes.length ? scopes : ["contents", "comments"];
 
-  const currentTargets = await getExternalTargetsRaw(c.env.BUCKET);
-  const now = new Date().toISOString();
+  try {
+    return await runWithExternalTargetsCas(c.env.BUCKET, async (currentTargets, expectedUpdatedAt) => {
+      const now = new Date().toISOString();
 
-  let targetId = typeof body.id === "string" ? body.id.trim() : "";
-  const existingIdx = targetId ? currentTargets.findIndex(t => t.id === targetId) : -1;
-  const existingTarget = existingIdx >= 0 ? currentTargets[existingIdx] : undefined;
+      let targetId = typeof body.id === "string" ? body.id.trim() : "";
+      const existingIdx = targetId ? currentTargets.findIndex(t => t.id === targetId) : -1;
+      const existingTarget = existingIdx >= 0 ? currentTargets[existingIdx] : undefined;
 
-  // 老前端（未传 storageRole）编辑时保留原值；新建时默认直接分流扩容
-  const storageRole = normalizeStorageRole(
-    body.storageRole,
-    existingTarget?.storageRole ?? DEFAULT_STORAGE_ROLE
-  );
-  const overflowThresholdRows = normalizeOverflowThreshold(
-    body.overflowThresholdRows,
-    existingTarget?.overflowThresholdRows ?? DEFAULT_OVERFLOW_THRESHOLD_ROWS
-  );
+      // 老前端（未传 storageRole）编辑时保留原值；新建时默认直接分流扩容
+      const storageRole = normalizeStorageRole(
+        body.storageRole,
+        existingTarget?.storageRole ?? DEFAULT_STORAGE_ROLE
+      );
+      const overflowThresholdRows = normalizeOverflowThreshold(
+        body.overflowThresholdRows,
+        existingTarget?.overflowThresholdRows ?? DEFAULT_OVERFLOW_THRESHOLD_ROWS
+      );
 
-  let savedTarget: ExternalStorageTarget;
+      let savedTarget: ExternalStorageTarget;
 
-  if (existingIdx >= 0) {
-    const existing = currentTargets[existingIdx];
-    // 如果前端传来的 authToken 为空串或 undefined，保留旧的 existing.authToken
-    const finalToken = rawAuthToken ? rawAuthToken : existing.authToken;
-    savedTarget = {
-      ...existing,
-      name,
-      provider,
-      enabled,
-      syncScopes,
-      storageRole,
-      overflowThresholdRows,
-      endpointUrl,
-      databaseId,
-      authToken: finalToken,
-      updatedAt: now
-    };
-    currentTargets[existingIdx] = savedTarget;
-  } else {
-    if (currentTargets.length >= 10) {
-      return c.json({ error: "外部存储目标已达到上限（最多 10 个）" }, 400);
+      if (existingIdx >= 0) {
+        const existing = currentTargets[existingIdx];
+        // 如果前端传来的 authToken 为空串或 undefined，保留旧的 existing.authToken
+        const finalToken = rawAuthToken ? rawAuthToken : existing.authToken;
+        savedTarget = {
+          ...existing,
+          name,
+          provider,
+          enabled,
+          syncScopes,
+          storageRole,
+          overflowThresholdRows,
+          endpointUrl,
+          databaseId,
+          authToken: finalToken,
+          updatedAt: now
+        };
+        currentTargets[existingIdx] = savedTarget;
+      } else {
+        if (currentTargets.length >= 10) {
+          return c.json({ error: "外部存储目标已达到上限（最多 10 个）" }, 400);
+        }
+        targetId = "ext-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
+        savedTarget = {
+          id: targetId,
+          name,
+          provider,
+          enabled,
+          syncScopes,
+          storageRole,
+          overflowThresholdRows,
+          endpointUrl,
+          databaseId,
+          authToken: rawAuthToken || undefined,
+          createdAt: now,
+          updatedAt: now,
+          lastTestAt: null,
+          lastTestOk: null,
+          lastTestMsg: null
+        };
+        currentTargets.push(savedTarget);
+      }
+
+      await saveExternalTargetsRaw(c.env.BUCKET, currentTargets, { expectedUpdatedAt });
+
+      return c.json({
+        ok: true,
+        target: maskTargetForClient(savedTarget),
+        targets: currentTargets.map(maskTargetForClient)
+      });
+    });
+  } catch (err) {
+    if (err instanceof ExternalTargetsConflictError) {
+      return c.json({ error: err.message, conflict: true }, 409);
     }
-    targetId = "ext-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
-    savedTarget = {
-      id: targetId,
-      name,
-      provider,
-      enabled,
-      syncScopes,
-      storageRole,
-      overflowThresholdRows,
-      endpointUrl,
-      databaseId,
-      authToken: rawAuthToken || undefined,
-      createdAt: now,
-      updatedAt: now,
-      lastTestAt: null,
-      lastTestOk: null,
-      lastTestMsg: null
-    };
-    currentTargets.push(savedTarget);
+    throw err;
   }
-
-  await saveExternalTargetsRaw(c.env.BUCKET, currentTargets);
-
-  return c.json({
-    ok: true,
-    target: maskTargetForClient(savedTarget),
-    targets: currentTargets.map(maskTargetForClient)
-  });
 });
 
 /**
@@ -1392,14 +1568,22 @@ authRoutes.post("/external-targets/delete", async c => {
     return c.json({ error: "缺少目标 ID" }, 400);
   }
 
-  const currentTargets = await getExternalTargetsRaw(c.env.BUCKET);
-  const remaining = currentTargets.filter(t => t.id !== id);
-  await saveExternalTargetsRaw(c.env.BUCKET, remaining);
+  try {
+    return await runWithExternalTargetsCas(c.env.BUCKET, async (currentTargets, expectedUpdatedAt) => {
+      const remaining = currentTargets.filter(t => t.id !== id);
+      await saveExternalTargetsRaw(c.env.BUCKET, remaining, { expectedUpdatedAt });
 
-  return c.json({
-    ok: true,
-    targets: remaining.map(maskTargetForClient)
-  });
+      return c.json({
+        ok: true,
+        targets: remaining.map(maskTargetForClient)
+      });
+    });
+  } catch (err) {
+    if (err instanceof ExternalTargetsConflictError) {
+      return c.json({ error: err.message, conflict: true }, 409);
+    }
+    throw err;
+  }
 });
 
 /**
@@ -1462,6 +1646,7 @@ authRoutes.post("/external-targets/test", async c => {
       const pingUrl = `${endpointUrl.replace(/\/+$/, "")}/v2/pipeline`;
       const res = await fetch(pingUrl, {
         method: "POST",
+        redirect: "manual",
         headers: {
           "Content-Type": "application/json",
           ...(authToken ? { Authorization: `Bearer ${authToken}` } : {})
@@ -1505,6 +1690,7 @@ authRoutes.post("/external-targets/test", async c => {
         const d1Url = `${d1Base}/client/v4/accounts/${accId}/d1/database/${dbId}/query`;
         const res = await fetch(d1Url, {
           method: "POST",
+          redirect: "manual",
           headers: {
             "Content-Type": "application/json",
             ...(authToken ? { Authorization: `Bearer ${authToken}` } : {})
@@ -1532,6 +1718,7 @@ authRoutes.post("/external-targets/test", async c => {
       const supaUrl = `${endpointUrl.replace(/\/+$/, "")}/rest/v1/`;
       const res = await fetch(supaUrl, {
         method: "GET",
+        redirect: "manual",
         headers: {
           ...(authToken ? { apikey: authToken, Authorization: `Bearer ${authToken}` } : {})
         },
@@ -1553,6 +1740,7 @@ authRoutes.post("/external-targets/test", async c => {
 
       let res = await fetch(endpointUrl, {
         method: "GET",
+        redirect: "manual",
         headers: reqHeaders,
         signal: controller.signal
       }).catch(() => null);
@@ -1561,6 +1749,7 @@ authRoutes.post("/external-targets/test", async c => {
         // 重试 HEAD
         res = await fetch(endpointUrl, {
           method: "HEAD",
+          redirect: "manual",
           headers: reqHeaders,
           signal: controller.signal
         }).catch(() => null);
@@ -1570,6 +1759,9 @@ authRoutes.post("/external-targets/test", async c => {
       if (res && res.ok) {
         testOk = true;
         testMsg = `HTTP 连通成功 (响应码 ${res.status})`;
+      } else if (res && res.status >= 300 && res.status < 400) {
+        testOk = false;
+        testMsg = `目标返回重定向 (HTTP ${res.status})，出于安全策略已禁止自动跟随`;
       } else if (res && res.status < 500) {
         testOk = false;
         testMsg = `目标返回客户端错误 (HTTP ${res.status})`;
@@ -1590,14 +1782,26 @@ authRoutes.post("/external-targets/test", async c => {
   const now = new Date().toISOString();
 
   let updatedTarget: ExternalStorageTarget | undefined;
-  if (existing) {
-    existing.lastTestAt = now;
-    existing.lastTestOk = testOk;
+  if (targetId) {
     // 目标服务的错误响应可能回显 Authorization；落库前抹掉 token，避免 GET 列表二次泄漏
     const safeMsg = authToken ? testMsg.split(authToken).join("***") : testMsg;
-    existing.lastTestMsg = `${safeMsg} (${latencyMs}ms)`;
-    updatedTarget = existing;
-    await saveExternalTargetsRaw(c.env.BUCKET, currentTargets);
+    try {
+      updatedTarget = await runWithExternalTargetsCas(c.env.BUCKET, async (latestTargets, expectedUpdatedAt) => {
+        const latestExisting = latestTargets.find(t => t.id === targetId);
+        // 若探测期间该目标已被删除，跳过写回、不复活已删目标
+        if (!latestExisting) return undefined;
+        latestExisting.lastTestAt = now;
+        latestExisting.lastTestOk = testOk;
+        latestExisting.lastTestMsg = `${safeMsg} (${latencyMs}ms)`;
+        await saveExternalTargetsRaw(c.env.BUCKET, latestTargets, { expectedUpdatedAt });
+        return latestExisting;
+      });
+    } catch (err) {
+      if (err instanceof ExternalTargetsConflictError) {
+        return c.json({ error: err.message, conflict: true }, 409);
+      }
+      throw err;
+    }
   }
 
   return c.json({

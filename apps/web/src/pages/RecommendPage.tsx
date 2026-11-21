@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../lib/api.js";
+import { assessContentRisk } from "../lib/ai-assess.js";
 import { recommendStore } from "../lib/store.js";
 
 const fmtNum = (n: any) => {
@@ -26,7 +27,8 @@ export default function RecommendPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [aiResults, setAiResults] = useState<Record<string, any>>(recommendStore.aiCache);
-  const [aiLoadingPk, setAiLoadingPk] = useState<string | null>(null);
+  const [aiLoadingPks, setAiLoadingPks] = useState<Record<string, boolean>>({});
+  const aiLoadingSetRef = useRef<Set<string>>(new Set());
   const [similarMap, setSimilarMap] = useState<Record<string, any[]>>(recommendStore.similarCache);
   const [similarLoadingPk, setSimilarLoadingPk] = useState<string | null>(null);
   const [similarError, setSimilarError] = useState<Record<string, string>>({});
@@ -84,26 +86,14 @@ export default function RecommendPage() {
   const handleAiAssess = async (e: React.MouseEvent, pk: string) => {
     e.preventDefault();
     e.stopPropagation();
-    if (aiResults[pk]) return;
-    setAiLoadingPk(pk);
-    try {
-      const res = await api<any>(`/api/recommend/ai-assess`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ pk })
-      });
-      if (res?.ai) {
-        setAiResults(prev => {
-          const next = { ...prev, [pk]: res.ai };
-          recommendStore.aiCache = next;
-          return next;
-        });
-      }
-    } catch (err: any) {
-      alert(`AI 风险鉴定失败: ${err?.message || err}`);
-    } finally {
-      setAiLoadingPk(prev => (prev === pk ? null : prev));
-    }
+    await assessContentRisk({
+      pk,
+      aiResults,
+      aiLoadingSetRef,
+      setAiLoadingPks,
+      setAiResults,
+      errorPrefix: "AI 风险鉴定失败"
+    });
   };
 
   const handleFindSimilar = async (e: React.MouseEvent, pk: string) => {
@@ -355,7 +345,7 @@ export default function RecommendPage() {
                 <button
                   type="button"
                   onClick={e => handleAiAssess(e, item.pk)}
-                  disabled={aiLoadingPk === item.pk}
+                  disabled={Boolean(aiLoadingPks[item.pk])}
                   style={{
                     padding: "2px 10px",
                     borderRadius: 4,
@@ -366,7 +356,7 @@ export default function RecommendPage() {
                     cursor: "pointer"
                   }}
                 >
-                  {aiLoadingPk === item.pk ? "AI 鉴定中…" : aiResults[item.pk] ? "✅ 已鉴定" : "🛡️ AI 风险鉴定"}
+                  {aiLoadingPks[item.pk] ? "AI 鉴定中…" : aiResults[item.pk] ? "✅ 已鉴定" : "🛡️ AI 风险鉴定"}
                 </button>
                 <button
                   type="button"

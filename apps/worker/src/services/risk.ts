@@ -34,7 +34,7 @@ export function evaluateContentRisk(row: any): RiskAssessment {
   const tags: string[] = [];
 
   const voteup = Number(row?.voteup_count) || 0;
-  const comments = Number(row?.comment_count) || 0;
+  const comments = Number(row?.live_comment_count ?? row?.comment_count) || 0;
   const favs = Number(row?.favorite_count) || 0;
   const isDeleted = Number(row?.is_deleted) === 1;
   const isCollapsed = Number(row?.is_collapsed) === 1;

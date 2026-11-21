@@ -538,15 +538,22 @@ async function localizeOne(
   return null;
 }
 
-/** 供图片任务队列调用：下载单张图片并返回站内路径；失败返回 null */
+/** 供图片任务队列调用：下载单张图片并返回站内路径（受全局并发槽位限制）；失败返回 null */
 export async function localizeImage(
   sourceUrl: string,
   bucket: R2Bucket,
-  qualityOverride?: ImageQuality
+  qualityOverride?: ImageQuality,
+  signal?: AbortSignal
 ): Promise<string | null> {
   if (!isZhihuImageUrl(sourceUrl)) return null;
   const quality = qualityOverride ?? (await getImageQualitySetting(bucket));
-  return localizeOne(sourceUrl, bucket, quality);
+  const acquired = await acquireImageSlot(signal);
+  if (!acquired) return null;
+  try {
+    return await localizeOne(sourceUrl, bucket, quality, signal);
+  } finally {
+    releaseImageSlot();
+  }
 }
 
 /** 待本地化的图片：src 是 HTML 里的原始属性值，url 是归一化后的可抓取地址 */

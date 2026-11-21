@@ -16,7 +16,6 @@ import {
   kickImageDrain,
   processImageBatch,
   IMAGE_TASK_BATCH_DEFAULT_LIMIT,
-  IMAGE_TASK_BATCH_MAX_LIMIT,
   IMAGE_TASK_INGEST_KICK_LIMIT
 } from "../services/image-tasks.js";
 import {
@@ -32,7 +31,7 @@ import type { Bindings } from "../types.js";
 
 export const ingestRoutes = new Hono<{ Bindings: Bindings }>();
 
-async function forwardToExternalTargets(
+export async function forwardToExternalTargets(
   c: any,
   scope: ExternalSyncScope,
   eventPath: string,
@@ -64,6 +63,7 @@ async function forwardToExternalTargets(
             const destUrl = `${t.endpointUrl.replace(/\/+$/, "")}${eventPath}`;
             const res = await fetch(destUrl, {
               method: "POST",
+              redirect: "manual",
               headers: {
                 "Content-Type": "application/json",
                 ...(t.authToken ? { Authorization: `Bearer ${t.authToken}` } : {})
@@ -76,6 +76,7 @@ async function forwardToExternalTargets(
             const tursoUrl = `${t.endpointUrl.replace(/\/+$/, "")}/v2/pipeline`;
             const res = await fetch(tursoUrl, {
               method: "POST",
+              redirect: "manual",
               headers: {
                 "Content-Type": "application/json",
                 ...(t.authToken ? { Authorization: `Bearer ${t.authToken}` } : {})
@@ -123,6 +124,7 @@ async function forwardToExternalTargets(
               // D1 REST /query 一次只接受一条语句：建表和写入必须拆成两次请求
               const ddlRes = await fetch(d1Url, {
                 method: "POST",
+                redirect: "manual",
                 headers: d1Headers,
                 body: JSON.stringify({
                   sql: `CREATE TABLE IF NOT EXISTS zhihu_backup_mirror (
@@ -138,6 +140,7 @@ async function forwardToExternalTargets(
               if (!ddlRes.ok) console.warn(`[mirror:${t.name}] cloudflare_d1 DDL HTTP ${ddlRes.status}`);
               const writeRes = await fetch(d1Url, {
                 method: "POST",
+                redirect: "manual",
                 headers: d1Headers,
                 body: JSON.stringify({
                   sql: `INSERT OR REPLACE INTO zhihu_backup_mirror (scope, entity_key, payload_json, synced_at) VALUES (?, ?, ?, ?)`,
@@ -154,6 +157,7 @@ async function forwardToExternalTargets(
             const objectUrl = `${t.endpointUrl.replace(/\/+$/, "")}/${encodeURIComponent(bucketName)}/${encodeURIComponent(scope)}/${encodeURIComponent(entityKey)}.json`;
             const res = await fetch(objectUrl, {
               method: "PUT",
+              redirect: "manual",
               headers: {
                 "Content-Type": "application/json; charset=utf-8",
                 ...(t.authToken ? { Authorization: `Bearer ${t.authToken}` } : {})
@@ -166,6 +170,7 @@ async function forwardToExternalTargets(
             const supaUrl = `${t.endpointUrl.replace(/\/+$/, "")}/rest/v1/zhihu_backup_mirror`;
             const res = await fetch(supaUrl, {
               method: "POST",
+              redirect: "manual",
               headers: {
                 "Content-Type": "application/json",
                 Prefer: "resolution=merge-duplicates",
@@ -210,8 +215,8 @@ function triggerExternalForward(c: any, scope: ExternalSyncScope, eventPath: str
 function triggerImageDrain(c: Context<{ Bindings: Bindings }>): void {
   const bucket = c.env.BUCKET;
   if (!bucket) return;
-  const promise = dbContext
-    .run(c.env.DB, () => kickImageDrain(bucket, IMAGE_TASK_INGEST_KICK_LIMIT))
+  const promise = Promise.resolve()
+    .then(() => dbContext.run(c.env.DB, () => kickImageDrain(bucket, IMAGE_TASK_INGEST_KICK_LIMIT)))
     .catch(err => {
       console.warn("[ingest] image drain failed:", err instanceof Error ? err.message : err);
       return null;
@@ -341,10 +346,12 @@ ingestRoutes.post("/content", async c => {
   return c.json({ ...result, offloadedTo: htmlOffloadedTo ?? undefined });
 });
 
+const IMAGE_TASK_ROUTE_MAX_LIMIT = 12;
+
 /**
  * 图片任务批量消费（P1）：每次领取一批 pending 任务，下载并写入 R2。
  * ingest 响应后的 waitUntil 会自动触发一次；cron / 手动补采也可以直接调用。
- * body 可选 { limit }，缺省 IMAGE_TASK_BATCH_DEFAULT_LIMIT，上限 IMAGE_TASK_BATCH_MAX_LIMIT。
+ * body 可选 { limit }，缺省 IMAGE_TASK_BATCH_DEFAULT_LIMIT，路由上限钳制为 12。
  */
 ingestRoutes.post("/image-batch", async c => {
   const bucket = c.env.BUCKET;
@@ -353,11 +360,11 @@ ingestRoutes.post("/image-batch", async c => {
   const body = await c.req.json().catch(() => null) as { limit?: unknown } | null;
   const rawLimit = Number(body?.limit);
   const limit = Number.isFinite(rawLimit) && rawLimit > 0
-    ? Math.min(Math.trunc(rawLimit), IMAGE_TASK_BATCH_MAX_LIMIT)
+    ? Math.max(1, Math.min(Math.trunc(rawLimit), IMAGE_TASK_ROUTE_MAX_LIMIT))
     : IMAGE_TASK_BATCH_DEFAULT_LIMIT;
 
   const result = await processImageBatch(bucket, limit);
-  return c.json(result);
+  return c.json({ ...result, limit });
 });
 
 ingestRoutes.post("/comments", async c => {

@@ -1360,6 +1360,7 @@ async function uploadOne(rec) {
       { body, contentType: rec.contentType || "application/octet-stream", timeoutMs: 180000 }
     );
   } else {
+    // Wrangler 3 的 `r2 object put` 仅提供 `--local` 选项，省略 `--local` 时默认即写入远端 Cloudflare R2（且不支持 `--remote` 参数）。
     const r = await runWrangler(
       [
         "r2",

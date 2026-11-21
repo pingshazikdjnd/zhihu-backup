@@ -208,6 +208,7 @@ function emptyProgress() {
       startedAt: null,
       finishedAt: null,
       exitCode: null,
+      signal: null,
       statsAfter: null
     };
   }
@@ -540,11 +541,17 @@ function runChild(command, args, { cwd, env, timeoutMs = 0, silent = false, maxC
     });
     child.on("error", err => {
       if (timer) clearTimeout(timer);
-      resolve({ code: 1, stdout, stderr: stderr + String(err?.message || err), tail });
+      resolve({ code: 1, signal: null, stdout, stderr: stderr + String(err?.message || err), tail });
     });
-    child.on("close", code => {
+    child.on("close", (code, signal) => {
       if (timer) clearTimeout(timer);
-      resolve({ code: code ?? 0, stdout, stderr, tail });
+      resolve({
+        code: code !== null ? code : (signal ? 128 : 1),
+        signal: signal || null,
+        stdout,
+        stderr,
+        tail
+      });
     });
     // wrangler 的确认提示：非交互环境下直接回 y
     try { child.stdin.write("y\n"); child.stdin.end(); } catch { /* ignore */ }
@@ -933,7 +940,7 @@ async function runCrawlerStage(stage, ctx) {
       }
     });
     // tail 是最后 128KB 输出：足够识别 ending 处的 partial_risk_controlled 等终态标记
-    return { code: result.code, tail: result.tail };
+    return { code: result.code, signal: result.signal || null, tail: result.tail };
   } finally {
     // 明文凭据（cookie / apiSecret）随 INPUT.json 立即清除
     try { fs.rmSync(INPUT_JSON_PATH, { force: true }); } catch { /* ignore */ }
@@ -1191,6 +1198,7 @@ async function runStageWithCooldown(stage, ctx, progress) {
   entry.startedAt = entry.startedAt || new Date().toISOString();
   entry.finishedAt = null;
   entry.exitCode = null;
+  entry.signal = null;
   progress.currentStage = stage.id;
   writeProgress(progress);
   log(`▶️ 开始 ${stage.id}：${stage.title}（${stage.note}）`);
@@ -1222,10 +1230,10 @@ async function runStageWithCooldown(stage, ctx, progress) {
     const statsBefore = await fetchStats(ctx.secret, true);
     entry.attempts = (entry.attempts || 0) + 1;
     const roundStartedAt = Date.now();
-    const { code, tail } = await runCrawlerStage(stage, ctx);
+    const { code, signal, tail } = await runCrawlerStage(stage, ctx);
     const roundMs = Date.now() - roundStartedAt;
     const riskTerminal = detectRiskTerminal(tail);
-    const partialRisk = isPartialRisk(code, tail);
+    const partialRisk = !signal && isPartialRisk(code, tail);
     const statsAfter = await fetchStats(ctx.secret, true);
     // 赞同阶段以 upvotes_cursor 是否清空为完成标准；其他阶段以退出码 + 终态标记判断
     const remainingCursor = isUpvotes
@@ -1234,6 +1242,7 @@ async function runStageWithCooldown(stage, ctx, progress) {
     const { grown, comparable } = diffStatsProgress(statsBefore, statsAfter);
 
     entry.exitCode = code;
+    entry.signal = signal || null;
     entry.riskTerminal = riskTerminal;
     entry.statsAfter = statsAfter;
     progress.latestStats = statsAfter;
@@ -1241,6 +1250,7 @@ async function runStageWithCooldown(stage, ctx, progress) {
     entry.rounds.push({
       round,
       exitCode: code,
+      signal: signal || null,
       riskTerminal,
       partialRisk,
       grewBy: grown,
@@ -1252,14 +1262,14 @@ async function runStageWithCooldown(stage, ctx, progress) {
     });
     writeProgress(progress);
     log(
-      `📊 ${stage.id} 第 ${round} 轮结束（退出码 ${code}${riskTerminal ? "，终态标记 partial" : ""}）| ${formatStats(statsAfter)}` +
+      `📊 ${stage.id} 第 ${round} 轮结束（退出码 ${code}${signal ? `，信号 ${signal}` : ""}${riskTerminal ? "，终态标记 partial" : ""}）| ${formatStats(statsAfter)}` +
         ` | 本轮进展: ${grown.length > 0 ? grown.join(" / ") : "无新增"}`
     );
 
-    // 完成判定：赞同阶段必须「退出码 0 + 游标已清空（明确翻到历史末尾）」，
+    // 完成判定：赞同阶段必须「退出码 0 + 无信号中止 + 游标已清空（明确翻到历史末尾）」，
     // 所有阶段都必须没有未恢复的单条失败/风控终态标记，否则冷却续跑补抓。
     const cursorSettled = !isUpvotes || !remainingCursor;
-    if (code === 0 && cursorSettled && !riskTerminal) {
+    if (code === 0 && !signal && cursorSettled && !riskTerminal) {
       entry.status = "completed";
       entry.finishedAt = new Date().toISOString();
       progress.currentStage = null;
@@ -1405,6 +1415,7 @@ function resetProgress(progress) {
     entry.startedAt = null;
     entry.finishedAt = null;
     entry.exitCode = null;
+    entry.signal = null;
     entry.statsAfter = null;
   }
   progress.currentStage = null;

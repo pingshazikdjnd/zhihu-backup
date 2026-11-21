@@ -142,7 +142,8 @@ function scanCandidates(d1) {
         c.pk,
         c.comment_count AS commentCount,
         COALESCE(cm.roots, 0) AS roots,
-        COALESCE(ct.children, 0) AS children
+        COALESCE(ct.children, 0) AS children,
+        COALESCE(ct.incompleteThreads, 0) AS incompleteThreads
       FROM contents c
       LEFT JOIN (
         SELECT content_pk,
@@ -151,9 +152,15 @@ function scanCandidates(d1) {
         GROUP BY content_pk
       ) cm ON cm.content_pk = c.pk
       LEFT JOIN (
-        SELECT content_pk, COALESCE(SUM(child_count), 0) AS children
-        FROM comment_threads
-        GROUP BY content_pk
+        SELECT ct.content_pk,
+               COALESCE(SUM(CASE WHEN ct.is_complete IN (1, 2) THEN ct.child_count ELSE 0 END), 0) AS children,
+               COALESCE(SUM(CASE WHEN ct.child_count > 0 AND COALESCE(ct.is_complete, 0) = 0 THEN 1 ELSE 0 END), 0) AS incompleteThreads
+        FROM comment_threads ct
+        JOIN comments r ON r.id = ct.root_id
+                       AND r.content_pk = ct.content_pk
+                       AND r.parent_comment_id IS NULL
+                       AND r.is_deleted = 0
+        GROUP BY ct.content_pk
       ) ct ON ct.content_pk = c.pk
       WHERE c.is_deleted = 0
         AND c.source_type IN ('answer', 'article')
@@ -176,7 +183,7 @@ function scanCandidates(d1) {
   let skippedAlreadyComplete = 0;
   const targets = [];
   for (const r of rows) {
-    if (Number(r.roots) + Number(r.children) >= Number(r.commentCount)) {
+    if (Number(r.incompleteThreads || 0) === 0 && Number(r.roots) + Number(r.children) >= Number(r.commentCount)) {
       skippedAlreadyComplete += 1;
       continue;
     }
@@ -242,11 +249,13 @@ async function pickWorkerPort(startPort) {
   throw new Error(`端口 ${startPort}..${startPort + 19} 均不可用`);
 }
 
-async function startLocalWorker(port) {
+async function startLocalWorker(port, onSpawn) {
   const proc = spawn(process.execPath, [WRANGLER_BIN, "dev", "--local", "--port", String(port)], {
     cwd: WORKER_DIR,
-    stdio: ["pipe", "pipe", "pipe"]
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: process.platform !== "win32"
   });
+  if (typeof onSpawn === "function") onSpawn(proc);
   let dead = false;
   let exitCode = null;
   let errTail = "";
@@ -258,30 +267,42 @@ async function startLocalWorker(port) {
     errTail = (errTail + d.toString()).slice(-3000);
   });
 
-  const baseUrl = `http://127.0.0.1:${port}`;
-  const deadline = Date.now() + 60_000;
-  let ready = false;
-  while (Date.now() < deadline && !dead) {
-    try {
-      const res = await fetch(`${baseUrl}/api/health`);
-      if (res.ok) {
-        ready = true;
-        break;
-      }
-    } catch {}
-    await sleep(500);
-  }
-  if (!ready) {
+  try {
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const deadline = Date.now() + 60_000;
+    let ready = false;
+    while (Date.now() < deadline && !dead) {
+      try {
+        const res = await fetch(`${baseUrl}/api/health`);
+        if (res.ok) {
+          ready = true;
+          break;
+        }
+      } catch {}
+      await sleep(500);
+    }
+    if (!ready) {
+      throw new Error(`本地 Worker (${baseUrl}) 启动失败 (exit=${exitCode}): ${errTail}`);
+    }
+    return { proc, baseUrl, isDead: () => dead };
+  } catch (err) {
     stopLocalWorker(proc);
-    throw new Error(`本地 Worker (${baseUrl}) 启动失败 (exit=${exitCode}): ${errTail}`);
+    throw err;
   }
-  return { proc, baseUrl, isDead: () => dead };
 }
 
 function stopLocalWorker(proc) {
   if (!proc?.pid) return;
   try {
-    execFileSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], { stdio: "ignore" });
+    if (process.platform === "win32") {
+      execFileSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      try {
+        process.kill(-proc.pid, "SIGTERM");
+      } catch {
+        proc.kill("SIGTERM");
+      }
+    }
   } catch {}
 }
 
@@ -537,18 +558,30 @@ async function main() {
 
   acquireLock();
   let worker = null;
+  let startingWorkerProc = null;
   let secret = "";
 
   const ensureWorker = async () => {
     if (worker && !worker.isDead()) return;
     const port = await pickWorkerPort(opts.preferredPort);
     log(`[worker] 正在端口 ${port} 启动单实例本地 Worker...`);
-    worker = await startLocalWorker(port);
+    try {
+      worker = await startLocalWorker(port, (proc) => {
+        startingWorkerProc = proc;
+      });
+    } finally {
+      startingWorkerProc = null;
+    }
     secret = await resolveWorkerSecret(worker.baseUrl, creds.secrets);
     log(`[worker] 本地 Worker 就绪 (${worker.baseUrl})，账号=${creds.username}`);
   };
 
   const cleanupWorker = () => {
+    if (startingWorkerProc) {
+      stopLocalWorker(startingWorkerProc);
+      startingWorkerProc = null;
+      log("[worker] 本地 Worker 已停止。");
+    }
     if (worker) {
       stopLocalWorker(worker.proc);
       worker = null;
@@ -576,6 +609,7 @@ async function main() {
   };
   process.once("SIGINT", handleSignal);
   process.once("SIGTERM", handleSignal);
+  if (process.platform !== "win32") process.once("SIGHUP", handleSignal);
 
   const markItemDone = (kind, pk) => {
     if (kind === "closed") {
@@ -710,9 +744,33 @@ async function main() {
 
     log(`🎉 第 4 步评论补采队列执行完成！累计已核销断点 ${completedSet.size} 条，跳过 ${skippedSet.size} 条。`);
   } finally {
-    if (progressDirty) saveProgress(progress);
-    cleanupWorker();
-    releaseLock();
+    try {
+      if (progressDirty) saveProgress(progress);
+    } catch (err) {
+      log(`[cleanup] 保存进度失败，继续执行清理: ${err?.message || err}`);
+    } finally {
+      try {
+        try {
+          cleanupWorker();
+        } catch (err) {
+          log(`[cleanup] 停止 Worker 失败: ${err?.message || err}`);
+        }
+        try {
+          fs.rmSync(INPUT_JSON_PATH, { force: true });
+        } catch (err) {
+          log(`[cleanup] 清理 INPUT.json 失败: ${err?.message || err}`);
+        }
+        try {
+          releaseLock();
+        } catch (err) {
+          log(`[cleanup] 释放锁失败: ${err?.message || err}`);
+        }
+      } finally {
+        process.off("SIGINT", handleSignal);
+        process.off("SIGTERM", handleSignal);
+        if (process.platform !== "win32") process.off("SIGHUP", handleSignal);
+      }
+    }
   }
 }
 

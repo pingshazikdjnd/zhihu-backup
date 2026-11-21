@@ -47,10 +47,14 @@ export type R2EdgeCacheOptions = {
   immutable?: boolean;
   /** 可变内容的缓存秒数，默认 86400 */
   ttlSeconds?: number;
+  /** 跳过进程内 Map 与边缘缓存，直接回源 `bucket.get`（写路径强一致读取用） */
+  bypassCache?: boolean;
 };
 
 function edgeCacheUrl(r2Key: string): string {
-  return `${EDGE_CACHE_ORIGIN}/${encodeURIComponent(r2Key)}`;
+  // 楼中楼缓存路径升级 /v2/ 前缀：自然淘汰历史 max-age=86400 旧边缘缓存条目
+  const prefix = r2Key.startsWith("childcomments/") ? "/v2/" : "/";
+  return `${EDGE_CACHE_ORIGIN}${prefix}${encodeURIComponent(r2Key)}`;
 }
 
 function resolveTtlSeconds(opts: R2EdgeCacheOptions): number {
@@ -126,6 +130,11 @@ export async function getR2TextWithEdgeCache(
   r2Key: string,
   opts: R2EdgeCacheOptions = {}
 ): Promise<string | null> {
+  if (opts.bypassCache) {
+    const obj = await bucket.get(r2Key);
+    return obj ? await obj.text() : null;
+  }
+
   const ttlSeconds = resolveTtlSeconds(opts);
 
   const fromMemory = readMemory(r2Key, bucket);
@@ -174,12 +183,21 @@ export async function getR2TextWithEdgeCache(
   return text;
 }
 
+/** 仅驱逐进程内 Map 缓存（0 次边缘子请求） */
+export function evictR2MemoryCache(r2Key: string): void {
+  evictMemory(r2Key);
+}
+
 /**
  * 清掉某个 R2 key 的两层缓存。
  * 调用方在 BUCKET.put / BUCKET.delete 之后必须立即执行，保证更新立刻可见。
  */
-export async function purgeR2EdgeCache(r2Key: string): Promise<void> {
+export async function purgeR2EdgeCache(
+  r2Key: string,
+  opts: { skipEdge?: boolean } = {}
+): Promise<void> {
   evictMemory(r2Key);
+  if (opts.skipEdge) return;
   const edge = getDefaultCache();
   if (!edge || typeof (edge as any).delete !== "function") return;
   try {
