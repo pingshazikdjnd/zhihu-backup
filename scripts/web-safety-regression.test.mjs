@@ -770,4 +770,9 @@ test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页�
     [{ id: "c1" }, { id: "c2" }, { id: "c2" }, { id: "c3" }]
   );
   assert.deepEqual(Array.from(deduped, x => x.id), ["c1", "c2", "c3"], "同页与跨页重复 id 均只保留一条");
+
+  // 4) [防删归档] CommentTree 为已删除根评论、预览回复、展开子评论渲染「已删除」徽标
+  assert.match(commentTreeSrc, /comment\.is_deleted === 1[\s\S]{0,200}已删除/);
+  assert.match(commentTreeSrc, /reply\.isDeleted[\s\S]{0,200}已删除/);
+  assert.match(commentTreeSrc, /child\.isDeleted[\s\S]{0,200}已删除/);
 });

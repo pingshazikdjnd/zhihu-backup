@@ -155,10 +155,10 @@ class MemoryD1 {
   }
 }
 
-// 按顺序加载 migrations 目录全部 0000~0005（node:fs 同步只读，绝不访问 .wrangler）
+// 按顺序加载 migrations 目录全部 0000~0006+（node:fs 同步只读，绝不访问 .wrangler）
 const migrationsDir = path.join(repoRoot, "apps", "worker", "migrations");
 const migrationSql = readdirSync(migrationsDir)
-  .filter(name => /^000[0-5]_.*\.sql$/.test(name))
+  .filter(name => /^\d{4}_.*\.sql$/.test(name))
   .sort()
   .map(name => readFileSync(path.join(migrationsDir, name), "utf8"));
 
@@ -193,6 +193,7 @@ class Hono {
       req: {
         url: url || ("http://127.0.0.1/api/auth" + path),
         header: name => lower[String(name).toLowerCase()],
+        query: name => new URL(url || ("http://127.0.0.1/api/auth" + path)).searchParams.get(name) ?? undefined,
         json: async () => body
       },
       json: (obj, code = 200) => { status = code; payload = obj; return { status, body: obj }; }
@@ -213,6 +214,7 @@ const workerModules = await (async () => {
   const comments = await loadTs(path.join(workerSrc, "services", "comments.ts"), honoOverrides);
   const imageTasks = await loadTs(path.join(workerSrc, "services", "image-tasks.ts"), honoOverrides);
   const auth = await loadTs(path.join(workerSrc, "routes", "auth.ts"), honoOverrides);
+  const statsRoute = await loadTs(path.join(workerSrc, "routes", "stats.ts"), honoOverrides);
   const collections = await loadTs(path.join(workerSrc, "services", "collections.ts"));
   const sharedIndexUrl = await moduleUrlFor(sharedIndexPath);
   const contents = await loadTs(
@@ -220,10 +222,10 @@ const workerModules = await (async () => {
     new Map([["shared", sharedIndexUrl]])
   );
   const schemas = await loadTs(sharedSchemasPath);
-  return { db, hash, changes, comments, imageTasks, auth, collections, contents, schemas };
+  return { db, hash, changes, comments, imageTasks, auth, statsRoute, collections, contents, schemas };
 })();
 
-const { db: dbModule, hash: hashModule, changes: changesModule, comments: commentsModule, imageTasks: imageTasksModule, collections: collectionsModule, contents: contentsModule } = workerModules;
+const { db: dbModule, hash: hashModule, changes: changesModule, comments: commentsModule, imageTasks: imageTasksModule, collections: collectionsModule, contents: contentsModule, statsRoute: statsRouteModule } = workerModules;
 
 const CONTENT_PK = "answer:1";
 const NOW_ISO = "2024-01-01T00:00:00.000Z";
@@ -575,18 +577,24 @@ test("全量评论清零：roots 为空时 contents.comment_count 归零并删�
   assert.equal(
     sqlite.prepare(`SELECT comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).comment_count,
     0,
-    "全量对账后 contents.comment_count 必须归零"
+    "全量对账后 contents.comment_count 必须归零以驱动爬虫增量检测"
   );
-  // 全量清零必须连残余线程索引行一起删掉（thread_hash / incoming_hash 随行消失），
-  // 否则原站清空后又新增子评论时，旧 R2 子评论会在下次 partial 同步里被「复活合并」。
-  assert.equal(
+  assert.ok(
+    sqlite.prepare(`SELECT archived_comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).archived_comment_count >= 1,
+    "全量清零后 contents.archived_comment_count 必须保留已归档总数"
+  );
+  // 评论防删归档：全量清零只将根评论标为 is_deleted = 1，绝不删除 comment_threads 索引或 R2 楼中楼对象。
+  assert.ok(
     sqlite.prepare(`SELECT * FROM comment_threads WHERE root_id = 'r1'`).get(),
-    undefined,
-    "全量清零后 comment_threads 残余线程行必须删除"
+    "全量清零后 comment_threads 线程索引必须保留"
   );
-  assert.equal(r2Deletes, 1, "全量清零必须删除旧 R2 子评论对象");
-  assert.equal(r2Store.has("childcomments/r1.json"), false, "旧 R2 子评论对象必须已不存在");
+  assert.equal(r2Deletes, 0, "全量清零不得删除旧 R2 子评论对象");
+  assert.equal(r2Store.has("childcomments/r1.json"), true, "旧 R2 子评论对象必须保留");
   assert.equal(sqlite.prepare(`SELECT is_deleted FROM comments WHERE id = 'r1'`).get().is_deleted, 1);
+  const archivedRoots = await runWithDb(d1, () => commentsModule.listRootComments(d1, CONTENT_PK, {}, bucket));
+  assert.equal(archivedRoots.length, 1);
+  assert.equal(archivedRoots[0].id, "r1");
+  assert.equal(archivedRoots[0].is_deleted, 1);
 });
 
 test("单根楼中楼删光：R2 与 comment_threads 同步清空，不再显示旧预览", async () => {
@@ -633,22 +641,26 @@ test("单根楼中楼删光：R2 与 comment_threads 同步清空，不再显示
   ));
   assert.equal(JSON.parse(r2Store.get(key)).children.length, 1);
 
-  // 原站楼中楼被删光：抓全 + childCount = 0
+  // 原站楼中楼被删光：抓全 + childCount = 0 -> 防删归档保留旧回复并打上 isDeleted: true 标记
   await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(
     rootPayload([], 0, true),
     { DB: d1, BUCKET: bucket }
   ));
 
   const stored = JSON.parse(r2Store.get(key));
-  assert.deepEqual(stored.children, []);
+  assert.equal(stored.children.length, 1);
+  assert.equal(stored.children[0].id, "ch1");
+  assert.equal(stored.children[0].isDeleted, true);
   assert.equal(stored.complete, true);
   const thread = sqlite.prepare(`SELECT child_count, is_complete, preview_json FROM comment_threads WHERE root_id = 'r1'`).get();
-  assert.equal(thread.child_count, 0);
   assert.equal(thread.is_complete, 1);
-  assert.equal(thread.preview_json, "[]");
+  const preview = JSON.parse(thread.preview_json);
+  assert.equal(preview.length, 1);
+  assert.equal(preview[0].id, "ch1");
+  assert.equal(preview[0].isDeleted, true);
 });
 
-test("complete-empty：旧扁平 D1 子评论 + 无线程索引时建立 R2 空快照与计数 0，读取 API 不回退旧行", async () => {
+test("complete-empty：旧扁平 D1 子评论 + 无线程索引时防删归档迁移至 R2 并标记已删除", async () => {
   const { sqlite, d1 } = createMemoryDb();
   seedContent(sqlite);
   insertLegacyChild(sqlite, { id: "legacy-child", content: "legacy reply" });
@@ -659,23 +671,25 @@ test("complete-empty：旧扁平 D1 子评论 + 无线程索引时建立 R2 空�
     { DB: d1, BUCKET: bucket }
   ));
 
-  assert.equal(result.r2Puts, 1, "权威空快照必须写入 complete-empty R2 对象");
+  assert.equal(result.r2Puts, 1, "旧 D1 子评论必须防删归档到 R2 并建立完整快照");
   assert.equal(stats.puts, 1);
   const stored = JSON.parse(store.get("childcomments/r1.json"));
-  assert.deepEqual(stored.children, []);
   assert.equal(stored.complete, true);
+  assert.equal(stored.children.length, 1);
+  assert.equal(stored.children[0].id, "legacy-child");
+  assert.equal(stored.children[0].isDeleted, true);
 
   const thread = sqlite.prepare(`SELECT child_count, is_complete, preview_json FROM comment_threads WHERE root_id = 'r1'`).get();
-  assert.equal(thread.child_count, 0, "即使原先没有线程索引也必须建立 child_count=0 的索引");
   assert.equal(thread.is_complete, 1);
-  assert.equal(thread.preview_json, "[]");
 
   const children = await runWithDb(d1, () => commentsModule.getChildComments(bucket, "r1", d1));
-  assert.deepEqual(children, [], "complete-empty 快照必须阻止读取 API 回退旧 D1 子评论");
+  assert.equal(children.length, 1);
+  assert.equal(children[0].id, "legacy-child");
+  assert.equal(children[0].isDeleted, true);
   assert.equal(
     sqlite.prepare(`SELECT COUNT(*) AS n FROM comments WHERE id = 'legacy-child'`).get().n,
     1,
-    "清空 R2/索引时不得删除 D1 旧子评论行"
+    "防删归档不得删除 D1 旧子评论行"
   );
 });
 
@@ -697,13 +711,14 @@ test("complete-empty：R2 有旧子评论但线程计数被人为置 0 时仍清
     { DB: d1, BUCKET: bucket }
   )));
 
-  assert.equal(result.r2Puts, 1, "不能因为 child_count 已经是 0 就跳过 R2 清空");
+  assert.equal(result.r2Puts, 1, "不能因为 child_count 已经是 0 就跳过防删归档标记");
   assert.equal(stats.puts, putsBefore + 1);
   const stored = JSON.parse(store.get("childcomments/r1.json"));
-  assert.deepEqual(stored.children, []);
+  assert.equal(stored.children.length, 1);
+  assert.equal(stored.children[0].id, "ch1");
+  assert.equal(stored.children[0].isDeleted, true);
   assert.equal(stored.complete, true);
   const thread = sqlite.prepare(`SELECT child_count, is_complete FROM comment_threads WHERE root_id = 'r1'`).get();
-  assert.equal(thread.child_count, 0);
   assert.equal(thread.is_complete, 1);
 });
 
@@ -2134,7 +2149,7 @@ test("R2 边缘缓存：命中 0 次 R2 读取，楼中楼写入/清空后 purge
     assert.deepEqual(read3.map(item => item.id), ["ch1", "ch2"], "purge 后必须读到最新楼中楼");
     assert.equal(commentBucket.stats.gets - read3Before, 1, "更新后必须重新回源 R2，而不是返回旧缓存");
 
-    // 7) 清空楼中楼同样 purge：R2 写入空对象后，读路径不再看到旧回复
+    // 7) 全量清零时防删归档保留 R2 楼中楼对象，读路径仍可查看已归档回复
     const emptyWrite = await runWithDb(d1, () =>
       commentsModule.replaceCommentsByRoot(
         { contentPk: CONTENT_PK, partial: false, roots: [], allRootIds: [] },
@@ -2142,11 +2157,10 @@ test("R2 边缘缓存：命中 0 次 R2 读取，楼中楼写入/清空后 purge
       )
     );
     assert.equal(emptyWrite.r2Puts, 0);
-    assert.equal(edgeStore.has(threadUrl), false, "清零后边缘缓存必须被 purge");
     const readAfterClear = await runWithDb(d1, () =>
       commentsModule.getChildComments(commentBucket.bucket, "r1", d1)
     );
-    assert.deepEqual(readAfterClear, [], "已清零的楼中楼不得从旧缓存里复活");
+    assert.deepEqual(readAfterClear.map(item => item.id), ["ch1", "ch2"], "防删归档模式下全量清零仍保留已归档楼中楼");
 
     // 8) GET /api/contents/:pk 正文走边缘缓存；children 路由带短时 CDN 缓存头
     const contentsRoutePath = path.join(workerSrc, "routes", "contents.ts");
@@ -2378,7 +2392,8 @@ test("offload：getChildComments 优先外部库、empty complete 不复活旧�
     );
 
     const children = await runWithDb(d1, () => commentsModule.getChildComments(bucket, "r1", d1));
-    assert.deepEqual(children, [], "外部库 complete=true 空楼中楼必须返回 []，不得被主 R2 旧快照遮蔽或复活旧扁平行");
+    assert.deepEqual(children.map(c => c.id), ["ch1"], "外部库防删归档必须保留 ch1，不得被主 R2 旧快照或旧扁平行污染");
+    assert.equal(children[0].isDeleted, true);
 
     // 2) 主 D1 0 行评论时，upsertContent 通过外部库感知已有评论，保持 prevCommentCount = 15
     const existingRow = sqlite.prepare(`SELECT * FROM contents WHERE pk = ?`).get(CONTENT_PK);
@@ -3385,19 +3400,17 @@ test("[P1-4] 评论全量清零：60 根主库单次批量 delete 且跳过高�
       }, { DB: d1, BUCKET: bucket })
     );
 
-    assert.equal(deleteCalls.length, 1, "60 个楼中楼清零必须合并为 1 次 bucket.delete(keys)");
-    assert.equal(Array.isArray(deleteCalls[0]), true);
-    assert.equal(deleteCalls[0].length, 60);
-    assert.equal(r2Store.size, 0, "60 个 R2 对象必须全部被删");
-    assert.equal(edgeDeleteCalls, 0, "超过 10 条时必须跳过同步 caches.default.delete 防止击穿 50 子请求限制");
-    assert.equal(sqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n, 0);
+    assert.equal(deleteCalls.length, 0, "防删归档全量清零不得调用 bucket.delete");
+    assert.equal(r2Store.size, 60, "60 个 R2 对象必须全部保留");
+    assert.equal(edgeDeleteCalls, 0, "未删改 R2 时不应无效调用 caches.default.delete");
+    assert.equal(sqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n, 60);
+    assert.equal(sqlite.prepare(`SELECT COUNT(*) AS n FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL AND is_deleted = 0`).get(CONTENT_PK).n, 0);
+    assert.equal(sqlite.prepare(`SELECT comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).comment_count, 0);
 
-    // 确认进程内内存缓存已驱逐（关闭 caches.default 后读 r60-1 必须真实回源 R2 且返回 []）
+    // 关闭 caches.default 后仍可读取已归档楼中楼
     delete globalThis.caches;
-    const getsBefore = r2Gets;
     const afterClear = await runWithDb(d1, () => commentsModule.getChildComments(bucket, "r60-1", d1));
-    assert.deepEqual(afterClear, []);
-    assert.equal(r2Gets - getsBefore, 1, "进程内缓存已驱逐，必须回源 R2");
+    assert.ok(afterClear.length > 0, "全量清零后仍应可读取已归档子评论");
 
     // 2) 外部 cloudflare_d1 扩容路径：60 个线程全量清零只发单条 DELETE FROM child_comment_blobs WHERE content_pk = ?
     const remoteSqlite = new Database(":memory:");
@@ -3467,10 +3480,10 @@ test("[P1-4] 评论全量清零：60 根主库单次批量 delete 且跳过高�
     );
 
     const blobDeletes = executedRemoteSqls.filter(s => /DELETE FROM child_comment_blobs/i.test(s));
-    assert.equal(blobDeletes.length, 1, "cloudflare_d1 清零必须合并为单条按 content_pk 删除");
-    assert.match(blobDeletes[0], /WHERE content_pk = \?/i);
-    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM child_comment_blobs WHERE content_pk = ?`).get(CONTENT_PK).n, 0);
-    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n, 0);
+    assert.equal(blobDeletes.length, 0, "防删归档模式下 cloudflare_d1 全量清零不得删除 child_comment_blobs");
+    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM child_comment_blobs WHERE content_pk = ?`).get(CONTENT_PK).n, 60);
+    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n, 60);
+    assert.equal(sqlite.prepare(`SELECT comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).comment_count, 0);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalCaches === undefined) delete globalThis.caches;
@@ -4199,19 +4212,22 @@ test("[P2-5] 外部存储降级写 R2 按 updatedAt 择新不回滚；offload �
       commentsModule.replaceCommentsByRoot(emptyRootPayload, { DB: d1, BUCKET: offloadBucket })
     );
     const blob = remoteSqlite.prepare(`SELECT payload_json, complete FROM child_comment_blobs WHERE root_id = 'r-p25'`).get();
-    assert.ok(blob, "即使外部库原本无计数与线程行，也必须落 complete=1 空快照");
+    assert.ok(blob, "迁移期存在主 R2 旧对象时，切 offload 后必须抢救归档到外部库并落 complete=1");
     assert.equal(blob.complete, 1);
-    assert.deepEqual(JSON.parse(blob.payload_json).children, []);
+    const parsedBlob = JSON.parse(blob.payload_json);
+    assert.deepEqual(parsedBlob.children.map(c => c.id), ["stale_main_r2"]);
+    assert.equal(parsedBlob.children[0].isDeleted, true);
 
     const children = await runWithDb(d1, () => commentsModule.getChildComments(offloadBucket, "r-p25", d1));
-    assert.deepEqual(children, [], "不得回退主 R2 复活 stale_main_r2");
+    assert.deepEqual(children.map(c => c.id), ["stale_main_r2"], "主 R2 旧子评论必须被抢救归档并标记已删除");
+    assert.equal(children[0].isDeleted, true);
 
-    // 第二次同输入必须命中 complete-empty 快路径，0 次 blob/thread 写入
+    // 第二次同输入必须命中快路径，0 次 blob/thread 写入
     remoteBlobOrThreadWrites = 0;
     await runWithDb(d1, () =>
       commentsModule.replaceCommentsByRoot(emptyRootPayload, { DB: d1, BUCKET: offloadBucket })
     );
-    assert.equal(remoteBlobOrThreadWrites, 0, "外部库 complete-empty 第二遍同输入应命中快路径");
+    assert.equal(remoteBlobOrThreadWrites, 0, "外部库完整归档第二遍同输入应命中快路径");
   } finally {
     globalThis.fetch = originalFetch;
     auth.invalidateExternalTargetsCache();
@@ -4878,14 +4894,17 @@ test("[P1-6] offload 全量清零同步清理主 D1 残留评论/线程与主 R2
       }, { DB: d1, BUCKET: bucket })
     );
 
-    assert.equal(r2Store.has(mainThreadKey), false, "主 R2 旧楼中楼对象必须已删除");
-    assert.equal(sqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n, 0);
+    assert.equal(r2Store.has(mainThreadKey), true, "防删归档模式下主 R2 旧楼中楼对象必须保留");
+    assert.equal(sqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n, 1);
     assert.equal(sqlite.prepare(`SELECT COUNT(*) AS n FROM comments WHERE content_pk = ? AND is_deleted = 0`).get(CONTENT_PK).n, 0);
     assert.equal(sqlite.prepare(`SELECT comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).comment_count, 0);
-    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM child_comment_blobs WHERE content_pk = ?`).get(CONTENT_PK).n, 0);
-    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n, 0);
-    assert.deepEqual(await runWithDb(d1, () => commentsModule.getChildComments(bucket, "r-main-legacy", d1)), []);
-    assert.deepEqual(await runWithDb(d1, () => commentsModule.listRootComments(d1, CONTENT_PK, {}, bucket)), []);
+    assert.ok(sqlite.prepare(`SELECT archived_comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).archived_comment_count >= 2);
+    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM child_comment_blobs WHERE content_pk = ?`).get(CONTENT_PK).n, 1);
+    assert.equal(remoteSqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n, 1);
+    assert.equal((await runWithDb(d1, () => commentsModule.getChildComments(bucket, "r-main-legacy", d1))).length, 1);
+    const archivedRoots = await runWithDb(d1, () => commentsModule.listRootComments(d1, CONTENT_PK, {}, bucket));
+    assert.ok(archivedRoots.length >= 2);
+    assert.ok(archivedRoots.every(r => r.is_deleted === 1));
   } finally {
     globalThis.fetch = originalFetch;
     auth.invalidateExternalTargetsCache();
@@ -4923,10 +4942,10 @@ test("[P1-3][P2-1] R2 批量删失败保留 comment_threads 行、部分成功�
   assert.equal(
     sqlite.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n,
     20,
-    "R2 批量删除失败时绝不可删除 comment_threads 索引行"
+    "防删归档全量清零不触发 bucket.delete 并保留全部 20 行 comment_threads"
   );
 
-  // 2) 部分成功（1015 个线程，首批 1000 成功、次批 15 > 10 失败不回退逐条删）-> 仅删 1000 个成功项，且 IN (...) SQL 参数严格 <= 90
+  // 2) 1015 个线程全量清零：防删归档模式下既不触发 R2 批量删除也不删 comment_threads（无子请求风险）
   const { sqlite: s2, d1: d1_2 } = createMemoryDb();
   seedContent(s2);
   const insertRootStmt = s2.prepare(`
@@ -4945,15 +4964,13 @@ test("[P1-3][P2-1] R2 批量删失败保留 comment_threads 行、部分成功�
     }
   })();
 
-  let delBatchIdx = 0;
-  const partialFailBucket = {
+  let bucketDeleteCount = 0;
+  const noDeleteBucket = {
     async get() { return null; },
     async put() {},
-    async delete(keys) {
-      delBatchIdx++;
-      if (Array.isArray(keys) && delBatchIdx === 2) {
-        throw new Error("second R2 batch failed");
-      }
+    async delete() {
+      bucketDeleteCount++;
+      throw new Error("should not call bucket.delete during archival full-clear");
     }
   };
   const threadDeleteParamCounts = [];
@@ -4964,7 +4981,6 @@ test("[P1-3][P2-1] R2 批量删失败保留 comment_threads 行、部分成功�
         return {
           bind(...params) {
             threadDeleteParamCounts.push(params.length);
-            assert.ok(params.length <= 90, `IN 删除语句参数数 (${params.length}) 必须 <= 90`);
             return stmt.bind(...params);
           }
         };
@@ -4974,14 +4990,14 @@ test("[P1-3][P2-1] R2 批量删失败保留 comment_threads 行、部分成功�
     batch: stmts => d1_2.batch(stmts)
   };
   await runWithDb(wrappedD1, () =>
-    commentsModule.replaceCommentsByRoot({ contentPk: CONTENT_PK, partial: false, allRootIds: [], roots: [] }, { DB: wrappedD1, BUCKET: partialFailBucket })
+    commentsModule.replaceCommentsByRoot({ contentPk: CONTENT_PK, partial: false, allRootIds: [], roots: [] }, { DB: wrappedD1, BUCKET: noDeleteBucket })
   );
-  assert.ok(threadDeleteParamCounts.length >= 12, "1000 个成功 root_id 必须按 <= 89 块分片删除");
-  assert.ok(threadDeleteParamCounts.length > 0 && Math.max(...threadDeleteParamCounts) <= 90);
+  assert.equal(bucketDeleteCount, 0);
+  assert.equal(threadDeleteParamCounts.length, 0);
   assert.equal(
     s2.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n,
-    15,
-    "仅 R2 删除失败的那 15 行线程索引应保留"
+    1015,
+    "1015 个线程索引在全量清零时均应保留"
   );
 
   // 3) P2-1: childcomments/* 边缘缓存 URL 必须带 /v2/ 前缀（自然淘汰旧 86400s 缓存）
@@ -5319,15 +5335,15 @@ test("[M6] 闭评重开抓全（complete=true）且 R2 PUT 失败时 is_complete
   assert.equal(rowRecovered.is_complete, 1, "下轮重试成功后应恢复为 is_complete=1");
 });
 
-test("[M5][M7] 全量清零失败反写正数 comment_count 保持重试信号 + 清理无索引旧根 R2 对象 + offload 0回复历史探测", async () => {
+test("[M5][M7][防删归档] 全量清零保留全部已归档楼中楼并将 comment_count 置 0 + offload 0回复历史探测抢救归档", async () => {
   const auth = workerModules.auth;
   auth.invalidateExternalTargetsCache();
   auth.resetRemoteSchemaCache();
 
-  // 1) 主库路径：前置 sendContent 已将 comment_count 置 0；20 条全量清零时 R2 删除全部失败 -> 反写 20 且保留线程索引；恢复后归 0；同时清理无索引旧根 R2 对象
+  // 1) 主库路径：20 条根全量清零时即使 bucket.delete 会抛错也不调用它，保留全部 20 个 R2 对象与 19 行线程索引，comment_count=0 且 archived_comment_count>=20
   const { sqlite: s1, d1: d1_1 } = createMemoryDb();
   seedContent(s1);
-  s1.prepare(`UPDATE contents SET comment_count = 0 WHERE pk = ?`).run(CONTENT_PK);
+  s1.prepare(`UPDATE contents SET comment_count = 0, archived_comment_count = 0 WHERE pk = ?`).run(CONTENT_PK);
   const mainR2 = new Map();
   for (let i = 0; i < 20; i++) {
     const rid = `r-m5-${i}`;
@@ -5336,7 +5352,6 @@ test("[M5][M7] 全量清零失败反写正数 comment_count 保持重试信号 +
       INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
       VALUES (?, ?, NULL, 'U', 'text', 1, 'h', ?, ?, 0)
     `).run(rid, CONTENT_PK, NOW_ISO, NOW_ISO);
-    // 刻意留一条无 comment_threads 索引的旧根（i === 0）测试 M7 对称清零
     if (i > 0) {
       s1.prepare(`
         INSERT INTO comment_threads (root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at)
@@ -5345,36 +5360,34 @@ test("[M5][M7] 全量清零失败反写正数 comment_count 保持重试信号 +
     }
   }
 
-  let failDelete = true;
+  let deleteCalls = 0;
   const mainBucket = {
     async get(k) { const v = mainR2.get(k); return v === undefined ? null : { async text() { return v; } }; },
     async put(k, v) { mainR2.set(k, String(v)); },
-    async delete(keys) {
-      if (failDelete) throw new Error("R2 delete outage");
-      for (const k of Array.isArray(keys) ? keys : [keys]) mainR2.delete(k);
+    async delete() {
+      deleteCalls++;
+      throw new Error("R2 delete outage");
     }
   };
 
   await runWithDb(d1_1, () =>
     commentsModule.replaceCommentsByRoot({ contentPk: CONTENT_PK, partial: false, allRootIds: [], roots: [] }, { DB: d1_1, BUCKET: mainBucket })
   );
+  assert.equal(deleteCalls, 0);
   assert.equal(s1.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n, 19);
-  assert.equal(s1.prepare(`SELECT comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).comment_count, 20, "即使前置已是 0，删失败仍须反写正数 20 保持重试信号");
+  assert.equal(s1.prepare(`SELECT comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).comment_count, 0);
+  assert.ok(s1.prepare(`SELECT archived_comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).archived_comment_count >= 20);
+  assert.equal(mainR2.size, 20, "包括无索引旧根在内的全部 R2 楼中楼对象必须保留");
+  const listAfterMainClear = await runWithDb(d1_1, () => commentsModule.listRootComments(d1_1, CONTENT_PK, {}, mainBucket));
+  assert.equal(listAfterMainClear.length, 20);
+  assert.ok(listAfterMainClear.every(r => r.is_deleted === 1));
 
-  failDelete = false;
-  await runWithDb(d1_1, () =>
-    commentsModule.replaceCommentsByRoot({ contentPk: CONTENT_PK, partial: false, allRootIds: [], roots: [] }, { DB: d1_1, BUCKET: mainBucket })
-  );
-  assert.equal(s1.prepare(`SELECT COUNT(*) AS n FROM comment_threads WHERE content_pk = ?`).get(CONTENT_PK).n, 0);
-  assert.equal(s1.prepare(`SELECT comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).comment_count, 0, "全部清理成功后 comment_count 自然归 0");
-  assert.equal(mainR2.has("childcomments/r-m5-0.json"), false, "无 comment_threads 索引的旧根 R2 对象也必须被一并清理");
-
-  // 2) offload 路径：远端清零异常时 contents.comment_count > 0，恢复后归 0；同时清理无主 comment_threads 索引的主 R2 旧根；且探测远端旧 blobs / 未删扁平子评论
+  // 2) offload 路径：探测远端旧 blobs / 未删扁平子评论并将缺失子评论标记 isDeleted 归档；全量清零保留全部对象
   auth.invalidateExternalTargetsCache();
   auth.resetRemoteSchemaCache();
   const { sqlite: s2, d1: d1_2 } = createMemoryDb();
   seedContent(s2);
-  s2.prepare(`UPDATE contents SET comment_count = 0 WHERE pk = ?`).run(CONTENT_PK);
+  s2.prepare(`UPDATE contents SET comment_count = 0, archived_comment_count = 0 WHERE pk = ?`).run(CONTENT_PK);
   s2.prepare(`
     INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
     VALUES ('r-legacy-main', ?, NULL, 'U', 'legacy', 1, 'h', ?, ?, 0)
@@ -5401,12 +5414,9 @@ test("[M5][M7] 全量清零失败反写正数 comment_count 保持重试信号 +
   const offloadBucket = {
     async get(k) { const v = offloadR2.get(k); return v === undefined ? null : { async text() { return v; } }; },
     async put(k, v) { offloadR2.set(k, String(v)); },
-    async delete(keys) {
-      for (const k of Array.isArray(keys) ? keys : [keys]) offloadR2.delete(k);
-    }
+    async delete() { throw new Error("offload full-clear must not delete R2"); }
   };
 
-  let failRemoteClear = true;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (_url, init = {}) => {
     const body = JSON.parse(String(init.body));
@@ -5414,9 +5424,6 @@ test("[M5][M7] 全量清零失败反写正数 comment_count 保持重试信号 +
     for (const req of body.requests) {
       if (req.type === "close") { results.push({ type: "ok", response: { type: "close" } }); continue; }
       const sql = req.stmt.sql;
-      if (failRemoteClear && /DELETE FROM (child_comment_blobs|comment_threads)/i.test(sql)) {
-        throw new Error("remote clear outage");
-      }
       const args = (req.stmt.args || []).map(a => (!a || a.type === "null") ? null : (a.type === "integer" || a.type === "float") ? Number(a.value) : String(a.value));
       const st = remoteSqlite.prepare(sql);
       if (st.reader) {
@@ -5434,10 +5441,10 @@ test("[M5][M7] 全量清零失败反写正数 comment_count 保持重试信号 +
   try {
     await auth.ensureRemoteCommentSchema(offloadTarget);
 
-    // 2a) offload 0 回复根：外部库仅有无线程索引的旧 child_comment_blobs（r-blob-only）或未删扁平子评论行（r-flat-only）→ 必须写 complete-empty 墓碑
+    // 2a) offload 0 回复根：外部库仅有旧 child_comment_blobs（r-blob-only）或未删扁平子评论行（r-flat-only）→ 保留历史子评论并标记 isDeleted: true
     remoteSqlite.prepare(`
       INSERT INTO child_comment_blobs (root_id, content_pk, payload_json, complete, updated_at)
-      VALUES ('r-blob-only', ?, '{"children":[{"id":"old-b"}],"complete":true}', 1, ?)
+      VALUES ('r-blob-only', ?, '{"children":[{"id":"old-b","author":"B","content":"old reply","likes":2}],"complete":true}', 1, ?)
     `).run(CONTENT_PK, NOW_ISO);
     remoteSqlite.prepare(`
       INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted)
@@ -5471,29 +5478,174 @@ test("[M5][M7] 全量清零失败反写正数 comment_count 保持重试信号 +
     const blobLegacy1 = remoteSqlite.prepare(`SELECT payload_json, complete FROM child_comment_blobs WHERE root_id = 'r-blob-only'`).get();
     const blobLegacy2 = remoteSqlite.prepare(`SELECT payload_json, complete FROM child_comment_blobs WHERE root_id = 'r-flat-only'`).get();
     const blobBrandNew = remoteSqlite.prepare(`SELECT payload_json, complete FROM child_comment_blobs WHERE root_id = 'r-brand-new'`).get();
-    assert.deepEqual(JSON.parse(blobLegacy1.payload_json).children, []);
-    assert.equal(blobLegacy1.complete, 1, "外部库有旧 blob 必须写入 complete-empty 墓碑");
-    assert.deepEqual(JSON.parse(blobLegacy2.payload_json).children, []);
-    assert.equal(blobLegacy2.complete, 1, "外部库有未删扁平子评论行必须写入 complete-empty 墓碑");
-    assert.equal(blobBrandNew, undefined, "全新 0 回复根仍应跳过墓碑写入");
+    const parsed1 = JSON.parse(blobLegacy1.payload_json);
+    assert.deepEqual(parsed1.children.map(c => c.id), ["old-b"]);
+    assert.equal(parsed1.children[0].isDeleted, true, "外部库旧 blob 子评论被删后必须标为已删除归档");
+    assert.equal(blobLegacy1.complete, 1);
+    const parsed2 = JSON.parse(blobLegacy2.payload_json);
+    assert.deepEqual(parsed2.children.map(c => c.id), ["c-flat-legacy"]);
+    assert.equal(parsed2.children[0].isDeleted, true, "外部库扁平子评论行必须迁移归档并标为已删除");
+    assert.equal(blobLegacy2.complete, 1);
+    assert.equal(blobBrandNew, undefined, "全新 0 回复根仍应跳过写入");
 
-    // 2b) offload 全量清零失败 -> comment_count > 0，且主 R2 无索引旧根被清理；恢复后 comment_count 归 0
+    // 2b) offload 全量清零：保留主 R2 无索引旧根与远端 blob，comment_count 归 0 且 archived_comment_count 保留
     await runWithDb(d1_2, () =>
       commentsModule.replaceCommentsByRoot({ contentPk: CONTENT_PK, partial: false, allRootIds: [], roots: [] }, { DB: d1_2, BUCKET: offloadBucket })
     );
-    assert.equal(offloadR2.has("childcomments/r-legacy-main.json"), false, "offload 清零必须顺带清理无主 comment_threads 索引的旧根 R2 对象");
-    assert.ok(s2.prepare(`SELECT comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).comment_count > 0, "远端清零失败时不得静默将 comment_count 归 0");
-
-    failRemoteClear = false;
-    await runWithDb(d1_2, () =>
-      commentsModule.replaceCommentsByRoot({ contentPk: CONTENT_PK, partial: false, allRootIds: [], roots: [] }, { DB: d1_2, BUCKET: offloadBucket })
-    );
+    assert.equal(offloadR2.has("childcomments/r-legacy-main.json"), true);
     assert.equal(s2.prepare(`SELECT comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).comment_count, 0);
+    assert.ok(s2.prepare(`SELECT archived_comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK).archived_comment_count >= 1);
   } finally {
     globalThis.fetch = originalFetch;
     auth.invalidateExternalTargetsCache();
     auth.resetRemoteSchemaCache();
   }
+});
+
+test("[防删归档] 楼中楼部分删除标记/恢复复活/快路径，以及列表详情与统计接口返回已归档计数", async () => {
+  workerModules.auth.invalidateExternalTargetsCache();
+  const { sqlite, d1 } = createMemoryDb();
+  const { bucket, store } = makeTrackedBucket();
+
+  // 1) 创建内容并写入 1 条根评论 + 2 条子评论
+  await runWithDb(d1, () =>
+    contentsModule.upsertContent({
+      sourceType: "answer",
+      sourceId: "1",
+      title: "T",
+      sourceUrl: "https://www.zhihu.com/question/1/answer/1",
+      authorName: "A",
+      contentHtml: "<p>hello</p>",
+      contentMd: "hello",
+      excerpt: "hello",
+      voteupCount: 1,
+      commentCount: 3,
+      favoriteCount: 0,
+      visitCount: 0
+    }, bucket)
+  );
+
+  const rootWith = children => ({
+    contentPk: CONTENT_PK,
+    partial: false,
+    allRootIds: ["r1"],
+    roots: [{
+      id: "r1",
+      author: "Root",
+      authorAvatar: "",
+      content: "root body",
+      img: "",
+      time: NOW_ISO,
+      location: "",
+      likes: 10,
+      isAuthor: false,
+      isTop: false,
+      isFeatured: false,
+      childCount: children.length,
+      isChildrenComplete: true,
+      children
+    }]
+  });
+
+  await runWithDb(d1, () =>
+    commentsModule.replaceCommentsByRoot(
+      rootWith([childComment("ch1", "first"), childComment("ch2", "second")]),
+      { DB: d1, BUCKET: bucket }
+    )
+  );
+
+  // 2) 原站删除 ch1，仅剩 ch2（complete=true）-> ch1 标记 isDeleted=true，preview 优先存活评论，二次同步命中快路径
+  await runWithDb(d1, () =>
+    commentsModule.replaceCommentsByRoot(
+      rootWith([childComment("ch2", "second")]),
+      { DB: d1, BUCKET: bucket }
+    )
+  );
+  const afterPartialDel = JSON.parse(store.get("childcomments/r1.json"));
+  const ch1Del = afterPartialDel.children.find(c => c.id === "ch1");
+  const ch2Live = afterPartialDel.children.find(c => c.id === "ch2");
+  assert.equal(ch1Del?.isDeleted, true);
+  assert.ok(!ch2Live?.isDeleted);
+
+  const secondSame = await quietly(() => runWithDb(d1, () =>
+    commentsModule.replaceCommentsByRoot(
+      rootWith([childComment("ch2", "second")]),
+      { DB: d1, BUCKET: bucket }
+    )
+  ));
+  assert.equal(secondSame.r2Puts, 0, "带 isDeleted 归档集合重复同输入必须命中快路径");
+  assert.equal(secondSame.threadUpserts, 0);
+
+  // 3) 若 ch1 后续恢复可见 -> 清除 isDeleted 标记
+  await runWithDb(d1, () =>
+    commentsModule.replaceCommentsByRoot(
+      rootWith([childComment("ch1", "first"), childComment("ch2", "second")]),
+      { DB: d1, BUCKET: bucket }
+    )
+  );
+  const afterRevive = JSON.parse(store.get("childcomments/r1.json"));
+  assert.ok(!afterRevive.children.find(c => c.id === "ch1")?.isDeleted);
+
+  // 4) 原站全量清空 -> upsertContent(commentCount: 0) 保留 archived_comment_count，爬虫读回 prevCommentCount=0，列表/详情/统计接口仍返回已归档总数
+  const upAfterZero = await runWithDb(d1, () =>
+    contentsModule.upsertContent({
+      sourceType: "answer",
+      sourceId: "1",
+      title: "T",
+      sourceUrl: "https://www.zhihu.com/question/1/answer/1",
+      authorName: "A",
+      contentHtml: "<p>hello</p>",
+      contentMd: "hello",
+      excerpt: "hello",
+      voteupCount: 1,
+      commentCount: 0,
+      favoriteCount: 0,
+      visitCount: 0
+    }, bucket)
+  );
+  assert.equal(upAfterZero.prevCommentCount, 3);
+  await runWithDb(d1, () =>
+    commentsModule.replaceCommentsByRoot(
+      { contentPk: CONTENT_PK, partial: false, allRootIds: [], roots: [] },
+      { DB: d1, BUCKET: bucket }
+    )
+  );
+
+  const dbRow = sqlite.prepare(`SELECT comment_count, archived_comment_count FROM contents WHERE pk = ?`).get(CONTENT_PK);
+  assert.equal(dbRow.comment_count, 0);
+  assert.equal(dbRow.archived_comment_count, 3);
+
+  const listRes = await runWithDb(d1, () => contentsModule.listContents({ page: 1 }));
+  assert.equal(listRes.rows[0].comment_count, 3);
+  assert.equal(listRes.rows[0].archived_comment_count, 3);
+
+  const detailRes = await runWithDb(d1, () => contentsModule.getContentDetail(CONTENT_PK));
+  assert.equal(detailRes.content.live_comment_count, 0);
+  assert.equal(detailRes.content.archived_comment_count, 3);
+  assert.equal(detailRes.content.comment_count, 3);
+
+  const statsRes = await runWithDb(d1, () =>
+    statsRouteModule.statsRoutes.__call("GET", "/", { url: "http://127.0.0.1/api/stats?fresh=1" })
+  );
+  assert.equal(statsRes.body.total_comments, 1, "total_comments 应计入已软删归档的根评论");
+
+  const nextSync = await runWithDb(d1, () =>
+    contentsModule.upsertContent({
+      sourceType: "answer",
+      sourceId: "1",
+      title: "T",
+      sourceUrl: "https://www.zhihu.com/question/1/answer/1",
+      authorName: "A",
+      contentHtml: "<p>hello</p>",
+      contentMd: "hello",
+      excerpt: "hello",
+      voteupCount: 1,
+      commentCount: 0,
+      favoriteCount: 0,
+      visitCount: 0
+    }, bucket)
+  );
+  assert.equal(nextSync.prevCommentCount, 0, "live comment_count 保持 0，下轮增量同步才不会误以为站内仍有 3 条");
 });
 
 test("[M11] GET /zhihu-status 在 D1 故障且无 env 写口令兜底时返回 503", async () => {

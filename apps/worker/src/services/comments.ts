@@ -22,8 +22,6 @@ import type {
 // D1 单次 batch 的语句数不宜过大；100 条一批兼顾往返次数和单批体积
 const BATCH_SIZE = 100;
 const CHILD_THREAD_CACHE_TTL_SECONDS = 30;
-const R2_BULK_DELETE_BATCH_SIZE = 1000;
-const MAX_SYNC_EDGE_PURGE_KEYS = 10;
 // Cloudflare D1 单条 SQL 绑定参数硬上限为 100，统一封顶 90 留足安全余量
 const D1_MAX_SQL_PARAMS = 90;
 
@@ -259,11 +257,11 @@ type ExistingRootRow = {
   child_count: number;
 };
 
-export type ChildCommentRecord = Record<string, unknown> & { id: string };
+export type ChildCommentRecord = Record<string, unknown> & { id: string; isDeleted?: boolean };
 
 /**
  * R2 旧对象的读取结果三态：
- * - ok：成功读到既有子评论（可参与 partial 合并）
+ * - ok：成功读到既有子评论（可参与归档合并）
  * - missing：R2 404，确实没有旧对象，可以放心写入本次数据
  * - error：读取/解析失败，状态未知——绝不能用本次不完整数据覆盖，
  *   否则既有完整楼中楼会被半份数据冲掉（P0）
@@ -281,6 +279,7 @@ export type PreviewReply = {
   content: string;
   likes: number;
   isAuthor: boolean;
+  isDeleted?: boolean;
 };
 
 /** comment_threads 里已有的线程索引行（快路径判断用） */
@@ -307,6 +306,7 @@ export type RootCommentRow = {
   is_author: number;
   is_top: number;
   is_featured: number;
+  is_deleted: number;
   comment_hash: string;
   first_seen_at: string;
   last_seen_at: string;
@@ -363,13 +363,40 @@ function normalizeChildren(children: IngestChildCommentInput[]): ChildCommentRec
   return Array.from(map.values());
 }
 
-/** partial 合并：旧对象里的子评论全部保留，新抓到的按 id 覆盖/追加，不删除 */
-function mergeChildren(existing: ChildCommentRecord[], incoming: ChildCommentRecord[]): ChildCommentRecord[] {
-  const merged = new Map<string, ChildCommentRecord>();
-  for (const child of existing) {
-    if (child && typeof child.id === "string" && child.id) merged.set(child.id, child);
+/**
+ * 防删归档合并子评论：
+ * - 已有子评论永久保留，绝不物理删除；
+ * - 本轮新抓到的子评论按 id 覆盖最新内容并清除 isDeleted 标记；
+ * - markMissingDeleted=true（本次抓全）时，原站不再返回的旧子评论标记 isDeleted: true；
+ * - markMissingDeleted=false（partial/闭评）时，旧子评论保持原样不误标删除。
+ */
+function archiveMergeChildren(
+  existing: ChildCommentRecord[],
+  incoming: ChildCommentRecord[],
+  markMissingDeleted: boolean
+): ChildCommentRecord[] {
+  const incomingById = new Map<string, ChildCommentRecord>();
+  for (const child of incoming) {
+    if (child && typeof child.id === "string" && child.id) {
+      const { isDeleted: _omit, ...live } = child;
+      incomingById.set(child.id, live as ChildCommentRecord);
+    }
   }
-  for (const child of incoming) merged.set(child.id, child);
+  const merged = new Map<string, ChildCommentRecord>();
+  for (const prev of existing) {
+    if (!prev || typeof prev.id !== "string" || !prev.id) continue;
+    const updated = incomingById.get(prev.id);
+    if (updated) {
+      merged.set(prev.id, updated);
+    } else if (markMissingDeleted) {
+      merged.set(prev.id, prev.isDeleted === true ? prev : { ...prev, isDeleted: true });
+    } else {
+      merged.set(prev.id, prev);
+    }
+  }
+  for (const [id, child] of incomingById) {
+    if (!merged.has(id)) merged.set(id, child);
+  }
   return Array.from(merged.values());
 }
 
@@ -385,13 +412,16 @@ function toPreviewReply(child: Record<string, unknown>): PreviewReply {
     beReplied: typeof child.beReplied === "string" ? child.beReplied : null,
     content: content.slice(0, PREVIEW_CONTENT_LENGTH),
     likes: Number.isFinite(likes) ? likes : 0,
-    isAuthor: child.isAuthor === true
+    isAuthor: child.isAuthor === true,
+    ...(child.isDeleted === true ? { isDeleted: true } : {})
   };
 }
 
-/** 列表页预览：只取前 2 条子评论，正文截断到 120 字，避免 D1 行放大 */
+/** 列表页预览：只取前 2 条子评论（优先现存、不足时补已删归档），正文截断到 120 字 */
 function buildPreviewReplies(children: ChildCommentRecord[]): PreviewReply[] {
-  return children.slice(0, PREVIEW_REPLY_LIMIT).map(toPreviewReply);
+  const live = children.filter(c => c.isDeleted !== true);
+  const archived = children.filter(c => c.isDeleted === true);
+  return [...live, ...archived].slice(0, PREVIEW_REPLY_LIMIT).map(toPreviewReply);
 }
 
 /** 解析 comment_threads.preview_json；损坏/非数组按空预览处理（走 D1 兜底） */
@@ -407,48 +437,6 @@ function parsePreviewJson(raw: string | null | undefined): PreviewReply[] {
   } catch {
     return [];
   }
-}
-
-async function deleteR2KeysBatch(
-  bucket: any,
-  keys: string[]
-): Promise<{ ok: boolean; succeededKeys: string[]; failedKeys: string[] }> {
-  if (!keys.length || typeof bucket?.delete !== "function") {
-    return { ok: true, succeededKeys: [], failedKeys: [] };
-  }
-  const succeededKeys: string[] = [];
-  const failedKeys: string[] = [];
-  for (let i = 0; i < keys.length; i += R2_BULK_DELETE_BATCH_SIZE) {
-    const batch = keys.slice(i, i + R2_BULK_DELETE_BATCH_SIZE);
-    if (batch.length === 1) {
-      try {
-        await bucket.delete(batch[0]);
-        succeededKeys.push(batch[0]);
-      } catch {
-        failedKeys.push(batch[0]);
-      }
-      continue;
-    }
-    try {
-      await bucket.delete(batch);
-      succeededKeys.push(...batch);
-    } catch {
-      // 兼容仅支持单 key 字符串的测试 mock：小批量退回逐条删除，大批量不撞子请求上限且绝不静默当成功
-      if (batch.length <= MAX_SYNC_EDGE_PURGE_KEYS) {
-        for (const k of batch) {
-          try {
-            await bucket.delete(k);
-            succeededKeys.push(k);
-          } catch {
-            failedKeys.push(k);
-          }
-        }
-      } else {
-        failedKeys.push(...batch);
-      }
-    }
-  }
-  return { ok: failedKeys.length === 0, succeededKeys, failedKeys };
 }
 
 async function readStoredChildThread(
@@ -558,19 +546,17 @@ async function replaceCommentsByRootInner(
   `).bind(input.contentPk).all<ExistingThreadRow>();
   const existingThreads = new Map((threadResult.results ?? []).map(row => [row.root_id, row]));
 
-  // 合并只读 R2 会把迁移前写在 D1 的旧扁平子评论弄丢（R2 404 时尤其明显）。
-  // 无论整批 partial 还是单根 isChildrenComplete=false，都需要一次批量取出本内容 is_deleted=0 的旧子评论行。
+  // 合并只读 R2 会把迁移前写在 D1 的旧扁平子评论（含已软删历史）弄丢（R2 404 时尤其明显）。
+  // 只要本轮有根评论提交，就一次批量取出该内容的旧 D1 子评论行，供防删归档合并使用。
   const legacyChildrenByRoot = new Map<string, ChildCommentRecord[]>();
   let legacyChildrenReadFailed = false;
-  const needLegacyChildMerge =
-    Boolean(input.partial) || input.roots.some(root => !root.isChildrenComplete);
-  if (needLegacyChildMerge) {
+  if (input.roots.length > 0) {
     try {
       const legacyResult = await database.prepare(`
         SELECT id, parent_comment_id, author_name, author_avatar, be_replied, content_md,
-               img_url, time_text, location, likes, is_author
+               img_url, time_text, location, likes, is_author, is_deleted
         FROM comments
-        WHERE content_pk = ? AND parent_comment_id IS NOT NULL AND is_deleted = 0
+        WHERE content_pk = ? AND parent_comment_id IS NOT NULL
         ORDER BY first_seen_at ASC
       `).bind(input.contentPk).all<ChildSelectRow>();
       for (const row of legacyResult.results ?? []) {
@@ -582,7 +568,7 @@ async function replaceCommentsByRootInner(
         else legacyChildrenByRoot.set(parentId, [child]);
       }
     } catch (err) {
-      // 旧 D1 子评论状态未知：后续 partial 根不能基于半份数据盲写 R2。
+      // 旧 D1 子评论状态未知：后续根不能基于半份数据盲写 R2。
       legacyChildrenReadFailed = true;
       console.warn(`[comments] failed to read legacy D1 children for ${input.contentPk}:`, err);
     }
@@ -769,59 +755,37 @@ async function replaceCommentsByRootInner(
     }
   }
 
+  // 防删归档：原站评论被整体删光时，上面已把全部根评论标成 is_deleted=1 留档；
+  // 这里绝不物理删除 R2 楼中楼与 comment_threads 线程索引，而是把 archived_comment_count
+  // 单调推高到已归档总数，同时把现网 comment_count 置 0（供爬虫差量比对，避免每轮重复抓空区）。
+  if (!input.partial && input.roots.length === 0 && (!input.allRootIds || input.allRootIds.length === 0)) {
+    const archivedChildMap = new Map<string, number>();
+    for (const row of existingRoots) {
+      archivedChildMap.set(
+        row.id,
+        Math.max(Number(existingThreads.get(row.id)?.child_count ?? 0), Number(row.child_count ?? 0))
+      );
+    }
+    for (const [rootId, th] of existingThreads) {
+      if (!archivedChildMap.has(rootId)) {
+        archivedChildMap.set(rootId, Number(th.child_count ?? 0));
+      }
+    }
+    let archivedTotal = archivedChildMap.size;
+    for (const cCount of archivedChildMap.values()) archivedTotal += cCount;
+    rootStmts.push(database.prepare(`
+      UPDATE contents
+      SET archived_comment_count = MAX(COALESCE(archived_comment_count, 0), comment_count, ?),
+          comment_count = 0
+      WHERE pk = ?
+    `).bind(archivedTotal, input.contentPk));
+  }
+
   await runBatchedStatements(database, rootStmts, ROOT_BATCH_SIZE);
 
   // 2) 子评论写 R2；3) comment_threads 最后统一 upsert
   const threadStmts: any[] = [];
 
-  // 评论整体清零时，残余线程索引里的子评论数与预览也必须一起清掉，
-  // 否则列表页仍会展示已删除楼中楼的旧预览。
-  // 而且只把 child_count 归零不够：thread_hash / incoming_hash 不清，R2 旧对象不删，
-  // 原站清空后又新增子评论、下次 partial 同步时旧 R2 子评论会被「合并复活」。
-  // 所有根评论此刻都已软删，直接删掉残余线程索引行最干净，下次从零重建。
-  // 同时需合并无 comment_threads 索引的旧根（existingRoots），确保遗留 R2 对象一并清理；
-  // 若 R2 删除有失败，主动反写正数 comment_count 保持下轮重试触发信号，绝不静默归 0。
-  if (!input.partial && input.roots.length === 0 && (!input.allRootIds || input.allRootIds.length === 0)) {
-    const clearRootIds = new Set<string>(existingThreads.keys());
-    for (const row of existingRoots) clearRootIds.add(row.id);
-    const keyEntries = Array.from(clearRootIds, rootId => ({
-      rootId,
-      key: childCommentsKey(rootId)
-    }));
-    const keysToDelete = keyEntries.map(entry => entry.key);
-    let deleteResult = { ok: true, succeededKeys: [] as string[], failedKeys: [] as string[] };
-    if (keysToDelete.length > 0) {
-      deleteResult = await deleteR2KeysBatch(env.BUCKET, keysToDelete);
-      const skipEdge = deleteResult.succeededKeys.length > MAX_SYNC_EDGE_PURGE_KEYS;
-      for (const key of deleteResult.succeededKeys) {
-        // 删完立刻失效缓存：超过 10 条时跳过同步边缘 cache.delete，避免击穿 Workers 50 子请求硬限
-        await purgeR2EdgeCache(key, { skipEdge });
-      }
-    }
-    if (deleteResult.failedKeys.length === 0) {
-      threadStmts.push(database.prepare(`
-        DELETE FROM comment_threads WHERE content_pk = ?
-      `).bind(input.contentPk));
-    } else if (deleteResult.succeededKeys.length > 0) {
-      const succeededKeySet = new Set(deleteResult.succeededKeys);
-      const succeededRootIds = keyEntries
-        .filter(entry => succeededKeySet.has(entry.key))
-        .map(entry => entry.rootId);
-      // 仅清理已成功删除 R2 的线程索引，保留失败项供下次重试；单句 IN 参数不超过 90（含 content_pk）
-      const maxIdsPerChunk = D1_MAX_SQL_PARAMS - 1;
-      for (let i = 0; i < succeededRootIds.length; i += maxIdsPerChunk) {
-        const chunk = succeededRootIds.slice(i, i + maxIdsPerChunk);
-        const placeholders = chunk.map(() => "?").join(", ");
-        threadStmts.push(database.prepare(`
-          DELETE FROM comment_threads WHERE content_pk = ? AND root_id IN (${placeholders})
-        `).bind(input.contentPk, ...chunk));
-      }
-    }
-    const nextCommentCount = deleteResult.failedKeys.length > 0 ? deleteResult.failedKeys.length : 0;
-    threadStmts.push(database.prepare(`
-      UPDATE contents SET comment_count = ? WHERE pk = ?
-    `).bind(nextCommentCount, input.contentPk));
-  }
   for (const { root, children } of prepared) {
     const hasChildren = children.length > 0;
     const childCount = Math.max(root.childCount, children.length);
@@ -829,69 +793,87 @@ async function replaceCommentsByRootInner(
     const isChildrenClosed = Boolean(root.isChildrenClosed);
 
     // 单个根下的楼中楼在原站被删光：本次抓全且站点确认 childCount = 0。
-    // 必须主动清空 R2 并建立 complete-empty 线程索引，不能依赖 existingThread.child_count > 0：
-    // 旧扁平 D1 迁移根可能没有 comment_threads 行，或 R2 里仍有旧对象但索引计数被清零，
-    // 跳过清空会让已删光的楼中楼一直展示旧预览，read API 也会回退 D1 历史子评论。
+    // 防删归档模式：先读回已有 R2 / 旧扁平 D1 子评论并全部标为 isDeleted: true 永久归档，
+    // 全新 0 回复根则跳过 R2/D1 写入，避免无谓写放大。
     if (!input.partial && !hasChildren && childCount === 0 && root.isChildrenComplete) {
       const key = childCommentsKey(root.id);
-      const emptyThreadHash = await sha256(JSON.stringify({ children: [], complete: true }));
       const emptyIncomingHash = await sha256(JSON.stringify({ children: [], childCount: 0, complete: true }));
+      const existingChildCount = Number(existingMap.get(root.id)?.child_count ?? 0);
+      const legacyList = legacyChildrenByRoot.get(root.id) ?? [];
 
-      // 快路径：上一轮已经是权威 complete-empty（R2 已落盘且索引一致）→ 0 R2 / 0 D1 写，
-      // 避免每次重同步都重复 PUT 同一个空对象。
+      // 快路径：上一轮已经是权威 complete 归档且输入未变 → 0 R2 / 0 D1 写
       if (
         existingThread &&
         existingThread.incoming_hash === emptyIncomingHash &&
-        existingThread.thread_hash === emptyThreadHash &&
-        existingThread.child_count === 0 &&
         existingThread.is_complete === 1 &&
-        existingThread.preview_json === "[]"
+        existingThread.thread_hash !== ""
       ) {
         continue;
       }
 
+      // 全新 0 回复根（无线程索引、无旧计数、无旧 D1 子评论）→ 0 写跳过
+      if (!existingThread && existingChildCount === 0 && legacyList.length === 0 && !legacyChildrenReadFailed) {
+        continue;
+      }
+
       let r2Ready = false;
+      let archivedChildren: ChildCommentRecord[] = [];
+      let nextThreadHash = "";
+      let previewJson = "[]";
       const stored = await readStoredChildThread(env.BUCKET, root.id, { bypassCache: true });
-      if (stored.status === "error") {
+      if (stored.status === "error" || legacyChildrenReadFailed) {
         // 读取失败时状态未知：绝不盲写覆盖可能仍可读的旧对象，下面保留重试状态。
-        console.warn(`[comments] skip empty R2 put for ${key}: previous object unreadable`);
-      } else if (stored.status === "ok" && stored.complete && stored.children.length === 0) {
-        // R2 已经是同一份 complete-empty 快照：省掉这次 PUT。
-        r2Ready = true;
+        console.warn(`[comments] skip archive empty put for ${key}: previous object unreadable`);
       } else {
-        try {
-          await env.BUCKET.put(key, JSON.stringify({ children: [], complete: true, updatedAt: now }), {
-            httpMetadata: { contentType: "application/json; charset=utf-8" }
-          });
-          r2Puts++;
-          // 清空也必须立即见效：边缘缓存里可能还留着旧楼中楼
-          await purgeR2EdgeCache(key);
-          r2Ready = true;
-        } catch (err) {
-          // R2 写失败则保留旧索引：避免出现「R2 仍是旧子评论、D1 却宣称 0 条」的不一致
-          console.warn(`[comments] R2 put failed for ${key}:`, err);
+        const prevChildren =
+          stored.status === "ok"
+            ? (stored.children.length === 0 && !stored.complete
+                ? archiveMergeChildren(legacyList, stored.children, false)
+                : stored.children)
+            : legacyList;
+        archivedChildren = archiveMergeChildren(prevChildren, [], true);
+        if (archivedChildren.length === 0 && !existingThread) {
+          continue;
+        }
+        nextThreadHash = await sha256(JSON.stringify({ children: archivedChildren, complete: true }));
+        previewJson = JSON.stringify(buildPreviewReplies(archivedChildren));
+        if (stored.status === "ok" && stored.complete) {
+          const storedHash = await sha256(JSON.stringify({ children: stored.children, complete: true }));
+          if (storedHash === nextThreadHash) {
+            r2Ready = true;
+          }
+        }
+        if (!r2Ready) {
+          try {
+            await env.BUCKET.put(key, JSON.stringify({ children: archivedChildren, complete: true, updatedAt: now }), {
+              httpMetadata: { contentType: "application/json; charset=utf-8" }
+            });
+            r2Puts++;
+            await purgeR2EdgeCache(key);
+            r2Ready = true;
+          } catch (err) {
+            console.warn(`[comments] R2 put failed for ${key}:`, err);
+          }
         }
       }
 
       if (r2Ready) {
+        const archivedCount = Math.max(archivedChildren.length, existingThread?.child_count ?? 0);
         threadStmts.push(database.prepare(`
           INSERT INTO comment_threads (
             root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at
-          ) VALUES (?, ?, ?, 0, 1, ?, ?, '[]', ?)
+          ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
           ON CONFLICT(root_id) DO UPDATE SET
             content_pk = excluded.content_pk,
             r2_key = excluded.r2_key,
-            child_count = 0,
+            child_count = excluded.child_count,
             is_complete = 1,
             thread_hash = excluded.thread_hash,
             incoming_hash = excluded.incoming_hash,
-            preview_json = '[]',
+            preview_json = excluded.preview_json,
             synced_at = excluded.synced_at
-        `).bind(root.id, input.contentPk, key, emptyThreadHash, emptyIncomingHash, now));
+        `).bind(root.id, input.contentPk, key, archivedCount, nextThreadHash, emptyIncomingHash, previewJson, now));
       } else {
-        // R2 读取/写入失败：没有旧索引时保持原样（本来就没有可回退状态），
-        // 有旧索引时保留可能仍可读的计数与哈希，但把 is_complete 置 0、incoming_hash 清空，
-        // 确保下一轮不会误命中快路径，会重新尝试清空。
         if (!existingThread) continue;
         const fallbackThreadHash = existingThread.thread_hash ?? "";
         if (
@@ -920,24 +902,23 @@ async function replaceCommentsByRootInner(
     }));
 
     // 快路径：输入与上次完全一致，且上次 R2 已成功落盘 → 0 GET / 0 PUT / 0 条 comment_threads 写入。
-    // thread_hash 非空保证上次 PUT 真的成功过；is_complete 分支保证「上次没抓全、这次抓全或新触发闭评冻结」仍会更新。
     if (
       existingThread &&
       existingThread.incoming_hash === incomingHash &&
-      existingThread.child_count === childCount &&
+      existingThread.child_count >= childCount &&
       (existingThread.is_complete === 1 || (!root.isChildrenComplete && (!isChildrenClosed || existingThread.is_complete === 2))) &&
       (!hasChildren || existingThread.thread_hash !== "")
     ) {
       continue;
     }
 
-    // hasChildren=false 且 childCount>0：子评论尚未抓取（或页 0 遇闭评），保留已有 R2 哈希/预览，绝不冲掉；
-    // 遇闭评把 is_complete 置 2 冻结，未闭评则保持已有 is_complete（已冻结的 2 不降级回 0）
+    // hasChildren=false 且 childCount>0：子评论尚未抓取（或页 0 遇闭评），保留已有 R2 哈希/预览与归档计数
     if (!hasChildren) {
       const desiredComplete = isChildrenClosed ? 2 : (existingThread?.is_complete ?? 0);
+      const effectiveChildCount = Math.max(childCount, existingThread?.child_count ?? 0);
       if (
         existingThread &&
-        existingThread.child_count === childCount &&
+        existingThread.child_count === effectiveChildCount &&
         existingThread.is_complete === desiredComplete
       ) {
         continue;
@@ -969,7 +950,7 @@ async function replaceCommentsByRootInner(
         root.id,
         input.contentPk,
         childCommentsKey(root.id),
-        childCount,
+        effectiveChildCount,
         desiredComplete,
         existingThread?.thread_hash ?? "",
         existingThread?.incoming_hash ?? "",
@@ -980,32 +961,37 @@ async function replaceCommentsByRootInner(
     }
 
     const key = childCommentsKey(root.id);
-    let childrenToStore = children;
-    let readFailed = false;
-    if (!root.isChildrenComplete) {
-      // 本次没抓全（含闭评）：与 R2 旧对象合并，只增改不删。
-      // 读失败（error）时状态未知，绝不能把本次不完整数据当成合并结果写回去。
+    const legacyList = legacyChildrenByRoot.get(root.id) ?? [];
+    let childrenToStore = archiveMergeChildren(legacyList, children, root.isChildrenComplete);
+    let readFailed = legacyChildrenReadFailed;
+    const needExistingMerge =
+      !root.isChildrenComplete ||
+      Boolean(existingThread) ||
+      Number(existingMap.get(root.id)?.child_count ?? 0) > 0 ||
+      legacyList.length > 0 ||
+      legacyChildrenReadFailed;
+    if (needExistingMerge) {
+      // 防删归档合并：无论是否抓全，只要可能存在旧对象都要先读回并集归档；
+      // 读失败（error）时状态未知，绝不能把本次数据直接覆盖回去。
       const stored = await readStoredChildThread(env.BUCKET, root.id, { bypassCache: true });
       if (stored.status === "error") {
         readFailed = true;
       } else if (legacyChildrenReadFailed) {
-        // D1 旧子评论状态未知：不能用一份看起来完整的 R2 合并结果盲写。
         readFailed = true;
       } else if (stored.status === "ok") {
-        childrenToStore = mergeChildren(stored.children, children);
-        // 已存在非空 R2 时按原逻辑只合并 R2；只有 R2 是不完整空对象
-        // （迁移前既没有旧对象、也没有可用子评论）时才补入 D1 旧子评论，
-        // 否则这次写回会把 D1 里仅存的历史回复永久挡在 R2 之外。
-        // complete=true 的旧 R2 是权威快照，不能掺入可能早已在原站删除的 D1 旧行。
-        if (stored.children.length === 0 && !stored.complete) {
-          childrenToStore = mergeChildren(legacyChildrenByRoot.get(root.id) ?? [], childrenToStore);
-        }
+        const baseChildren =
+          stored.children.length === 0 && !stored.complete
+            ? archiveMergeChildren(legacyList, stored.children, false)
+            : stored.children;
+        childrenToStore = archiveMergeChildren(baseChildren, children, root.isChildrenComplete);
       } else {
-        // R2 404：迁移前的旧扁平 D1 子评论与本次新抓到的子评论一起写入，避免丢失。
-        childrenToStore = mergeChildren(legacyChildrenByRoot.get(root.id) ?? [], children);
+        childrenToStore = archiveMergeChildren(legacyList, children, root.isChildrenComplete);
       }
     }
     const complete = root.isChildrenComplete;
+    const effectiveChildCount = complete
+      ? Math.max(childCount, childrenToStore.length, existingThread?.child_count ?? 0)
+      : Math.max(childCount, existingThread?.child_count ?? 0);
     const previewJson = JSON.stringify(buildPreviewReplies(childrenToStore));
     const nextThreadHash = await sha256(JSON.stringify({ children: childrenToStore, complete }));
     const targetIsComplete = complete
@@ -1019,8 +1005,6 @@ async function replaceCommentsByRootInner(
     let storedIncomingHash = incomingHash;
     if (readFailed) {
       // 旧对象读取失败：跳过 PUT，保护 R2 里既有的完整楼中楼。
-      // 恢复状态与 PUT 失败完全一致：is_complete 维持 0（若已闭评冻结为 2 则保持 2）、thread_hash 保留旧值、
-      // incoming_hash 清空 → 下轮同输入不会误命中快路径，会自动重试合并。
       console.warn(`[comments] skip R2 put for ${key}: previous object unreadable`);
       isComplete = existingThread?.is_complete === 2 ? 2 : 0;
       storedThreadHash = existingThread?.thread_hash ?? "";
@@ -1030,7 +1014,6 @@ async function replaceCommentsByRootInner(
       existingThread.thread_hash === nextThreadHash &&
       (complete ? existingThread.is_complete === 1 : existingThread.is_complete !== 1)
     ) {
-      // R2 里已经是同一份内容：跳过这次 Class A 写入（若需从 0 升为闭评冻结 2，下面仍会写 D1）
       isComplete = targetIsComplete;
       storedThreadHash = nextThreadHash;
     } else {
@@ -1048,7 +1031,6 @@ async function replaceCommentsByRootInner(
       } catch (err) {
         // R2 与 D1 无法同一事务：PUT 失败不回滚已写的根评论，只把线程标记为不完整。
         // 重开并抓全（complete=true）时 R2 落盘失败必须置 0 可重试，不可沿用闭评冻结态 2。
-        // thread_hash 保留旧值、incoming_hash 清空 → 下次同输入不会误命中快路径，会重新 PUT。
         console.warn(`[comments] R2 put failed for ${key}:`, err);
         isComplete = complete ? 0 : (existingThread?.is_complete === 2 ? 2 : 0);
         storedThreadHash = existingThread?.thread_hash ?? "";
@@ -1060,7 +1042,7 @@ async function replaceCommentsByRootInner(
     if (
       existingThread &&
       existingThread.incoming_hash === storedIncomingHash &&
-      existingThread.child_count === childCount &&
+      existingThread.child_count === effectiveChildCount &&
       existingThread.preview_json === previewJson &&
       existingThread.is_complete === isComplete &&
       existingThread.thread_hash === storedThreadHash
@@ -1085,7 +1067,7 @@ async function replaceCommentsByRootInner(
       root.id,
       input.contentPk,
       key,
-      childCount,
+      effectiveChildCount,
       isComplete,
       storedThreadHash,
       storedIncomingHash,
@@ -1124,12 +1106,12 @@ export async function listRootComments(
   const result = await database.prepare(`
     SELECT c.id, c.content_pk, c.author_name, c.author_avatar, c.be_replied,
            c.content_md, c.img_url, c.time_text, c.location, c.likes,
-           c.is_author, c.is_top, c.is_featured, c.comment_hash,
+           c.is_author, c.is_top, c.is_featured, c.is_deleted, c.comment_hash,
            c.first_seen_at, c.last_seen_at,
            COALESCE(
              t.child_count,
              NULLIF(c.child_count, 0),
-             (SELECT COUNT(*) FROM comments ch WHERE ch.parent_comment_id = c.id AND ch.is_deleted = 0),
+             (SELECT COUNT(*) FROM comments ch WHERE ch.parent_comment_id = c.id),
              0
            ) AS child_count,
            COALESCE(t.is_complete, 0) AS is_complete,
@@ -1137,7 +1119,7 @@ export async function listRootComments(
            t.synced_at AS thread_synced_at
     FROM comments c
     LEFT JOIN comment_threads t ON t.root_id = c.id
-    WHERE c.content_pk = ? AND c.parent_comment_id IS NULL AND c.is_deleted = 0
+    WHERE c.content_pk = ? AND c.parent_comment_id IS NULL
     ORDER BY c.is_top DESC, c.likes DESC, c.id DESC
     LIMIT ? OFFSET ?
   `).bind(contentPk, limit, offset).all<RootCommentRow>();
@@ -1149,7 +1131,7 @@ export async function listRootComments(
   if (rows.length === 0) {
     if (offset > 0 && offloadTargets.length > 0) {
       const mainIdsResult = await database.prepare(
-        `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL AND is_deleted = 0`
+        `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL`
       ).bind(contentPk).all<{ id: string }>().catch(() => ({ results: [] as Array<{ id: string }> }));
       const mainIds = new Set(
         (mainIdsResult.results ?? []).map(r => r.id).filter(Boolean)
@@ -1198,12 +1180,12 @@ export async function listRootComments(
   if (needsFallback.length > 0) {
     const placeholders = needsFallback.map(() => "?").join(", ");
     const childResult = await database.prepare(`
-      SELECT id, parent_comment_id, author_name, be_replied, content_md, likes, is_author
+      SELECT id, parent_comment_id, author_name, be_replied, content_md, likes, is_author, is_deleted
       FROM (
-        SELECT id, parent_comment_id, author_name, be_replied, content_md, likes, is_author,
+        SELECT id, parent_comment_id, author_name, be_replied, content_md, likes, is_author, is_deleted,
                ROW_NUMBER() OVER (PARTITION BY parent_comment_id ORDER BY first_seen_at ASC) AS rn
         FROM comments
-        WHERE parent_comment_id IN (${placeholders}) AND is_deleted = 0
+        WHERE parent_comment_id IN (${placeholders})
       )
       WHERE rn <= 2
       ORDER BY rn ASC
@@ -1215,6 +1197,7 @@ export async function listRootComments(
       content_md: string | null;
       likes: number;
       is_author: number;
+      is_deleted: number;
     }>();
 
     for (const child of childResult.results ?? []) {
@@ -1226,7 +1209,8 @@ export async function listRootComments(
         beReplied: child.be_replied ?? null,
         content: (child.content_md ?? "").slice(0, PREVIEW_CONTENT_LENGTH),
         likes: child.likes ?? 0,
-        isAuthor: child.is_author === 1
+        isAuthor: child.is_author === 1,
+        ...(child.is_deleted === 1 ? { isDeleted: true } : {})
       });
       previews.set(child.parent_comment_id, list);
     }
@@ -1243,7 +1227,7 @@ export async function listRootComments(
     const seen = new Set(finalRows.map(row => row.id));
     if (offset > 0) {
       const mainIdsResult = await database.prepare(
-        `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL AND is_deleted = 0`
+        `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL`
       ).bind(contentPk).all<{ id: string }>().catch(() => ({ results: [] as Array<{ id: string }> }));
       for (const r of mainIdsResult.results ?? []) {
         if (r.id) seen.add(r.id);
@@ -1268,12 +1252,12 @@ export async function listRootComments(
 const REMOTE_ROOT_COMMENTS_SQL = `
   SELECT c.id, c.content_pk, c.author_name, c.author_avatar, c.be_replied,
          c.content_md, c.img_url, c.time_text, c.location, c.likes,
-         c.is_author, c.is_top, c.is_featured, c.comment_hash,
+         c.is_author, c.is_top, c.is_featured, c.is_deleted, c.comment_hash,
          c.first_seen_at, c.last_seen_at,
          COALESCE(
            t.child_count,
            NULLIF(c.child_count, 0),
-           (SELECT COUNT(*) FROM comments ch WHERE ch.parent_comment_id = c.id AND ch.is_deleted = 0),
+           (SELECT COUNT(*) FROM comments ch WHERE ch.parent_comment_id = c.id),
            0
          ) AS child_count,
          COALESCE(t.is_complete, 0) AS is_complete,
@@ -1281,7 +1265,7 @@ const REMOTE_ROOT_COMMENTS_SQL = `
          t.synced_at AS thread_synced_at
   FROM comments c
   LEFT JOIN comment_threads t ON t.root_id = c.id
-  WHERE c.content_pk = ? AND c.parent_comment_id IS NULL AND c.is_deleted = 0
+  WHERE c.content_pk = ? AND c.parent_comment_id IS NULL
   ORDER BY c.is_top DESC, c.likes DESC, c.id DESC
   LIMIT ? OFFSET ?
 `;
@@ -1305,6 +1289,7 @@ function normalizeRemoteRootRows(rows: Record<string, any>[]): RootCommentRow[] 
       is_author: Number(row.is_author ?? 0) || 0,
       is_top: Number(row.is_top ?? 0) || 0,
       is_featured: Number(row.is_featured ?? 0) || 0,
+      is_deleted: Number(row.is_deleted ?? 0) || 0,
       comment_hash: String(row.comment_hash ?? ""),
       first_seen_at: String(row.first_seen_at ?? ""),
       last_seen_at: String(row.last_seen_at ?? ""),
@@ -1433,9 +1418,7 @@ async function replaceCommentsByRootOffloaded(
   const now = new Date().toISOString();
   await ensureRemoteCommentSchema(target);
 
-  const needLegacyChildMerge =
-    Boolean(input.partial) || input.roots.some(root => !root.isChildrenComplete);
-  // 远端现状：根评论 + 线程索引（需合并未完结楼中楼时顺带取旧扁平子评论）合成 1 次 pipeline 读取
+  // 远端现状：根评论 + 线程索引（有提交根时顺带取旧扁平子评论供防删归档合并）合成 1 次 pipeline 读取
   const readBatchStatements: RemoteSqlStatement[] = [
     {
       sql: `SELECT id, comment_hash, is_deleted, author_avatar, likes, time_text, location, child_count
@@ -1450,12 +1433,12 @@ async function replaceCommentsByRootOffloaded(
       params: [input.contentPk]
     }
   ];
-  if (needLegacyChildMerge) {
+  if (input.roots.length > 0) {
     readBatchStatements.push({
       sql: `SELECT id, parent_comment_id, author_name, author_avatar, be_replied, content_md,
-                   img_url, time_text, location, likes, is_author
+                   img_url, time_text, location, likes, is_author, is_deleted
             FROM comments
-            WHERE content_pk = ? AND parent_comment_id IS NOT NULL AND is_deleted = 0
+            WHERE content_pk = ? AND parent_comment_id IS NOT NULL
             ORDER BY first_seen_at ASC`,
       params: [input.contentPk]
     });
@@ -1467,7 +1450,8 @@ async function replaceCommentsByRootOffloaded(
     (threadResult?.rows ?? []).map(toRemoteThreadRow).map(row => [row.root_id, row])
   );
   const remoteLegacyChildrenByRoot = new Map<string, ChildCommentRecord[]>();
-  const remoteLegacyReadFailed = needLegacyChildMerge && !remoteLegacyResult;
+  const remoteLegacyReadFailed: boolean =
+    input.roots.length > 0 && !(remoteLegacyResult as typeof existingResult | undefined);
   if (remoteLegacyResult) {
     for (const row of remoteLegacyResult.rows) {
       const parentId = row.parent_comment_id == null ? "" : String(row.parent_comment_id);
@@ -1673,85 +1657,43 @@ async function replaceCommentsByRootOffloaded(
   await flushRemoteStatements(target, rootStatements);
 
   // 2) 楼中楼 JSON + 线程索引写外部库
-  // 评论被整体清空：删掉外部库残余楼中楼与线程索引，同时清理迁移前残留在主 D1/主 R2 的旧线程与评论行，
-  // 防止外部库清空后 getChildComments / listRootComments 回退主库复活旧回复。
+  // 防删归档模式：原站评论被整体清空时，绝不删除外部库残余楼中楼/线程索引或主 R2 旧对象，
+  // 只软删主库遗留活跃根评论并将 archived_comment_count 单调推高、现网 comment_count 置 0。
   if (!input.partial && input.roots.length === 0 && (!input.allRootIds || input.allRootIds.length === 0)) {
-    const clearStatements: RemoteSqlStatement[] = [
-      {
-        sql: `DELETE FROM child_comment_blobs WHERE content_pk = ?`,
-        params: [input.contentPk]
-      },
-      {
-        sql: `DELETE FROM comment_threads WHERE content_pk = ?`,
-        params: [input.contentPk]
-      }
-    ];
-    // 清理失败不阻塞清零，但需反写正数 comment_count 保持下轮自动重试触发信号
-    let remoteClearFailed = false;
-    await executeRemoteSqlBatch(target, clearStatements).catch(() => {
-      remoteClearFailed = true;
-    });
-    try {
-      const mainThreadsResult = await env.DB.prepare(`
-        SELECT root_id FROM comment_threads WHERE content_pk = ?
-        UNION
-        SELECT id AS root_id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL
-      `).bind(input.contentPk, input.contentPk).all<{ root_id: string }>();
-      const mainThreadEntries = Array.from(
-        new Set((mainThreadsResult.results ?? []).map(r => r.root_id).filter(Boolean)),
-        rootId => ({ rootId, key: childCommentsKey(rootId) })
+    const archivedChildMap = new Map<string, number>();
+    for (const row of existingRoots) {
+      archivedChildMap.set(
+        row.id,
+        Math.max(Number(existingThreads.get(row.id)?.child_count ?? 0), Number(row.child_count ?? 0))
       );
-
-      let mainR2Delete = { ok: true, succeededKeys: [] as string[], failedKeys: [] as string[] };
-      if (mainThreadEntries.length > 0) {
-        mainR2Delete = await deleteR2KeysBatch(
-          env.BUCKET,
-          mainThreadEntries.map(entry => entry.key)
-        );
-        const skipEdge = mainR2Delete.succeededKeys.length > MAX_SYNC_EDGE_PURGE_KEYS;
-        for (const key of mainR2Delete.succeededKeys) {
-          await purgeR2EdgeCache(key, { skipEdge });
-        }
+    }
+    for (const [rootId, th] of existingThreads) {
+      if (!archivedChildMap.has(rootId)) {
+        archivedChildMap.set(rootId, Number(th.child_count ?? 0));
       }
-
-      const mainCleanupStmts: any[] = [];
-      if (mainThreadEntries.length > 0) {
-        if (mainR2Delete.failedKeys.length === 0) {
-          mainCleanupStmts.push(env.DB.prepare(
-            `DELETE FROM comment_threads WHERE content_pk = ?`
-          ).bind(input.contentPk));
-        } else if (mainR2Delete.succeededKeys.length > 0) {
-          const succeededKeySet = new Set(mainR2Delete.succeededKeys);
-          const succeededRootIds = mainThreadEntries
-            .filter(entry => succeededKeySet.has(entry.key))
-            .map(entry => entry.rootId);
-          const maxIdsPerChunk = D1_MAX_SQL_PARAMS - 1;
-          for (let i = 0; i < succeededRootIds.length; i += maxIdsPerChunk) {
-            const chunk = succeededRootIds.slice(i, i + maxIdsPerChunk);
-            const placeholders = chunk.map(() => "?").join(", ");
-            mainCleanupStmts.push(env.DB.prepare(
-              `DELETE FROM comment_threads WHERE content_pk = ? AND root_id IN (${placeholders})`
-            ).bind(input.contentPk, ...chunk));
-          }
-        }
-      }
-      mainCleanupStmts.push(env.DB.prepare(`
-        UPDATE comments
-        SET is_deleted = 1, deleted_at = ?, last_seen_at = ?
-        WHERE content_pk = ? AND is_deleted = 0
-      `).bind(now, now, input.contentPk));
-      const nextCommentCount = (remoteClearFailed || mainR2Delete.failedKeys.length > 0)
-        ? Math.max(1, mainR2Delete.failedKeys.length)
-        : 0;
-      mainCleanupStmts.push(env.DB.prepare(
-        `UPDATE contents SET comment_count = ? WHERE pk = ?`
-      ).bind(nextCommentCount, input.contentPk));
+    }
+    let archivedTotal = archivedChildMap.size;
+    for (const cCount of archivedChildMap.values()) archivedTotal += cCount;
+    try {
+      const mainCleanupStmts: any[] = [
+        env.DB.prepare(`
+          UPDATE comments
+          SET is_deleted = 1, deleted_at = ?, last_seen_at = ?
+          WHERE content_pk = ? AND is_deleted = 0
+        `).bind(now, now, input.contentPk),
+        env.DB.prepare(`
+          UPDATE contents
+          SET archived_comment_count = MAX(COALESCE(archived_comment_count, 0), comment_count, ?),
+              comment_count = 0
+          WHERE pk = ?
+        `).bind(archivedTotal, input.contentPk)
+      ];
       await runBatchedStatements(env.DB, mainCleanupStmts, ROOT_BATCH_SIZE);
-    } catch { /* 主库残留清理失败不阻塞外部库已完成的清零 */ }
+    } catch { /* 主库状态更新失败不阻塞外部库已完成的软删归档 */ }
   }
 
-  // 在进入根循环前向本地主 D1 与外部库各查一次该内容是否存在迁移前旧楼中楼/子评论计数，
-  // 只有远端或主库确有旧楼中楼历史时，才为 0 回复根写入 complete-empty 墓碑，
+  // 在进入根循环前向本地主 D1 与外部库各查一次该内容是否存在迁移前旧楼中楼历史，
+  // 只有远端或主库确有旧楼中楼历史时，才为 0 回复根捞回旧数据并标已删归档，
   // 避免全新 0 回复根每批白白多发几十次子请求。
   const mainLegacyRootIds = new Set<string>();
   let mainLegacyQueryFailed = false;
@@ -1776,7 +1718,7 @@ async function replaceCommentsByRootOffloaded(
           WHERE content_pk = ? AND parent_comment_id IS NULL AND child_count > 0
           UNION
           SELECT DISTINCT parent_comment_id AS root_id FROM comments
-          WHERE content_pk = ? AND parent_comment_id IS NOT NULL AND is_deleted = 0
+          WHERE content_pk = ? AND parent_comment_id IS NOT NULL
         `).bind(input.contentPk, input.contentPk).all<{ root_id: string }>()
       ]);
       for (const r of mainThreadsRes.results ?? []) {
@@ -1790,13 +1732,8 @@ async function replaceCommentsByRootOffloaded(
     }
     try {
       const remoteLegacyRes = await executeRemoteSqlBatch(target, [{
-        sql: `
-          SELECT root_id FROM child_comment_blobs WHERE content_pk = ?
-          UNION
-          SELECT DISTINCT parent_comment_id AS root_id FROM comments
-          WHERE content_pk = ? AND parent_comment_id IS NOT NULL AND is_deleted = 0
-        `,
-        params: [input.contentPk, input.contentPk]
+        sql: `SELECT root_id FROM child_comment_blobs WHERE content_pk = ?`,
+        params: [input.contentPk]
       }]);
       for (const row of remoteLegacyRes[0]?.rows ?? []) {
         const rid = row.root_id == null ? "" : String(row.root_id);
@@ -1807,14 +1744,33 @@ async function replaceCommentsByRootOffloaded(
     }
   }
 
-  // partial 合并所需的旧 JSON：按 <= 90 参数分块一次 IN 批量读回（大幅压低 cloudflare_d1 子请求数）
+  // 合并所需的旧 JSON：按 <= 90 参数分块一次 IN 批量读回（大幅压低 cloudflare_d1 子请求数）
   const childStatements: RemoteSqlStatement[] = [];
   const blobUpsertRows: unknown[][] = [];
   const threadUpsertRows: unknown[][] = [];
   const threadCountOnlyKeepRows: unknown[][] = [];
   const threadCountOnlyClosedRows: unknown[][] = [];
   const mergeRootIds = prepared
-    .filter(item => item.children.length > 0 && !item.root.isChildrenComplete)
+    .filter(({ root, children }) => {
+      const hasChildren = children.length > 0;
+      const childCount = Math.max(root.childCount, children.length);
+      const isZeroReplyComplete = !input.partial && !hasChildren && childCount === 0 && root.isChildrenComplete;
+      if (isZeroReplyComplete) {
+        return (
+          existingThreads.has(root.id) ||
+          Number(existingMap.get(root.id)?.child_count ?? 0) > 0 ||
+          remoteLegacyRootIds.has(root.id) ||
+          remoteLegacyChildrenByRoot.has(root.id)
+        );
+      }
+      if (!hasChildren) return false;
+      return (
+        !root.isChildrenComplete ||
+        existingThreads.has(root.id) ||
+        Number(existingMap.get(root.id)?.child_count ?? 0) > 0 ||
+        remoteLegacyChildrenByRoot.has(root.id)
+      );
+    })
     .map(item => item.root.id);
   const storedBlobByRoot = new Map<string, string | null>();
   if (mergeRootIds.length > 0) {
@@ -1866,33 +1822,116 @@ async function replaceCommentsByRootOffloaded(
     const existingThread = existingThreads.get(root.id);
     const isChildrenClosed = Boolean(root.isChildrenClosed);
 
-    // 单个根的楼中楼被删光：仅当远端或主库存在历史线程/子评论记录时才落 complete-empty 快照，
-    // 防止全新 0 回复根无谓放大远端写入与子请求；命中快路径时 0 写入。
+    // 单个根的楼中楼在原站被删光：仅当远端或主库存在历史线程/子评论记录时才捞回旧回复并标 isDeleted=true 永久归档，
+    // 全新 0 回复根跳过写入；命中快路径时 0 写入。
     if (!input.partial && !hasChildren && childCount === 0 && root.isChildrenComplete) {
-      const hadRemoteThreadData = Boolean(existingThread);
-      const existingRootChildCount = Number(existingMap.get(root.id)?.child_count ?? 0);
-      const hadMainLegacyData = mainLegacyQueryFailed || mainLegacyRootIds.has(root.id);
-      const hadRemoteLegacyData = remoteLegacyQueryFailed || remoteLegacyRootIds.has(root.id);
-      if (!hadRemoteThreadData && existingRootChildCount === 0 && !hadMainLegacyData && !hadRemoteLegacyData) {
-        continue;
-      }
-
-      const emptyThreadHash = await sha256(JSON.stringify({ children: [], complete: true }));
       const emptyIncomingHash = await sha256(JSON.stringify({ children: [], childCount: 0, complete: true }));
       if (
         existingThread &&
         existingThread.incoming_hash === emptyIncomingHash &&
-        existingThread.thread_hash === emptyThreadHash &&
-        existingThread.child_count === 0 &&
         existingThread.is_complete === 1 &&
-        existingThread.preview_json === "[]"
+        existingThread.thread_hash !== ""
       ) {
         continue;
       }
+
+      const hadRemoteThreadData = Boolean(existingThread);
+      const existingRootChildCount = Number(existingMap.get(root.id)?.child_count ?? 0);
+      const hadMainLegacyData = mainLegacyQueryFailed || mainLegacyRootIds.has(root.id);
+      const hadRemoteLegacyData =
+        remoteLegacyQueryFailed ||
+        remoteLegacyRootIds.has(root.id) ||
+        remoteLegacyChildrenByRoot.has(root.id);
+      if (!hadRemoteThreadData && existingRootChildCount === 0 && !hadMainLegacyData && !hadRemoteLegacyData) {
+        continue;
+      }
+
+      const raw = storedBlobByRoot.get(root.id);
+      if (raw === null || remoteLegacyReadFailed) {
+        if (existingThread) {
+          const fallbackHash = existingThread.thread_hash ?? "";
+          if (
+            !(
+              existingThread.is_complete === 0 &&
+              existingThread.incoming_hash === "" &&
+              existingThread.thread_hash === fallbackHash
+            )
+          ) {
+            threadUpsertRows.push([
+              root.id,
+              input.contentPk,
+              childCommentsKey(root.id),
+              existingThread.child_count,
+              0,
+              fallbackHash,
+              "",
+              existingThread.preview_json ?? "[]",
+              now
+            ]);
+          }
+        }
+        continue;
+      }
+
+      let prevChildren: ChildCommentRecord[] = [];
+      let parsedBlobInvalid = false;
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw) as { children?: unknown; complete?: unknown } | null;
+          if (!parsed || !Array.isArray(parsed.children)) {
+            parsedBlobInvalid = true;
+          } else {
+            prevChildren = parsed.children.filter(
+              (c): c is ChildCommentRecord => !!c && typeof c === "object" && typeof (c as any).id === "string"
+            );
+            if (prevChildren.length === 0 && parsed.complete !== true) {
+              prevChildren = archiveMergeChildren(remoteLegacyChildrenByRoot.get(root.id) ?? [], [], false);
+            }
+          }
+        } catch {
+          parsedBlobInvalid = true;
+        }
+      } else {
+        prevChildren = archiveMergeChildren(remoteLegacyChildrenByRoot.get(root.id) ?? [], [], false);
+      }
+
+      if (parsedBlobInvalid) {
+        if (existingThread) {
+          const fallbackHash = existingThread.thread_hash ?? "";
+          threadUpsertRows.push([
+            root.id,
+            input.contentPk,
+            childCommentsKey(root.id),
+            existingThread.child_count,
+            0,
+            fallbackHash,
+            "",
+            existingThread.preview_json ?? "[]",
+            now
+          ]);
+        }
+        continue;
+      }
+
+      // 迁移前主库有历史线程/子评论而外部库尚无回复：从主 R2 捞回并标已删归档，防止切换 offload 后丢失旧楼中楼
+      if (prevChildren.length === 0 && hadMainLegacyData) {
+        const mainStored = await readStoredChildThread(env.BUCKET, root.id, { bypassCache: true });
+        if (mainStored.status === "ok" && mainStored.children.length > 0) {
+          prevChildren = mainStored.children;
+        }
+      }
+
+      const archivedChildren = archiveMergeChildren(prevChildren, [], true);
+      if (archivedChildren.length === 0 && !existingThread && !hadMainLegacyData) {
+        continue;
+      }
+      const archivedThreadHash = await sha256(JSON.stringify({ children: archivedChildren, complete: true }));
+      const archivedCount = Math.max(archivedChildren.length, existingThread?.child_count ?? 0);
+      const previewJson = JSON.stringify(buildPreviewReplies(archivedChildren));
       blobUpsertRows.push([
         root.id,
         input.contentPk,
-        JSON.stringify({ children: [], complete: true, updatedAt: now }),
+        JSON.stringify({ children: archivedChildren, complete: true, updatedAt: now }),
         1,
         now
       ]);
@@ -1900,11 +1939,11 @@ async function replaceCommentsByRootOffloaded(
         root.id,
         input.contentPk,
         childCommentsKey(root.id),
-        0,
+        archivedCount,
         1,
-        emptyThreadHash,
+        archivedThreadHash,
         emptyIncomingHash,
-        "[]",
+        previewJson,
         now
       ]);
       continue;
@@ -1922,19 +1961,20 @@ async function replaceCommentsByRootOffloaded(
     if (
       existingThread &&
       existingThread.incoming_hash === incomingHash &&
-      existingThread.child_count === childCount &&
+      existingThread.child_count >= childCount &&
       (existingThread.is_complete === 1 || (!root.isChildrenComplete && (!isChildrenClosed || existingThread.is_complete === 2))) &&
       (!hasChildren || existingThread.thread_hash !== "")
     ) {
       continue;
     }
 
-    // 子评论尚未抓取（或页 0 遇闭评）：保留已有楼中楼 JSON/哈希/预览；闭评置 2 冻结，否则保留原 is_complete
+    // 子评论尚未抓取（或页 0 遇闭评）：保留已有楼中楼 JSON/哈希/预览与归档计数；闭评置 2 冻结，否则保留原 is_complete
     if (!hasChildren) {
       const desiredComplete = isChildrenClosed ? 2 : (existingThread?.is_complete ?? 0);
+      const effectiveChildCount = Math.max(childCount, existingThread?.child_count ?? 0);
       if (
         existingThread &&
-        existingThread.child_count === childCount &&
+        existingThread.child_count === effectiveChildCount &&
         existingThread.is_complete === desiredComplete
       ) {
         continue;
@@ -1943,7 +1983,7 @@ async function replaceCommentsByRootOffloaded(
         root.id,
         input.contentPk,
         childCommentsKey(root.id),
-        childCount,
+        effectiveChildCount,
         desiredComplete,
         existingThread?.thread_hash ?? "",
         existingThread?.incoming_hash ?? "",
@@ -1959,11 +1999,15 @@ async function replaceCommentsByRootOffloaded(
     }
 
     const key = childCommentsKey(root.id);
-    let childrenToStore = children;
-    let readFailed = false;
-    if (!root.isChildrenComplete) {
-      // 本次没抓全（含闭评）：用前面批量读回的旧 JSON（以及缺失时的旧扁平子评论）合并。
-      // 读取失败时状态未知，绝不能覆盖既有完整楼中楼。
+    const remoteLegacyList = remoteLegacyChildrenByRoot.get(root.id) ?? [];
+    let childrenToStore = archiveMergeChildren(remoteLegacyList, children, root.isChildrenComplete);
+    let readFailed: boolean = remoteLegacyReadFailed;
+    const hadRemoteMergeCandidate =
+      !root.isChildrenComplete ||
+      Boolean(existingThread) ||
+      Number(existingMap.get(root.id)?.child_count ?? 0) > 0 ||
+      remoteLegacyList.length > 0;
+    if (hadRemoteMergeCandidate) {
       const raw = storedBlobByRoot.get(root.id);
       if (raw === null || remoteLegacyReadFailed) {
         readFailed = true;
@@ -1976,20 +2020,24 @@ async function replaceCommentsByRootOffloaded(
             const existingChildren = parsed.children.filter(
               (c): c is ChildCommentRecord => !!c && typeof c === "object" && typeof (c as any).id === "string"
             );
-            childrenToStore = mergeChildren(existingChildren, children);
-            if (existingChildren.length === 0 && parsed.complete !== true) {
-              childrenToStore = mergeChildren(remoteLegacyChildrenByRoot.get(root.id) ?? [], childrenToStore);
-            }
+            const baseChildren =
+              existingChildren.length === 0 && parsed.complete !== true
+                ? archiveMergeChildren(remoteLegacyList, existingChildren, false)
+                : existingChildren;
+            childrenToStore = archiveMergeChildren(baseChildren, children, root.isChildrenComplete);
           }
         } catch {
           readFailed = true;
         }
       } else {
-        childrenToStore = mergeChildren(remoteLegacyChildrenByRoot.get(root.id) ?? [], children);
+        childrenToStore = archiveMergeChildren(remoteLegacyList, children, root.isChildrenComplete);
       }
     }
 
     const complete = root.isChildrenComplete;
+    const effectiveChildCount = complete
+      ? Math.max(childCount, childrenToStore.length, existingThread?.child_count ?? 0)
+      : Math.max(childCount, existingThread?.child_count ?? 0);
     const previewJson = JSON.stringify(buildPreviewReplies(childrenToStore));
     const nextThreadHash = await sha256(JSON.stringify({ children: childrenToStore, complete }));
     const targetIsComplete = complete
@@ -2028,7 +2076,7 @@ async function replaceCommentsByRootOffloaded(
     if (
       existingThread &&
       existingThread.incoming_hash === storedIncomingHash &&
-      existingThread.child_count === childCount &&
+      existingThread.child_count === effectiveChildCount &&
       existingThread.preview_json === previewJson &&
       existingThread.is_complete === isComplete &&
       existingThread.thread_hash === storedThreadHash
@@ -2040,7 +2088,7 @@ async function replaceCommentsByRootOffloaded(
       root.id,
       input.contentPk,
       key,
-      childCount,
+      effectiveChildCount,
       isComplete,
       storedThreadHash,
       storedIncomingHash,
@@ -2165,7 +2213,7 @@ export async function hasOffloadedComments(
     try {
       const result = await executeRemoteSql(
         target,
-        `SELECT 1 AS has_any FROM comments WHERE content_pk = ? AND is_deleted = 0 LIMIT 1`,
+        `SELECT 1 AS has_any FROM comments WHERE content_pk = ? LIMIT 1`,
         [contentPk]
       );
       if (result.rows.length > 0) return true;
@@ -2180,10 +2228,10 @@ export async function hasOffloadedComments(
  * 按需读取某个根评论下的全部子评论。
  *
  * 读取顺序：
- * 1. 若配置了可读的外部扩容库（offloadTargets）：优先读外部库 child_comment_blobs（含 complete=true 空快照权威标记），
+ * 1. 若配置了可读的外部扩容库（offloadTargets）：优先读外部库 child_comment_blobs（含 complete=true 权威快照），
  *    blob 缺失时再查外部库 comments 子评论行，避免迁移前主 R2 的旧快照永久遮蔽外部库新数据；
  * 2. 主 R2 childcomments/{rootId}.json（未启用外部库 / overflow 旧线程所在）；
- * 3. 主 D1 comments 的子评论行（迁移前 / 早期数据兜底）。
+ * 3. 主 D1 comments 的子评论行（迁移前 / 早期数据兜底，含已软删归档）。
  */
 export async function getChildComments(
   bucket: R2Bucket | undefined,
@@ -2194,7 +2242,7 @@ export async function getChildComments(
     const offloadTargets = await listReadableCommentOffloadTargets(bucket).catch(() => []);
     for (const target of offloadTargets) {
       const blob = await readRemoteChildBlob(target, rootId);
-      // 外部库 complete=true 是权威快照：即使 children 为空也直接返回 []，绝不回退主 R2 / D1 复活已删回复
+      // 外部库 complete=true 是权威快照：即使 children 为空也直接返回 []，绝不回退主 R2 / D1 复活未归档旧行
       if (blob.status === "ok" && (blob.complete || blob.children.length > 0)) {
         return blob.children;
       }
@@ -2204,9 +2252,6 @@ export async function getChildComments(
     }
 
     const stored = await readStoredChildThread(bucket, rootId);
-    // complete=true 是原站确认的权威快照：即使 children 为空也必须直接返回 []，
-    // 不能回退 D1 里的历史子评论（那些行可能早已在原站删除）。
-    // 不完整对象只在确实读到子评论时返回，空的不完整对象仍走旧回退。
     if (stored.status === "ok" && (stored.complete || stored.children.length > 0)) {
       // 历史 R2 对象可能只有 img 没有 img_url：两个字段都补齐，前端读任一都能取到图
       return stored.children.map(child => ({
@@ -2220,9 +2265,9 @@ export async function getChildComments(
 
   const result = await database.prepare(`
     SELECT id, parent_comment_id, author_name, author_avatar, be_replied, content_md,
-           img_url, time_text, location, likes, is_author
+           img_url, time_text, location, likes, is_author, is_deleted
     FROM comments
-    WHERE parent_comment_id = ? AND is_deleted = 0
+    WHERE parent_comment_id = ?
     ORDER BY first_seen_at ASC
   `).bind(rootId).all<{
     id: string;
@@ -2236,6 +2281,7 @@ export async function getChildComments(
     location: string | null;
     likes: number;
     is_author: number;
+    is_deleted: number;
   }>();
 
   return (result.results ?? []).map(mapStoredChildRow);
@@ -2271,7 +2317,7 @@ async function readRemoteChildBlob(
   }
 }
 
-/** 外部库 comments 表里按 parent_comment_id 存的子评论行 */
+/** 外部库 comments 表里按 parent_comment_id 存的子评论行（含已软删归档） */
 async function readRemoteChildRows(
   target: ExternalStorageTarget,
   rootId: string
@@ -2279,9 +2325,9 @@ async function readRemoteChildRows(
   try {
     const result = await executeRemoteSql(target, `
       SELECT id, parent_comment_id, author_name, author_avatar, be_replied, content_md,
-             img_url, time_text, location, likes, is_author
+             img_url, time_text, location, likes, is_author, is_deleted
       FROM comments
-      WHERE parent_comment_id = ? AND is_deleted = 0
+      WHERE parent_comment_id = ?
       ORDER BY first_seen_at ASC
     `, [rootId]);
     return result.rows.map(mapRemoteChildRow);
@@ -2303,6 +2349,7 @@ type ChildSelectRow = {
   location: string | null;
   likes: number | null;
   is_author: number | null;
+  is_deleted?: number | null;
 };
 
 function mapStoredChildRow(row: ChildSelectRow): ChildCommentRecord {
@@ -2319,7 +2366,8 @@ function mapStoredChildRow(row: ChildSelectRow): ChildCommentRecord {
     time: row.time_text ?? "",
     location: row.location ?? "",
     likes: Number(row.likes ?? 0) || 0,
-    isAuthor: row.is_author === 1
+    isAuthor: row.is_author === 1,
+    ...(row.is_deleted === 1 ? { isDeleted: true } : {})
   };
 }
 
@@ -2336,7 +2384,8 @@ function mapRemoteChildRow(row: Record<string, any>): ChildCommentRecord {
     time_text: row.time_text == null ? null : String(row.time_text),
     location: row.location == null ? null : String(row.location),
     likes: Number(row.likes ?? 0) || 0,
-    is_author: Number(row.is_author ?? 0) || 0
+    is_author: Number(row.is_author ?? 0) || 0,
+    is_deleted: Number(row.is_deleted ?? 0) || 0
   });
 }
 

@@ -1499,6 +1499,16 @@ test("[P2-4] crawler fetchStoredCommentState / shouldSyncCommentsDeep 对 is_com
   const retryState = await ctx.__state("answer:p24-retry");
   assert.equal(retryState.incompleteRoots, 1);
   assert.equal(await ctx.__deep("answer:p24-retry", 11, 11, "full"), true);
+
+  // 3) [防删归档] is_deleted = 1 的已删除归档根评论必须被爬虫忽略，不计入 liveRoots / storedComments / incompleteRoots
+  returnedRows = [
+    { child_count: 10, is_complete: 0, is_deleted: 1 },
+    { child_count: 3, is_complete: 1, is_deleted: 0 }
+  ];
+  const archivedState = await ctx.__state("answer:archived-roots");
+  assert.equal(archivedState.roots, 1);
+  assert.equal(archivedState.storedComments, 4);
+  assert.equal(archivedState.incompleteRoots, 0);
 });
 
 test("[P0-1][P1-4] crawler score 回退不触发全量删对账，畸形响应与非确认空页不误清零", async () => {

@@ -22,7 +22,7 @@ statsRoutes.get("/", async c => {
   const answersCount = await db.prepare(`SELECT count(*) as c FROM contents WHERE source_type = 'answer' AND is_deleted = 0`).get() as { c: number };
   const articlesCount = await db.prepare(`SELECT count(*) as c FROM contents WHERE source_type = 'article' AND is_deleted = 0`).get() as { c: number };
   const upvotesCount = await db.prepare(`SELECT count(*) as c FROM upvotes`).get() as { c: number };
-  const commentsCount = await db.prepare(`SELECT count(*) as c FROM comments WHERE is_deleted = 0`).get() as { c: number };
+  const commentsCount = await db.prepare(`SELECT count(*) as c FROM comments`).get() as { c: number };
   const collectionsCount = await db.prepare(`SELECT count(*) as c FROM collections`).get() as { c: number };
   const collectionItemsCount = await db.prepare(`SELECT count(*) as c FROM collection_items WHERE is_removed = 0`).get() as { c: number };
   const followedUsersCount = await db.prepare(`SELECT count(*) as c FROM followed_users`).get() as { c: number };

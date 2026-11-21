@@ -85,7 +85,6 @@ function waitForInFlightIngestWrites(timeoutMs: number): Promise<void> {
       resolve();
     };
     const timer = setTimeout(finish, timeoutMs);
-    timer.unref?.();
     const drain = () => {
       if (inFlightIngestWrites.size === 0) {
         finish();
@@ -547,7 +546,7 @@ function shouldSyncComments(commentCount: number, prevCommentCount: number | nul
 const commentSyncIncomplete = new Set<string>();
 
 type StoredCommentState = { roots: number; storedComments: number; incompleteRoots: number };
-type StoredRootCommentRow = { is_complete?: unknown; child_count?: unknown };
+type StoredRootCommentRow = { is_complete?: unknown; child_count?: unknown; is_deleted?: unknown };
 
 function isStoredRootCommentRow(value: unknown): value is StoredRootCommentRow {
   return Boolean(value) && typeof value === "object";
@@ -573,15 +572,19 @@ async function fetchStoredCommentState(contentPk: string): Promise<StoredComment
       const data = json.data;
       rows = Array.isArray(data) ? data.filter(isStoredRootCommentRow) : [];
     }
+    let liveRoots = 0;
     let incompleteRoots = 0;
-    let storedComments = rows.length;
+    let storedComments = 0;
     for (const row of rows) {
+      // 防删归档保留的已删除根评论（is_deleted=1）已不在现网，不计入现网有效数与待补抓状态
+      if (Number(row.is_deleted ?? 0) === 1) continue;
+      liveRoots++;
       // 0 子评论且走 partial 批入库的根不会写 comment_threads，此时 listRootComments 固定返回 is_complete=0；
       // 只有真正存在子评论（child_count > 0）且状态为 0（未完成可重试）时才计入不完整，is_complete=2（闭评冻结）不再触发重抓
       if (Number(row.child_count) > 0 && Number(row.is_complete ?? 0) === 0) incompleteRoots++;
-      storedComments += Number(row.child_count) || 0;
+      storedComments += 1 + (Number(row.child_count) || 0);
     }
-    return { roots: rows.length, storedComments, incompleteRoots };
+    return { roots: liveRoots, storedComments, incompleteRoots };
   } catch {
     return null;
   }

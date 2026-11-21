@@ -39,7 +39,7 @@ export async function listUpvotes(params?: { page?: number; sort?: string }) {
 
   return await db.prepare(`
     SELECT c.pk, c.source_type, c.source_id, c.title, c.question_title, c.source_url, c.author_name, c.author_url_token, c.author_avatar, c.author_headline, c.excerpt,
-           c.voteup_count, c.comment_count, c.favorite_count, c.visit_count, c.created_time, c.updated_time, c.last_seen_at, c.is_deleted, u.upvote_time
+           c.voteup_count, MAX(c.comment_count, COALESCE(c.archived_comment_count, 0)) AS comment_count, c.favorite_count, c.visit_count, c.created_time, c.updated_time, c.last_seen_at, c.is_deleted, u.upvote_time
     FROM upvotes u
     JOIN contents c ON u.content_pk = c.pk
     ORDER BY ${orderBy}
