@@ -7386,6 +7386,99 @@ test("[PR2-3] offload 失败归档重试预览按子评论 ID 去重（主库与
   }
 });
 
+test("[PR2-3] offload 失败归档重试预览保留历史回复 isDeleted（仅外部库 / 主库存活与外部库已删同 ID）", async () => {
+  const auth = workerModules.auth;
+
+  const runScenario = async ({ id, mainChild, remoteContent }) => {
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+    const { sqlite, d1 } = createMemoryDb();
+    seedContent(sqlite);
+    if (mainChild) insertLegacyChild(sqlite, mainChild);
+
+    const remoteSqlite = new Database(":memory:");
+    const target = makeTursoTarget(id, `https://${id}.example.com`);
+    const bucket = makeTargetBucket(target);
+    // 强制触发 0 活回复归档失败的重试分支：让前置 child_comment_blobs 探测报错
+    const mock = installTursoPipelineMock(remoteSqlite, {
+      failSql: /SELECT root_id FROM child_comment_blobs WHERE content_pk = \?/
+    });
+    try {
+      await runWithDb(d1, () => auth.ensureRemoteCommentSchema(target));
+      remoteSqlite.prepare(`
+        INSERT INTO comments (
+          id, content_pk, parent_comment_id, author_name, content_md, likes,
+          comment_hash, first_seen_at, last_seen_at, is_deleted, child_count
+        ) VALUES ('r1', ?, NULL, 'Root', 'root', 10, 'hr', ?, ?, 0, 0)
+      `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+      // 外部库扁平子评论表中的历史回复已软删（isDeleted: true）
+      remoteSqlite.prepare(`
+        INSERT INTO comments (
+          id, content_pk, parent_comment_id, author_name, content_md, likes,
+          comment_hash, first_seen_at, last_seen_at, is_deleted, child_count
+        ) VALUES ('archived_child', ?, 'r1', 'A', ?, 1, 'hc', ?, ?, 1, 0)
+      `).run(CONTENT_PK, remoteContent, NOW_ISO, NOW_ISO);
+
+      await runWithDb(d1, () =>
+        commentsModule.replaceCommentsByRoot({
+          contentPk: CONTENT_PK,
+          partial: false,
+          allRootIds: ["r1"],
+          roots: [{
+            id: "r1",
+            author: "Root",
+            authorAvatar: "",
+            content: "root",
+            img: "",
+            time: NOW_ISO,
+            location: "",
+            likes: 10,
+            isAuthor: false,
+            isTop: false,
+            isFeatured: false,
+            childCount: 0,
+            isChildrenComplete: true,
+            children: []
+          }]
+        }, { DB: d1, BUCKET: bucket })
+      );
+
+      const thread = remoteSqlite.prepare(
+        `SELECT child_count, is_complete, incoming_hash, preview_json FROM comment_threads WHERE root_id = 'r1'`
+      ).get();
+      assert.ok(thread, "0 活回复归档失败必须写回待重试 comment_threads 行");
+      assert.equal(thread.is_complete, 0);
+      assert.equal(thread.incoming_hash, "");
+      const preview = JSON.parse(thread.preview_json);
+      assert.deepEqual(
+        preview.map(item => item.id),
+        ["archived_child"],
+        "历史已删回复必须进入重试预览且只出现一次"
+      );
+      assert.equal(preview[0].isDeleted, true, "合并两份历史列表时必须保留外部库的 isDeleted 标记");
+      assert.equal(preview[0].content, remoteContent.slice(0, 120), "同 ID 冲突时后出现的外部库记录覆盖主库记录");
+    } finally {
+      mock.restore();
+      auth.invalidateExternalTargetsCache();
+      auth.resetRemoteSchemaCache();
+    }
+  };
+
+  // 场景 1：仅外部库存在该已删历史回复
+  await runScenario({
+    id: "ext-pr2-preview-flag-remote-only",
+    mainChild: null,
+    remoteContent: "remote archived version"
+  });
+
+  // 场景 2：主 D1 存活副本与外部库 isDeleted:true 同 ID 并存，预览必须保持已删
+  await runScenario({
+    id: "ext-pr2-preview-flag-both",
+    mainChild: { id: "archived_child", rootId: "r1", content: "main live version", isDeleted: 0 },
+    remoteContent: "remote archived version"
+  });
+});
+
 test("[PR2-3] /root-comments?live_only=1 能发现第 50 根之后的待重试线程（主 D1 与 offload）", async () => {
   const auth = workerModules.auth;
   auth.invalidateExternalTargetsCache();
@@ -7498,5 +7591,124 @@ test("[PR2-3] /root-comments?live_only=1 能发现第 50 根之后的待重试�
       auth.invalidateExternalTargetsCache();
       auth.resetRemoteSchemaCache();
     }
+  }
+});
+
+test("[PR2-3] live_only=1 外部分流下用外部库收敛状态过滤主库旧副本（4 场景）", async () => {
+  const auth = workerModules.auth;
+
+  const insertMainRoot = (sqlite, id, likes) => {
+    sqlite.prepare(`
+      INSERT INTO comments (
+        id, content_pk, parent_comment_id, author_name, content_md, likes,
+        comment_hash, child_count, first_seen_at, last_seen_at, is_deleted
+      ) VALUES (?, ?, NULL, 'U', 'root', ?, 'h', 0, ?, ?, 0)
+    `).run(id, CONTENT_PK, likes, NOW_ISO, NOW_ISO);
+  };
+  const insertMainThread = (sqlite, rootId, isComplete) => {
+    sqlite.prepare(`
+      INSERT INTO comment_threads (
+        root_id, content_pk, r2_key, child_count, is_complete,
+        thread_hash, incoming_hash, preview_json, synced_at
+      ) VALUES (?, ?, ?, 0, ?, '', '', '[]', ?)
+    `).run(rootId, CONTENT_PK, `childcomments/${rootId}.json`, isComplete, NOW_ISO);
+  };
+  const insertRemoteRoot = (sqlite, id, likes, isDeleted = 0) => {
+    sqlite.prepare(`
+      INSERT INTO comments (
+        id, content_pk, parent_comment_id, author_name, content_md, likes,
+        comment_hash, child_count, first_seen_at, last_seen_at, is_deleted
+      ) VALUES (?, ?, NULL, 'U', 'root', ?, 'h', 0, ?, ?, ?)
+    `).run(id, CONTENT_PK, likes, NOW_ISO, NOW_ISO, isDeleted);
+  };
+  const insertRemoteThread = (sqlite, rootId, isComplete) => {
+    sqlite.prepare(`
+      INSERT INTO comment_threads (
+        root_id, content_pk, r2_key, child_count, is_complete,
+        thread_hash, incoming_hash, preview_json, synced_at
+      ) VALUES (?, ?, ?, 0, ?, '', '', '[]', ?)
+    `).run(rootId, CONTENT_PK, `childcomments/${rootId}.json`, isComplete, NOW_ISO);
+  };
+
+  // 主 D1 固定形态：55 条存活根，前 50 条已完成，第 55 条（低赞、不在前 50 页）在主库未完成
+  const seedMainDb = sqlite => {
+    seedContent(sqlite);
+    for (let i = 1; i <= 55; i++) insertMainRoot(sqlite, `root-${i}`, 1000 - i);
+    for (let i = 1; i <= 50; i++) insertMainThread(sqlite, `root-${i}`, 1);
+    insertMainThread(sqlite, "root-55", 0);
+  };
+
+  const runScenario = async ({ id, seedRemote }) => {
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+    const { sqlite, d1 } = createMemoryDb();
+    seedMainDb(sqlite);
+    const remoteSqlite = new Database(":memory:");
+    const target = makeTursoTarget(id, `https://${id}.example.com`);
+    const bucket = makeTargetBucket(target);
+    const mock = installTursoPipelineMock(remoteSqlite);
+    try {
+      await runWithDb(d1, () => auth.ensureRemoteCommentSchema(target));
+      seedRemote(remoteSqlite);
+      const res = await runWithDb(d1, () =>
+        contentsRouteModule.contentRoutes.__call("GET", "/:pk/root-comments", {
+          params: { pk: CONTENT_PK },
+          url: `http://127.0.0.1/api/contents/${encodeURIComponent(CONTENT_PK)}/root-comments?limit=50&live_only=1`
+        }, { DB: d1, BUCKET: bucket })
+      );
+      assert.equal(res.status, 200);
+      assert.equal(res.body.data.length, 50, "主 D1 有 55 根时当前页固定为 50 条");
+      return res.body.has_incomplete_roots;
+    } finally {
+      mock.restore();
+      auth.invalidateExternalTargetsCache();
+      auth.resetRemoteSchemaCache();
+    }
+  };
+
+  const scenarios = [
+    {
+      id: "ext-pr2-settled-complete",
+      label: "A 外部库第 55 条已完成：主库旧 is_complete=0 不得再触发重抓",
+      expect: false,
+      seedRemote: sqlite => {
+        for (let i = 1; i <= 55; i++) insertRemoteRoot(sqlite, `root-${i}`, 1000 - i);
+        for (let i = 1; i <= 55; i++) insertRemoteThread(sqlite, `root-${i}`, 1);
+      }
+    },
+    {
+      id: "ext-pr2-settled-softdeleted",
+      label: "B 外部库第 55 条已软删：同样视为已收敛，屏蔽主库旧副本",
+      expect: false,
+      seedRemote: sqlite => {
+        for (let i = 1; i <= 54; i++) insertRemoteRoot(sqlite, `root-${i}`, 1000 - i);
+        insertRemoteRoot(sqlite, "root-55", 945, 1);
+        for (let i = 1; i <= 50; i++) insertRemoteThread(sqlite, `root-${i}`, 1);
+      }
+    },
+    {
+      id: "ext-pr2-unmigrated",
+      label: "C 第 55 条仅存在于主 D1：真正未迁移的未完成根仍触发重试",
+      expect: true,
+      seedRemote: sqlite => {
+        for (let i = 1; i <= 54; i++) insertRemoteRoot(sqlite, `root-${i}`, 1000 - i);
+        for (let i = 1; i <= 54; i++) insertRemoteThread(sqlite, `root-${i}`, 1);
+      }
+    },
+    {
+      id: "ext-pr2-remote-incomplete",
+      label: "D 外部库第 55 条本身未完成：必须继续触发重试",
+      expect: true,
+      seedRemote: sqlite => {
+        for (let i = 1; i <= 55; i++) insertRemoteRoot(sqlite, `root-${i}`, 1000 - i);
+        for (let i = 1; i <= 54; i++) insertRemoteThread(sqlite, `root-${i}`, 1);
+        insertRemoteThread(sqlite, "root-55", 0);
+      }
+    }
+  ];
+
+  for (const scenario of scenarios) {
+    const actual = await runScenario(scenario);
+    assert.equal(actual, scenario.expect, scenario.label);
   }
 });

@@ -402,6 +402,24 @@ function archiveMergeChildren(
   return Array.from(merged.values());
 }
 
+/**
+ * 合并多份「已落库」的子评论历史列表（迁移/双写过渡期的主库与外部库）。
+ *
+ * 与 archiveMergeChildren 不同，这里的每一份都是历史快照，没有任何一份代表现网最新状态，
+ * 因此只按 id 去重（后面的列表覆盖前面同 ID 记录），原样保留所选记录自身的 isDeleted，
+ * 绝不把已删回复洗成存活回复。
+ */
+function mergeStoredChildrenLists(...lists: ChildCommentRecord[][]): ChildCommentRecord[] {
+  const merged = new Map<string, ChildCommentRecord>();
+  for (const list of lists) {
+    for (const child of list) {
+      if (!child || typeof child.id !== "string" || !child.id) continue;
+      merged.set(child.id, child);
+    }
+  }
+  return Array.from(merged.values());
+}
+
 const PREVIEW_REPLY_LIMIT = 2;
 const PREVIEW_CONTENT_LENGTH = 120;
 
@@ -1919,7 +1937,8 @@ async function replaceCommentsByRootOffloaded(
     );
     // 同一条子评论可能同时存在于主库与外部库（迁移/双写过渡期）：按 id 合并去重，
     // 外部库版本覆盖主库版本，保证 retryPreviewJson 里每个子评论 ID 只出现一次。
-    const legacyPreviewList = archiveMergeChildren(mainLegacyList, remoteLegacyList, false);
+    // 两份都是历史数据，必须原样保留 isDeleted，不能走会清除删除标记的现网合并逻辑。
+    const legacyPreviewList = mergeStoredChildrenLists(mainLegacyList, remoteLegacyList);
     const retryPreviewJson = existingThread
       ? (existingThread.preview_json ?? "[]")
       : (legacyPreviewList.length > 0 ? JSON.stringify(buildPreviewReplies(legacyPreviewList)) : "[]");
@@ -1994,14 +2013,14 @@ async function replaceCommentsByRootOffloaded(
               (c): c is ChildCommentRecord => !!c && typeof c === "object" && typeof (c as any).id === "string"
             );
             if (prevChildren.length === 0 && parsed.complete !== true) {
-              prevChildren = archiveMergeChildren(remoteLegacyChildrenByRoot.get(root.id) ?? [], [], false);
+              prevChildren = mergeStoredChildrenLists(remoteLegacyChildrenByRoot.get(root.id) ?? []);
             }
           }
         } catch {
           parsedBlobInvalid = true;
         }
       } else {
-        prevChildren = archiveMergeChildren(remoteLegacyChildrenByRoot.get(root.id) ?? [], [], false);
+        prevChildren = mergeStoredChildrenLists(remoteLegacyChildrenByRoot.get(root.id) ?? []);
       }
 
       if (parsedBlobInvalid) {
@@ -2019,7 +2038,7 @@ async function replaceCommentsByRootOffloaded(
           continue;
         }
         if (mainStored.status === "ok") {
-          prevChildren = archiveMergeChildren(mainLegacyList, mainStored.children, false);
+          prevChildren = mergeStoredChildrenLists(mainLegacyList, mainStored.children);
         } else {
           prevChildren = mainLegacyList;
         }
@@ -2131,7 +2150,7 @@ async function replaceCommentsByRootOffloaded(
             );
             const baseChildren =
               existingChildren.length === 0 && parsed.complete !== true
-                ? archiveMergeChildren(remoteLegacyList, existingChildren, false)
+                ? mergeStoredChildrenLists(remoteLegacyList, existingChildren)
                 : existingChildren;
             childrenToStore = archiveMergeChildren(baseChildren, children, root.isChildrenComplete);
           }
@@ -2338,16 +2357,20 @@ export async function hasOffloadedComments(
  *
  * 根评论列表按热度只取前 50 条（D1 绑定参数上限），第 50 根之后失败归档的线程
  * 不会出现在任何一页里；爬虫仅凭当前页逐行状态会永久漏掉它们。这里用单条
- * `SELECT 1 ... LIMIT 1` 在主 D1 与外部扩容库各探测一次，不拉整表、不占绑定参数、
+ * `SELECT 1 ... LIMIT 1` 在外部扩容库与主 D1 探测，不拉整表、不占绑定参数、
  * 不会因 join 放大重复计数。
+ *
+ * 启用外部分流后，主 D1 会残留迁移前的旧线程（is_complete=0），而成功归档只写外部库。
+ * 因此外部扩容库是「当前写入库」：先确认所有可达外部库都没有未完成活根，再把主 D1
+ * 残留的未完成根 ID 与外部库已接管的根（含软删归档，说明该根已在外部库收敛）对账，
+ * 只对真正未迁移的主库旧根返回 true，避免爬虫每轮全量重抓。
  */
 export async function hasIncompleteLiveRoot(
   database: D1Database,
   contentPk: string,
   bucket?: any
 ): Promise<boolean> {
-  const sql = `
-    SELECT 1 AS has_any
+  const incompleteWhereSql = `
     FROM comments c
     LEFT JOIN comment_threads t ON t.root_id = c.id
     WHERE c.content_pk = ? AND c.parent_comment_id IS NULL AND c.is_deleted = 0
@@ -2363,29 +2386,86 @@ export async function hasIncompleteLiveRoot(
           )
         )
       )
-    LIMIT 1
   `;
-  try {
-    const row = await database.prepare(sql).bind(contentPk).first<{ has_any?: number }>();
-    if (row) return true;
-  } catch {
-    // 主库探测失败不能让路由整体 500：继续尝试外部库，最终由调用方按 false 处理
-  }
-  if (!bucket) return false;
-  const targets = await listReadableCommentOffloadTargets(bucket).catch(() => []);
-  for (const target of targets) {
+  const hasAnySql = `SELECT 1 AS has_any ${incompleteWhereSql} LIMIT 1`;
+  const rootIdsSql = `SELECT c.id AS id ${incompleteWhereSql}`;
+
+  const offloadTargets = bucket ? await listReadableCommentOffloadTargets(bucket).catch(() => []) : [];
+
+  // 未启用外部扩容库：保持原有单条探测，零额外开销。
+  if (offloadTargets.length === 0) {
     try {
-      const result = await executeRemoteSql(target, sql, [contentPk]);
+      const row = await database.prepare(hasAnySql).bind(contentPk).first<{ has_any?: number }>();
+      return Boolean(row);
+    } catch {
+      return false;
+    }
+  }
+
+  // 1) 外部扩容库是当前写入库：任意外部库存在未完成活根即需要重试。
+  //    单库报错只记 warn 且不计入可达目标，避免不可达外部库误屏蔽主库真实重试。
+  const reachableTargets: ExternalStorageTarget[] = [];
+  for (const target of offloadTargets) {
+    try {
+      const result = await executeRemoteSql(target, hasAnySql, [contentPk]);
       if (result.rows.length > 0) return true;
+      reachableTargets.push(target);
     } catch (err) {
-      // 单个外部库不可用时记 warn 并继续探测下一个目标
       console.warn(
         `[comments] hasIncompleteLiveRoot probe failed (${target.name || target.id}):`,
         err
       );
     }
   }
-  return false;
+
+  // 2) 所有可达外部库都没有未完成活根：再取出主 D1 残留的未完成活根 ID 集合。
+  let unresolvedIds: Set<string>;
+  try {
+    const { results } = await database.prepare(rootIdsSql).bind(contentPk).all<{ id?: string }>();
+    unresolvedIds = new Set(
+      (results ?? [])
+        .map(row => (row.id == null ? "" : String(row.id)))
+        .filter(id => id !== "")
+    );
+  } catch {
+    // 主库探测失败不能让路由整体 500：调用方按 false 处理
+    return false;
+  }
+  if (unresolvedIds.size === 0) return false;
+  // 外部库全部不可达时无法证明主库旧副本已收敛，仍按主库结论触发重试。
+  if (reachableTargets.length === 0) return true;
+
+  // 3) 步骤 1 已证明可达外部库中没有任何未完成活根，因此凡是在外部库 comments 表
+  //    存在的根 ID 都已在当前写入库收敛（已软删的根同样算收敛，故不加 is_deleted 过滤）。
+  //    将其从主库未完成集合中剔除；每个外部库最多只追加 1 次子请求。
+  for (const target of reachableTargets) {
+    const ids = Array.from(unresolvedIds);
+    try {
+      const rows = ids.length <= D1_MAX_SQL_PARAMS - 1
+        ? (await executeRemoteSql(
+            target,
+            `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL AND id IN (${ids.map(() => "?").join(", ")})`,
+            [contentPk, ...ids]
+          )).rows
+        : (await executeRemoteSql(
+            target,
+            `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL`,
+            [contentPk]
+          )).rows;
+      for (const row of rows) {
+        const id = row.id == null ? "" : String(row.id);
+        if (id) unresolvedIds.delete(id);
+      }
+      if (unresolvedIds.size === 0) return false;
+    } catch (err) {
+      // 收敛状态查不到时不能当作已收敛：保留主库未完成结论，继续探测下一个目标
+      console.warn(
+        `[comments] hasIncompleteLiveRoot convergence probe failed (${target.name || target.id}):`,
+        err
+      );
+    }
+  }
+  return unresolvedIds.size > 0;
 }
 
 /**
