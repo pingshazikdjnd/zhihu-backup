@@ -101,7 +101,13 @@ export function maskTargetForClient(t: ExternalStorageTarget): ClientExternalSto
 const EXTERNAL_TARGETS_CACHE_TTL_MS = 60_000;
 const EXTERNAL_TARGETS_LOCK_KEY = "external_storage_targets";
 const EXTERNAL_TARGETS_MAX_CAS_RETRIES = 2;
-let cachedExternalTargets: { at: number; list: ExternalStorageTarget[]; d1UpdatedAt: string | null } | null = null;
+let cachedExternalTargets: {
+  at: number;
+  list: ExternalStorageTarget[];
+  d1UpdatedAt: string | null;
+  /** R2 对象版本；null=对象尚不存在，undefined=无法取得版本（读取失败/未传 bucket） */
+  r2Etag: string | null | undefined;
+} | null = null;
 let lastExternalTargetsWriteMs = 0;
 
 export class ExternalTargetsConflictError extends Error {
@@ -143,13 +149,29 @@ function resolveTargetsUpdatedMs(list: any[], explicitUpdatedAt?: unknown): numb
   return maxMs;
 }
 
+/** R2 对象原生 ETag：优先 etag，其次去掉 httpEtag 的引号；无法取得时返回 undefined */
+function readR2ObjectEtag(obj: any): string | undefined {
+  if (!obj) return undefined;
+  if (typeof obj.etag === "string" && obj.etag) return obj.etag;
+  if (typeof obj.httpEtag === "string") {
+    const stripped = obj.httpEtag.trim().replace(/^"+|"+$/g, "");
+    if (stripped) return stripped;
+  }
+  return undefined;
+}
+
 async function readExternalTargetsWithVersion(
   bucket?: any
-): Promise<{ targets: ExternalStorageTarget[]; d1UpdatedAt: string | null }> {
+): Promise<{
+  targets: ExternalStorageTarget[];
+  d1UpdatedAt: string | null;
+  r2Etag: string | null | undefined;
+}> {
   if (cachedExternalTargets && Date.now() - cachedExternalTargets.at < EXTERNAL_TARGETS_CACHE_TTL_MS) {
     return {
       targets: cloneTargets(cachedExternalTargets.list),
-      d1UpdatedAt: cachedExternalTargets.d1UpdatedAt
+      d1UpdatedAt: cachedExternalTargets.d1UpdatedAt,
+      r2Etag: cachedExternalTargets.r2Etag
     };
   }
 
@@ -174,10 +196,13 @@ async function readExternalTargetsWithVersion(
 
   let r2Targets: any[] | null = null;
   let r2UpdatedMs = 0;
+  // R2 CAS 版本：对象不存在为 null；读取失败/拿不到 ETag 为 undefined（禁止降级盲写）
+  let r2Etag: string | null | undefined;
   if (bucket) {
     try {
       const obj = await bucket.get(R2_EXTERNAL_TARGETS_KEY);
       if (obj) {
+        r2Etag = readR2ObjectEtag(obj);
         const parsed = JSON.parse(await obj.text());
         if (Array.isArray(parsed)) {
           r2Targets = parsed;
@@ -186,8 +211,13 @@ async function readExternalTargetsWithVersion(
             obj.customMetadata?.updatedAt ?? obj.uploaded
           );
         }
+      } else {
+        r2Etag = null;
       }
-    } catch { /* ignore R2 read error */ }
+    } catch {
+      // 读失败时保持 undefined：后续 D1 故障降级写 R2 必须拒绝盲写
+      r2Etag = undefined;
+    }
   }
 
   // 同时读取 D1 与 R2 并按最新 updatedAt 择新：D1 满额降级只写入 R2 后缓存过期时不会静默回滚到旧 D1 值
@@ -228,8 +258,8 @@ async function readExternalTargetsWithVersion(
     if (cleaned.length >= 10) break;
   }
 
-  cachedExternalTargets = { at: Date.now(), list: cloneTargets(cleaned), d1UpdatedAt };
-  return { targets: cleaned, d1UpdatedAt };
+  cachedExternalTargets = { at: Date.now(), list: cloneTargets(cleaned), d1UpdatedAt, r2Etag };
+  return { targets: cleaned, d1UpdatedAt, r2Etag };
 }
 
 export async function getExternalTargetsRaw(bucket?: any): Promise<ExternalStorageTarget[]> {
@@ -240,7 +270,7 @@ export async function getExternalTargetsRaw(bucket?: any): Promise<ExternalStora
 export async function saveExternalTargetsRaw(
   bucket: any,
   targets: ExternalStorageTarget[],
-  opts?: { expectedUpdatedAt?: string | null }
+  opts?: { expectedUpdatedAt?: string | null; expectedR2Etag?: string | null }
 ): Promise<void> {
   const saved = targets.slice(0, 10);
   const payload = JSON.stringify(saved);
@@ -291,16 +321,42 @@ export async function saveExternalTargetsRaw(
 
   let r2Ok = false;
   let r2Err: unknown = null;
+  let r2Conflict = false;
+  let nextR2Etag: string | undefined;
   if (bucket) {
+    // D1 故障降级写 R2 时，调用方要求 CAS 就必须用 R2 原生 onlyIf 校验版本；
+    // 读取阶段没拿到可用版本（undefined）时拒绝盲写，避免覆盖别的 isolate 刚写的新配置。
+    const requireR2Cas = d1Err !== null && hasExpected;
+    if (requireR2Cas && opts?.expectedR2Etag === undefined) {
+      cachedExternalTargets = null;
+      throw d1Err instanceof Error ? d1Err : new Error("保存外部存储目标失败");
+    }
+    const putOptions: any = {
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+      customMetadata: { updatedAt: now }
+    };
+    if (requireR2Cas) {
+      putOptions.onlyIf = opts!.expectedR2Etag === null
+        ? { etagDoesNotMatch: "*" }
+        : { etagMatches: opts!.expectedR2Etag };
+    }
     try {
-      await bucket.put(R2_EXTERNAL_TARGETS_KEY, payload, {
-        httpMetadata: { contentType: "application/json; charset=utf-8" },
-        customMetadata: { updatedAt: now }
-      });
-      r2Ok = true;
+      const putRes = await bucket.put(R2_EXTERNAL_TARGETS_KEY, payload, putOptions);
+      // 真实 R2 在 onlyIf 不满足时返回 null；必须严格 === null，兼容未返回对象的简单 mock
+      if (putRes === null) {
+        r2Conflict = true;
+      } else {
+        r2Ok = true;
+        nextR2Etag = typeof putRes?.etag === "string" && putRes.etag ? putRes.etag : undefined;
+      }
     } catch (err) {
       r2Err = err;
     }
+  }
+  if (r2Conflict) {
+    // 绝不能被下面的 catch/错误分支吞掉：交给 runWithExternalTargetsCas 自动重读重试或最终 409
+    cachedExternalTargets = null;
+    throw new ExternalTargetsConflictError();
   }
   if (d1Err && (!bucket || !r2Ok)) {
     cachedExternalTargets = null;
@@ -310,20 +366,25 @@ export async function saveExternalTargetsRaw(
   cachedExternalTargets = {
     at: Date.now(),
     list: cloneTargets(saved),
-    d1UpdatedAt: d1Err ? (opts?.expectedUpdatedAt ?? null) : now
+    d1UpdatedAt: d1Err ? (opts?.expectedUpdatedAt ?? null) : now,
+    r2Etag: nextR2Etag
   };
 }
 
 async function runWithExternalTargetsCas<T>(
   bucket: any,
-  fn: (currentTargets: ExternalStorageTarget[], expectedUpdatedAt: string | null) => Promise<T>
+  fn: (
+    currentTargets: ExternalStorageTarget[],
+    expectedUpdatedAt: string | null,
+    expectedR2Etag: string | null | undefined
+  ) => Promise<T>
 ): Promise<T> {
   return await withKeyLock(EXTERNAL_TARGETS_LOCK_KEY, async () => {
     for (let attempt = 0; attempt <= EXTERNAL_TARGETS_MAX_CAS_RETRIES; attempt++) {
       invalidateExternalTargetsCache();
-      const { targets, d1UpdatedAt } = await readExternalTargetsWithVersion(bucket);
+      const { targets, d1UpdatedAt, r2Etag } = await readExternalTargetsWithVersion(bucket);
       try {
-        return await fn(targets, d1UpdatedAt);
+        return await fn(targets, d1UpdatedAt, r2Etag);
       } catch (err) {
         if (err instanceof ExternalTargetsConflictError && attempt < EXTERNAL_TARGETS_MAX_CAS_RETRIES) {
           continue;
@@ -1476,7 +1537,7 @@ authRoutes.post("/external-targets", async c => {
   const syncScopes: ExternalSyncScope[] = scopes.length ? scopes : ["contents", "comments"];
 
   try {
-    return await runWithExternalTargetsCas(c.env.BUCKET, async (currentTargets, expectedUpdatedAt) => {
+    return await runWithExternalTargetsCas(c.env.BUCKET, async (currentTargets, expectedUpdatedAt, expectedR2Etag) => {
       const now = new Date().toISOString();
 
       let targetId = typeof body.id === "string" ? body.id.trim() : "";
@@ -1514,6 +1575,10 @@ authRoutes.post("/external-targets", async c => {
         };
         currentTargets[existingIdx] = savedTarget;
       } else {
+        // 带 id 却找不到目标：并发删除后前端仍拿旧 id 提交编辑，绝不能静默新建一条复活的配置
+        if (targetId) {
+          return c.json({ error: "目标外部存储源不存在或已被删除，请刷新后重试", conflict: true }, 409);
+        }
         if (currentTargets.length >= 10) {
           return c.json({ error: "外部存储目标已达到上限（最多 10 个）" }, 400);
         }
@@ -1538,7 +1603,7 @@ authRoutes.post("/external-targets", async c => {
         currentTargets.push(savedTarget);
       }
 
-      await saveExternalTargetsRaw(c.env.BUCKET, currentTargets, { expectedUpdatedAt });
+      await saveExternalTargetsRaw(c.env.BUCKET, currentTargets, { expectedUpdatedAt, expectedR2Etag });
 
       return c.json({
         ok: true,
@@ -1569,9 +1634,9 @@ authRoutes.post("/external-targets/delete", async c => {
   }
 
   try {
-    return await runWithExternalTargetsCas(c.env.BUCKET, async (currentTargets, expectedUpdatedAt) => {
+    return await runWithExternalTargetsCas(c.env.BUCKET, async (currentTargets, expectedUpdatedAt, expectedR2Etag) => {
       const remaining = currentTargets.filter(t => t.id !== id);
-      await saveExternalTargetsRaw(c.env.BUCKET, remaining, { expectedUpdatedAt });
+      await saveExternalTargetsRaw(c.env.BUCKET, remaining, { expectedUpdatedAt, expectedR2Etag });
 
       return c.json({
         ok: true,
@@ -1786,14 +1851,25 @@ authRoutes.post("/external-targets/test", async c => {
     // 目标服务的错误响应可能回显 Authorization；落库前抹掉 token，避免 GET 列表二次泄漏
     const safeMsg = authToken ? testMsg.split(authToken).join("***") : testMsg;
     try {
-      updatedTarget = await runWithExternalTargetsCas(c.env.BUCKET, async (latestTargets, expectedUpdatedAt) => {
+      updatedTarget = await runWithExternalTargetsCas(c.env.BUCKET, async (latestTargets, expectedUpdatedAt, expectedR2Etag) => {
         const latestExisting = latestTargets.find(t => t.id === targetId);
         // 若探测期间该目标已被删除，跳过写回、不复活已删目标
         if (!latestExisting) return undefined;
+        // 探测结果只属于本次实际探测的连接配置：探测期间并发改了 provider/endpointUrl/databaseId/authToken
+        // （或前端用未保存的草稿配置点「先测试连接」）时跳过写回，绝不给新配置贴上旧探测结果
+        const latestEndpoint =
+          latestExisting.endpointUrl ||
+          (latestExisting.provider === "cloudflare_d1" ? "https://api.cloudflare.com" : "");
+        const sameTestedConfig =
+          latestExisting.provider === provider &&
+          latestEndpoint === endpointUrl &&
+          (latestExisting.databaseId || "") === (databaseId || "") &&
+          (latestExisting.authToken || "") === (authToken || "");
+        if (!sameTestedConfig) return undefined;
         latestExisting.lastTestAt = now;
         latestExisting.lastTestOk = testOk;
         latestExisting.lastTestMsg = `${safeMsg} (${latencyMs}ms)`;
-        await saveExternalTargetsRaw(c.env.BUCKET, latestTargets, { expectedUpdatedAt });
+        await saveExternalTargetsRaw(c.env.BUCKET, latestTargets, { expectedUpdatedAt, expectedR2Etag });
         return latestExisting;
       });
     } catch (err) {

@@ -550,7 +550,13 @@ function shouldSyncComments(commentCount: number, prevCommentCount: number | nul
 const commentSyncIncomplete = new Set<string>();
 
 type StoredCommentState = { roots: number; storedComments: number; incompleteRoots: number };
-type StoredRootCommentRow = { is_complete?: unknown; child_count?: unknown; is_deleted?: unknown };
+type StoredRootCommentRow = {
+  is_complete?: unknown;
+  child_count?: unknown;
+  is_deleted?: unknown;
+  needs_thread_retry?: unknown;
+  thread_synced_at?: unknown;
+};
 
 function isStoredRootCommentRow(value: unknown): value is StoredRootCommentRow {
   return Boolean(value) && typeof value === "object";
@@ -584,8 +590,15 @@ async function fetchStoredCommentState(contentPk: string): Promise<StoredComment
       if (Number(row.is_deleted ?? 0) === 1) continue;
       liveRoots++;
       // 0 子评论且走 partial 批入库的根不会写 comment_threads，此时 listRootComments 固定返回 is_complete=0；
-      // 只有真正存在子评论（child_count > 0）且状态为 0（未完成可重试）时才计入不完整，is_complete=2（闭评冻结）不再触发重抓
-      if (Number(row.child_count) > 0 && Number(row.is_complete ?? 0) === 0) incompleteRoots++;
+      // 显式重试信号 needs_thread_retry=1（0 活回复归档/迁移失败遗留）、或已有线程索引但未完成
+      // （thread_synced_at 存在且 is_complete=0），必须触发重抓，即使 child_count=0 也不能漏；
+      // 全新 0 回复根（无 comment_threads 行）与闭评冻结（is_complete=2）都不触发。
+      const needsThreadRetry =
+        Number(row.needs_thread_retry ?? 0) === 1 ||
+        (Boolean(row.thread_synced_at) && Number(row.is_complete ?? 0) === 0);
+      if (needsThreadRetry || (Number(row.child_count) > 0 && Number(row.is_complete ?? 0) === 0)) {
+        incompleteRoots++;
+      }
       storedComments += 1 + (Number(row.child_count) || 0);
     }
     return { roots: liveRoots, storedComments, incompleteRoots };

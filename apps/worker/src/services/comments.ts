@@ -313,6 +313,8 @@ export type RootCommentRow = {
   child_count: number;
   is_complete: number;
   thread_synced_at: string | null;
+  /** 1 = 已存在线程索引但未完成（0 活回复归档/迁移失败遗留），爬虫据此强制重抓 */
+  needs_thread_retry?: number;
   /** 原始预览字符串；对外返回前会转成 preview_replies 数组并去掉该字段 */
   preview_json?: string | null;
   preview_replies: PreviewReply[];
@@ -875,20 +877,47 @@ async function replaceCommentsByRootInner(
             synced_at = excluded.synced_at
         `).bind(root.id, input.contentPk, key, archivedCount, nextThreadHash, emptyIncomingHash, previewJson, now));
       } else {
-        if (!existingThread) continue;
-        const fallbackThreadHash = existingThread.thread_hash ?? "";
+        // 归档失败：严禁写空快照/is_complete=1，但必须留下待重试索引行（needs_thread_retry=1），
+        // 否则「活根回复被删光 + 首轮归档失败」的根会永久停在 child_count=0 的新根状态而不被爬虫重抓。
+        const hasArchiveHistory =
+          Boolean(existingThread) ||
+          existingChildCount > 0 ||
+          legacyList.length > 0 ||
+          legacyChildrenReadFailed;
+        if (!hasArchiveHistory) continue;
+        const fallbackThreadHash = existingThread?.thread_hash ?? "";
+        const retryChildCount = Math.max(
+          existingThread?.child_count ?? 0,
+          existingChildCount,
+          legacyList.length
+        );
+        const retryPreviewJson = existingThread
+          ? (existingThread.preview_json ?? "[]")
+          : (legacyList.length > 0 ? JSON.stringify(buildPreviewReplies(legacyList)) : "[]");
         if (
+          existingThread &&
           existingThread.is_complete === 0 &&
           existingThread.incoming_hash === "" &&
-          existingThread.thread_hash === fallbackThreadHash
+          existingThread.thread_hash === fallbackThreadHash &&
+          existingThread.child_count === retryChildCount &&
+          (existingThread.preview_json ?? "[]") === retryPreviewJson
         ) {
           continue;
         }
         threadStmts.push(database.prepare(`
-          UPDATE comment_threads
-          SET is_complete = 0, thread_hash = ?, incoming_hash = '', synced_at = ?
-          WHERE root_id = ?
-        `).bind(fallbackThreadHash, now, root.id));
+          INSERT INTO comment_threads (
+            root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at
+          ) VALUES (?, ?, ?, ?, 0, ?, '', ?, ?)
+          ON CONFLICT(root_id) DO UPDATE SET
+            content_pk = excluded.content_pk,
+            r2_key = excluded.r2_key,
+            child_count = excluded.child_count,
+            is_complete = excluded.is_complete,
+            thread_hash = excluded.thread_hash,
+            incoming_hash = excluded.incoming_hash,
+            preview_json = excluded.preview_json,
+            synced_at = excluded.synced_at
+        `).bind(root.id, input.contentPk, key, retryChildCount, fallbackThreadHash, retryPreviewJson, now));
       }
       continue;
     }
@@ -1126,7 +1155,8 @@ export async function listRootComments(
            ${childCountSelectSql} AS child_count,
            COALESCE(t.is_complete, 0) AS is_complete,
            t.preview_json AS preview_json,
-           t.synced_at AS thread_synced_at
+           t.synced_at AS thread_synced_at,
+           CASE WHEN t.root_id IS NOT NULL AND COALESCE(t.is_complete, 0) = 0 THEN 1 ELSE 0 END AS needs_thread_retry
     FROM comments c
     LEFT JOIN comment_threads t ON t.root_id = c.id
     WHERE c.content_pk = ? AND c.parent_comment_id IS NULL${liveFilter}
@@ -1280,7 +1310,8 @@ function buildRemoteRootCommentsSql(liveOnly: boolean): string {
          ${childCountSelectSql} AS child_count,
          COALESCE(t.is_complete, 0) AS is_complete,
          t.preview_json AS preview_json,
-         t.synced_at AS thread_synced_at
+         t.synced_at AS thread_synced_at,
+         CASE WHEN t.root_id IS NOT NULL AND COALESCE(t.is_complete, 0) = 0 THEN 1 ELSE 0 END AS needs_thread_retry
   FROM comments c
   LEFT JOIN comment_threads t ON t.root_id = c.id
   WHERE c.content_pk = ? AND c.parent_comment_id IS NULL${liveFilter}
@@ -1315,6 +1346,7 @@ function normalizeRemoteRootRows(rows: Record<string, any>[]): RootCommentRow[] 
       child_count: Number(row.child_count ?? 0) || 0,
       is_complete: Number(row.is_complete ?? 0) || 0,
       thread_synced_at: row.thread_synced_at == null ? null : String(row.thread_synced_at),
+      needs_thread_retry: Number(row.needs_thread_retry ?? 0) || 0,
       // 预览在外部库 comment_threads.preview_json 里，解析失败按空预览处理（不阻塞根列表）
       preview_replies: parsePreviewJson(typeof row.preview_json === "string" ? row.preview_json : null)
     });
@@ -1868,6 +1900,50 @@ async function replaceCommentsByRootOffloaded(
     }
   }
 
+  // 0 活回复归档/迁移失败：不写空快照，但必须留下待重试线程索引行（is_complete=0, incoming_hash=""），
+  // 供 listRootComments 的 needs_thread_retry 与爬虫重抓消费；child_count 保留既有历史水位。
+  const pushZeroReplyArchiveRetryRow = (
+    rootId: string,
+    existingThread: ExistingThreadRow | undefined
+  ): void => {
+    const existingRootChildCount = Number(existingMap.get(rootId)?.child_count ?? 0);
+    const mainLegacyList = mainLegacyChildrenByRoot.get(rootId) ?? [];
+    const remoteLegacyList = remoteLegacyChildrenByRoot.get(rootId) ?? [];
+    const fallbackHash = existingThread?.thread_hash ?? "";
+    const retryChildCount = Math.max(
+      existingThread?.child_count ?? 0,
+      existingRootChildCount,
+      mainLegacyThreadChildCountByRoot.get(rootId) ?? 0,
+      mainLegacyList.length,
+      remoteLegacyList.length
+    );
+    const legacyPreviewList = [...mainLegacyList, ...remoteLegacyList];
+    const retryPreviewJson = existingThread
+      ? (existingThread.preview_json ?? "[]")
+      : (legacyPreviewList.length > 0 ? JSON.stringify(buildPreviewReplies(legacyPreviewList)) : "[]");
+    if (
+      existingThread &&
+      existingThread.is_complete === 0 &&
+      existingThread.incoming_hash === "" &&
+      existingThread.thread_hash === fallbackHash &&
+      existingThread.child_count === retryChildCount &&
+      (existingThread.preview_json ?? "[]") === retryPreviewJson
+    ) {
+      return;
+    }
+    threadUpsertRows.push([
+      rootId,
+      input.contentPk,
+      childCommentsKey(rootId),
+      retryChildCount,
+      0,
+      fallbackHash,
+      "",
+      retryPreviewJson,
+      now
+    ]);
+  };
+
   for (const { root, children } of prepared) {
     const hasChildren = children.length > 0;
     const childCount = Math.max(root.childCount, children.length);
@@ -1900,28 +1976,7 @@ async function replaceCommentsByRootOffloaded(
 
       const raw = storedBlobByRoot.get(root.id);
       if (mainLegacyQueryFailed || remoteLegacyQueryFailed || raw === null || remoteLegacyReadFailed) {
-        if (existingThread) {
-          const fallbackHash = existingThread.thread_hash ?? "";
-          if (
-            !(
-              existingThread.is_complete === 0 &&
-              existingThread.incoming_hash === "" &&
-              existingThread.thread_hash === fallbackHash
-            )
-          ) {
-            threadUpsertRows.push([
-              root.id,
-              input.contentPk,
-              childCommentsKey(root.id),
-              existingThread.child_count,
-              0,
-              fallbackHash,
-              "",
-              existingThread.preview_json ?? "[]",
-              now
-            ]);
-          }
-        }
+        pushZeroReplyArchiveRetryRow(root.id, existingThread);
         continue;
       }
 
@@ -1948,20 +2003,7 @@ async function replaceCommentsByRootOffloaded(
       }
 
       if (parsedBlobInvalid) {
-        if (existingThread) {
-          const fallbackHash = existingThread.thread_hash ?? "";
-          threadUpsertRows.push([
-            root.id,
-            input.contentPk,
-            childCommentsKey(root.id),
-            existingThread.child_count,
-            0,
-            fallbackHash,
-            "",
-            existingThread.preview_json ?? "[]",
-            now
-          ]);
-        }
+        pushZeroReplyArchiveRetryRow(root.id, existingThread);
         continue;
       }
 
@@ -1971,28 +2013,7 @@ async function replaceCommentsByRootOffloaded(
         const mainStored = await readStoredChildThread(env.BUCKET, root.id, { bypassCache: true });
         if (mainStored.status === "error") {
           console.warn(`[comments] skip offload archive empty for ${root.id}: main R2 object unreadable`);
-          if (existingThread) {
-            const fallbackHash = existingThread.thread_hash ?? "";
-            if (
-              !(
-                existingThread.is_complete === 0 &&
-                existingThread.incoming_hash === "" &&
-                existingThread.thread_hash === fallbackHash
-              )
-            ) {
-              threadUpsertRows.push([
-                root.id,
-                input.contentPk,
-                childCommentsKey(root.id),
-                existingThread.child_count,
-                0,
-                fallbackHash,
-                "",
-                existingThread.preview_json ?? "[]",
-                now
-              ]);
-            }
-          }
+          pushZeroReplyArchiveRetryRow(root.id, existingThread);
           continue;
         }
         if (mainStored.status === "ok") {

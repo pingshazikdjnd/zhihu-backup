@@ -4,6 +4,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
+import vm from "node:vm";
 import Database from "better-sqlite3";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -5850,6 +5851,14 @@ test("[PR2-1][PR2-7] offload 0 回复归档：主 R2 报错保留可重试、主
       undefined,
       "主 D1 legacy 查询失败时绝不能写死 complete=1 空快照"
     );
+    // 但必须留下待重试索引行（is_complete=0, thread_hash="", incoming_hash=""），否则爬虫不会再补抓
+    const d1OnlyRetryAfterMainQueryFail = remoteSqlite.prepare(
+      `SELECT child_count, is_complete, thread_hash, incoming_hash FROM comment_threads WHERE root_id = 'r-d1-only'`
+    ).get();
+    assert.equal(d1OnlyRetryAfterMainQueryFail?.is_complete, 0);
+    assert.equal(d1OnlyRetryAfterMainQueryFail?.thread_hash, "");
+    assert.equal(d1OnlyRetryAfterMainQueryFail?.incoming_hash, "");
+    assert.equal(d1OnlyRetryAfterMainQueryFail?.child_count, 5, "待重试行必须保留主 D1 根表历史 child_count");
 
     // 2f) 正常 D1 + 主 R2 r-r2-err 仍报错：r-r2-err 保持可重试、r-d1-only 捞出主 D1 独有扁平子评论、r-main-th-cnt 保留 child_count=6、r-remote-cnt 保留 child_count=7
     await runWithDb(d1, () =>
@@ -6372,7 +6381,7 @@ test("[PR2-10] auth.ts 外部存储 /test 慢探测期间并发编辑/新增/删
 
     await call("POST", "/external-targets", {
       headers: authHeaders,
-      body: { id: idA, name: "Target A Renamed", provider: "turso", endpointUrl: "https://a-new.turso.io", syncScopes: ["comments"] }
+      body: { id: idA, name: "Target A Renamed", provider: "turso", endpointUrl: "https://a.turso.io", syncScopes: ["comments"] }
     });
     await call("POST", "/external-targets", {
       headers: authHeaders,
@@ -6389,8 +6398,72 @@ test("[PR2-10] auth.ts 外部存储 /test 慢探测期间并发编辑/新增/删
     assert.equal(afterConcurrentEdit.length, 2, "新增的目标 B 不得被探测写回覆盖丢失");
     const targetA = afterConcurrentEdit.find(t => t.id === idA);
     assert.equal(targetA.name, "Target A Renamed", "并发重命名不得被探测前的旧快照覆盖");
-    assert.equal(targetA.endpointUrl, "https://a-new.turso.io");
-    assert.equal(targetA.lastTestOk, true);
+    assert.equal(targetA.endpointUrl, "https://a.turso.io");
+    assert.equal(targetA.lastTestOk, true, "并发只改非连接字段时必须正常写回本次探测结果");
+
+    // 1b) 探测期间并发修改该目标的 endpointUrl / authToken：探测结果不得贴到新连接配置上
+    const createE = await call("POST", "/external-targets", {
+      headers: authHeaders,
+      body: { name: "Target E", provider: "turso", endpointUrl: "https://e.turso.io", authToken: "tokE", syncScopes: ["comments"] }
+    });
+    const idE = createE.body.target.id;
+    let probeStartedEResolve;
+    const probeStartedE = new Promise(r => { probeStartedEResolve = r; });
+    globalThis.fetch = async () => {
+      probeStartedEResolve();
+      await new Promise(r => { releaseProbe = r; });
+      return { ok: true, status: 200, json: async () => ({ results: [{ type: "ok" }] }), text: async () => "" };
+    };
+    const testChangedPromise = call("POST", "/external-targets/test", {
+      headers: authHeaders,
+      body: { id: idE }
+    });
+    await probeStartedE;
+    const editE = await call("POST", "/external-targets", {
+      headers: authHeaders,
+      body: { id: idE, name: "Target E Renamed", provider: "turso", endpointUrl: "https://e-changed.turso.io", authToken: "tokE2", syncScopes: ["comments"] }
+    });
+    assert.equal(editE.status, 200);
+    releaseProbe();
+    const testChangedRes = await testChangedPromise;
+    assert.equal(testChangedRes.status, 200);
+    assert.equal(testChangedRes.body.ok, true, "探测本身仍要正常返回结果");
+    assert.equal(testChangedRes.body.target, undefined, "连接配置已被并发修改时必须跳过写回");
+
+    auth.invalidateExternalTargetsCache();
+    const afterConnEdit = await runWithDb(d1, () => auth.getExternalTargetsRaw(bucket));
+    const targetE = afterConnEdit.find(t => t.id === idE);
+    assert.equal(targetE.endpointUrl, "https://e-changed.turso.io", "并发编辑后的新连接配置必须保留");
+    assert.equal(targetE.authToken, "tokE2");
+    assert.equal(targetE.lastTestAt, null, "旧配置的探测结果不得污染新配置 lastTestAt");
+    assert.equal(targetE.lastTestOk, null, "旧配置的探测结果不得污染新配置 lastTestOk");
+    assert.equal(targetE.lastTestMsg, null, "旧配置的探测结果不得污染新配置 lastTestMsg");
+
+    // 1c) 前端编辑表单携带未保存的草稿配置点「先测试连接」：返回草稿探测结果，但不覆写已保存目标的 lastTest*
+    auth.invalidateExternalTargetsCache();
+    const beforeDraftTest = (await runWithDb(d1, () => auth.getExternalTargetsRaw(bucket))).find(t => t.id === idA);
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ results: [{ type: "ok" }] }), text: async () => "" });
+    const draftTestRes = await call("POST", "/external-targets/test", {
+      headers: authHeaders,
+      body: { id: idA, endpointUrl: "https://a-draft.turso.io", authToken: "tokDraft" }
+    });
+    assert.equal(draftTestRes.status, 200);
+    assert.equal(draftTestRes.body.ok, true);
+    assert.equal(draftTestRes.body.target, undefined, "草稿配置的探测结果不得写回已保存目标");
+    auth.invalidateExternalTargetsCache();
+    const afterDraftTest = (await runWithDb(d1, () => auth.getExternalTargetsRaw(bucket))).find(t => t.id === idA);
+    assert.equal(afterDraftTest.endpointUrl, "https://a.turso.io", "草稿配置不得被 /test 落库");
+    assert.equal(afterDraftTest.authToken, "tokA", "草稿 token 不得被 /test 落库");
+    assert.equal(afterDraftTest.lastTestAt, beforeDraftTest.lastTestAt, "草稿探测不得覆写已保存目标的 lastTestAt");
+    assert.equal(afterDraftTest.lastTestOk, beforeDraftTest.lastTestOk, "草稿探测不得覆写已保存目标的 lastTestOk");
+    assert.equal(afterDraftTest.lastTestMsg, beforeDraftTest.lastTestMsg, "草稿探测不得覆写已保存目标的 lastTestMsg");
+
+    // 清理临时目标 E，保持后续并发删除/新增用例的原始目标数量假设
+    const deleteE = await call("POST", "/external-targets/delete", {
+      headers: authHeaders,
+      body: { id: idE }
+    });
+    assert.equal(deleteE.status, 200);
 
     // 2) 探测期间并发删除目标 A：探测结束后跳过写回，绝不复活 A
     let probeStarted2Resolve;
@@ -6513,6 +6586,557 @@ test("[PR2-10] auth.ts 外部存储 /test 慢探测期间并发编辑/新增/删
   } finally {
     globalThis.fetch = originalFetch;
     auth.invalidateExternalTargetsCache();
+  }
+});
+
+test("[PR2-P2-1] /external-targets 编辑已并发删除的目标返回 409，不误新建也不触发无意义 CAS 重试", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  const { d1 } = createMemoryDb();
+  const store = new Map();
+  let metaGets = 0;
+  const bucket = {
+    async get(k) {
+      if (k === auth.R2_EXTERNAL_TARGETS_KEY) metaGets++;
+      const v = store.get(k);
+      return v === undefined ? null : { async text() { return v; } };
+    },
+    async put(k, v) { store.set(k, String(v)); },
+    async delete(k) { store.delete(k); }
+  };
+  const env = { API_SECRET: "unit-secret", BUCKET: bucket };
+  const authHeaders = { authorization: "Bearer unit-secret" };
+  const call = (method, p, init) => runWithDb(d1, () => auth.authRoutes.__call(method, p, init, env));
+
+  const created = await call("POST", "/external-targets", {
+    headers: authHeaders,
+    body: { name: "并发删除目标", provider: "turso", endpointUrl: "https://deleted.turso.io", syncScopes: ["comments"] }
+  });
+  assert.equal(created.status, 200);
+  const id = created.body.target.id;
+
+  const deleted = await call("POST", "/external-targets/delete", {
+    headers: authHeaders,
+    body: { id }
+  });
+  assert.equal(deleted.status, 200);
+
+  auth.invalidateExternalTargetsCache();
+  metaGets = 0;
+  // 模拟并发删除后前端仍拿旧 id 提交未保存的编辑：必须 409，绝不能静默新建一条复活配置
+  const staleEdit = await call("POST", "/external-targets", {
+    headers: authHeaders,
+    body: {
+      id,
+      name: "复活尝试",
+      provider: "turso",
+      endpointUrl: "https://resurrect.turso.io",
+      syncScopes: ["comments"]
+    }
+  });
+  assert.equal(staleEdit.status, 409);
+  assert.equal(staleEdit.body.conflict, true);
+  assert.match(staleEdit.body.error, /不存在|已被删除/);
+  assert.equal(metaGets, 1, "直接 return 409 不得 throw 冲突并空跑 2 次 CAS 重试");
+
+  auth.invalidateExternalTargetsCache();
+  const after = await runWithDb(d1, () => auth.getExternalTargetsRaw(bucket));
+  assert.deepEqual(after, [], "并发删除后旧 id 编辑绝不可新建/复活目标");
+  assert.equal(store.get(auth.R2_EXTERNAL_TARGETS_KEY), "[]", "R2 镜像必须保持已删除状态");
+
+  // 正常新建（不带 id）仍然可用，且不会误判为过期编辑
+  const fresh = await call("POST", "/external-targets", {
+    headers: authHeaders,
+    body: { name: "正常新建", provider: "turso", endpointUrl: "https://fresh.turso.io", syncScopes: ["comments"] }
+  });
+  assert.equal(fresh.status, 200);
+  auth.invalidateExternalTargetsCache();
+});
+
+test("[PR2-P2-2] D1 故障降级写 R2 使用原生 onlyIf CAS，读不到 R2 版本时拒绝盲写", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  const { d1 } = createMemoryDb();
+  const env = { API_SECRET: "unit-secret" };
+  const authHeaders = { authorization: "Bearer unit-secret" };
+  const concurrentTarget = {
+    id: "ext-concurrent",
+    name: "Concurrent Writer",
+    provider: "turso",
+    enabled: true,
+    syncScopes: ["comments"],
+    storageRole: "offload",
+    overflowThresholdRows: 1500000,
+    endpointUrl: "https://concurrent.turso.io",
+    authToken: "tokC",
+    createdAt: NOW_ISO,
+    updatedAt: NOW_ISO
+  };
+  const makeTargetBody = name => ({
+    name,
+    provider: "turso",
+    endpointUrl: `https://${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.turso.io`,
+    authToken: "tok",
+    syncScopes: ["comments"]
+  });
+
+  const failingD1 = {
+    prepare() {
+      const fail = async () => { throw new Error("D1 outage"); };
+      return {
+        bind() { return { first: fail, all: fail, run: fail }; },
+        first: fail,
+        all: fail,
+        run: fail
+      };
+    },
+    batch: async () => { throw new Error("D1 outage"); }
+  };
+
+  const createEtagBucket = () => {
+    const objects = new Map();
+    const puts = [];
+    let seq = 0;
+    let beforePut = null;
+    const seed = (key, body) => {
+      const etag = `etag-${++seq}`;
+      objects.set(key, { body: String(body), etag, customMetadata: {} });
+      return etag;
+    };
+    const bucket = {
+      objects,
+      puts,
+      seed,
+      setBeforePut(fn) { beforePut = fn; },
+      async get(key) {
+        const entry = objects.get(key);
+        if (!entry) return null;
+        return {
+          etag: entry.etag,
+          httpEtag: `"${entry.etag}"`,
+          customMetadata: entry.customMetadata,
+          async text() { return entry.body; }
+        };
+      },
+      async put(key, body, opts = {}) {
+        puts.push({ key, opts, body: String(body) });
+        if (beforePut) await beforePut({ bucket, key, body, opts, count: puts.length });
+        const current = objects.get(key) ?? null;
+        const onlyIf = opts.onlyIf;
+        if (onlyIf) {
+          if ("etagMatches" in onlyIf && (!current || current.etag !== onlyIf.etagMatches)) return null;
+          if ("etagDoesNotMatch" in onlyIf && current) return null;
+        }
+        const etag = `etag-${++seq}`;
+        objects.set(key, { body: String(body), etag, customMetadata: opts.customMetadata || {} });
+        return { etag, httpEtag: `"${etag}"` };
+      },
+      async delete(key) { objects.delete(key); }
+    };
+    return bucket;
+  };
+
+  // 1) R2 对象尚不存在（expectedR2Etag=null）：onlyIf etagDoesNotMatch "*" 允许首次创建
+  {
+    auth.invalidateExternalTargetsCache();
+    const bucket = createEtagBucket();
+    const res = await runWithDb(failingD1, () =>
+      auth.authRoutes.__call("POST", "/external-targets", {
+        headers: authHeaders,
+        body: makeTargetBody("Null Etag")
+      }, { ...env, BUCKET: bucket })
+    );
+    assert.equal(res.status, 200);
+    assert.deepEqual(bucket.puts[0]?.opts?.onlyIf, { etagDoesNotMatch: "*" });
+    assert.equal(JSON.parse(bucket.objects.get(auth.R2_EXTERNAL_TARGETS_KEY).body).length, 1);
+  }
+
+  // 2) D1 失败 + R2 onlyIf 匹配（expectedR2Etag=当前 etag）：降级写成功
+  {
+    auth.invalidateExternalTargetsCache();
+    const bucket = createEtagBucket();
+    const seededEtag = bucket.seed(auth.R2_EXTERNAL_TARGETS_KEY, "[]");
+    const res = await runWithDb(failingD1, () =>
+      auth.authRoutes.__call("POST", "/external-targets", {
+        headers: authHeaders,
+        body: makeTargetBody("Cas Match")
+      }, { ...env, BUCKET: bucket })
+    );
+    assert.equal(res.status, 200, "D1 故障时 R2 版本校验通过必须降级写成功");
+    assert.deepEqual(bucket.puts[0]?.opts?.onlyIf, { etagMatches: seededEtag });
+    const stored = JSON.parse(bucket.objects.get(auth.R2_EXTERNAL_TARGETS_KEY).body);
+    assert.equal(stored.length, 1);
+    assert.equal(stored[0].name, "Cas Match");
+  }
+
+  // 3) 首轮 onlyIf 返回 null（并发 R2 写入）→ 自动重读重试成功，且不覆盖并发写入
+  {
+    auth.invalidateExternalTargetsCache();
+    const bucket = createEtagBucket();
+    bucket.seed(auth.R2_EXTERNAL_TARGETS_KEY, "[]");
+    let injected = 0;
+    bucket.setBeforePut(({ bucket, key, count }) => {
+      if (count === 1) {
+        injected++;
+        bucket.seed(key, JSON.stringify([concurrentTarget]));
+      }
+    });
+    const res = await runWithDb(failingD1, () =>
+      auth.authRoutes.__call("POST", "/external-targets", {
+        headers: authHeaders,
+        body: makeTargetBody("Retry After Conflict")
+      }, { ...env, BUCKET: bucket })
+    );
+    assert.equal(res.status, 200, "单次 R2 并发冲突必须自动重读重试并成功");
+    assert.equal(injected, 1);
+    assert.equal(bucket.puts.length, 2);
+    assert.equal(typeof bucket.puts[1].opts.onlyIf.etagMatches, "string");
+    assert.notEqual(bucket.puts[0].opts.onlyIf.etagMatches, bucket.puts[1].opts.onlyIf.etagMatches);
+    const stored = JSON.parse(bucket.objects.get(auth.R2_EXTERNAL_TARGETS_KEY).body);
+    assert.equal(stored.length, 2, "重试必须基于并发写入后的最新配置合并");
+    assert.ok(stored.some(t => t.id === "ext-concurrent"), "并发写入的目标不得被覆盖丢失");
+    assert.ok(stored.some(t => t.name === "Retry After Conflict"));
+  }
+
+  // 4) 持续冲突耗尽重试：HTTP 409，绝不覆盖并发写入
+  {
+    auth.invalidateExternalTargetsCache();
+    const bucket = createEtagBucket();
+    bucket.seed(auth.R2_EXTERNAL_TARGETS_KEY, JSON.stringify([concurrentTarget]));
+    bucket.setBeforePut(({ bucket, key }) => {
+      // 每次 put 前都模拟另一个 isolate 抢先写入，版本始终变化
+      bucket.seed(key, JSON.stringify([concurrentTarget]));
+    });
+    const res = await runWithDb(failingD1, () =>
+      auth.authRoutes.__call("POST", "/external-targets", {
+        headers: authHeaders,
+        body: makeTargetBody("Never Wins")
+      }, { ...env, BUCKET: bucket })
+    );
+    assert.equal(res.status, 409);
+    assert.equal(res.body.conflict, true);
+    assert.equal(bucket.puts.length, 3, "首轮 + 最多 2 次重试");
+    const stored = JSON.parse(bucket.objects.get(auth.R2_EXTERNAL_TARGETS_KEY).body);
+    assert.deepEqual(stored.map(t => t.id), ["ext-concurrent"], "持续冲突时绝不可覆盖并发写入");
+  }
+
+  // 5) R2 读取失败拿不到版本（expectedR2Etag=undefined）：拒绝盲写并抛错，绝不返回 ok:true
+  {
+    auth.invalidateExternalTargetsCache();
+    const bucket = createEtagBucket();
+    bucket.get = async key => {
+      if (key === auth.R2_EXTERNAL_TARGETS_KEY) throw new Error("R2 read outage");
+      return null;
+    };
+    await assert.rejects(
+      () => runWithDb(failingD1, () =>
+        auth.authRoutes.__call("POST", "/external-targets", {
+          headers: authHeaders,
+          body: makeTargetBody("Blind Write")
+        }, { ...env, BUCKET: bucket })
+      ),
+      /D1 outage/
+    );
+    assert.equal(bucket.puts.length, 0, "无法校验 R2 版本时拒绝盲写，不得覆盖对象");
+  }
+});
+
+test("[PR2-P2-4] 0 活回复归档失败留下 needs_thread_retry=1 待重试索引行（主 D1 / offload 双路径），爬虫据此重抓", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+  const makeZeroRoot = id => ({
+    id,
+    author: "Root",
+    authorAvatar: "",
+    content: "root",
+    img: "",
+    time: NOW_ISO,
+    location: "",
+    likes: 1,
+    isAuthor: false,
+    isTop: false,
+    isFeatured: false,
+    childCount: 0,
+    isChildrenComplete: true,
+    children: []
+  });
+
+  // 1) 主 D1：活根原有回复在原站删光，本轮 R2 读取失败 → 不写空快照，但留下待重试索引行
+  {
+    const { sqlite, d1 } = createMemoryDb();
+    seedContent(sqlite);
+    sqlite.prepare(`
+      INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, child_count, first_seen_at, last_seen_at, is_deleted)
+      VALUES ('r-main-live-empty', ?, NULL, 'Root', 'root', 1, 'h-main', 2, ?, ?, 0)
+    `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+    sqlite.prepare(`
+      INSERT INTO comment_threads (root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at)
+      VALUES ('r-main-live-empty', ?, 'childcomments/r-main-live-empty.json', 2, 1, 'th-main', 'in-main', '[]', ?)
+    `).run(CONTENT_PK, NOW_ISO);
+    const r2Store = new Map([
+      ["childcomments/r-main-live-empty.json", JSON.stringify({
+        children: [
+          { id: "main-old-1", author: "A", content: "old 1", likes: 1 },
+          { id: "main-old-2", author: "B", content: "old 2", likes: 2 }
+        ],
+        complete: true
+      })]
+    ]);
+    let failKey = "childcomments/r-main-live-empty.json";
+    const bucket = {
+      async get(k) {
+        if (failKey && k === failKey) throw new Error("R2 read outage");
+        const v = r2Store.get(k);
+        return v === undefined ? null : { async text() { return v; } };
+      },
+      async put(k, v) { r2Store.set(k, String(v)); },
+      async delete() {}
+    };
+
+    const payload = {
+      contentPk: CONTENT_PK,
+      partial: false,
+      allRootIds: ["r-main-live-empty", "r-main-brand-new"],
+      roots: [makeZeroRoot("r-main-live-empty"), makeZeroRoot("r-main-brand-new")]
+    };
+    await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(payload, { DB: d1, BUCKET: bucket }));
+
+    const thread = sqlite.prepare(
+      `SELECT child_count, is_complete, thread_hash, incoming_hash FROM comment_threads WHERE root_id = 'r-main-live-empty'`
+    ).get();
+    assert.equal(thread.is_complete, 0, "归档失败必须保持可重试 is_complete=0");
+    assert.equal(thread.incoming_hash, "");
+    assert.equal(thread.thread_hash, "th-main");
+    assert.equal(thread.child_count, 2, "失败时 child_count 必须保留既有历史水位");
+    const brandNewThread = sqlite.prepare(
+      `SELECT root_id FROM comment_threads WHERE root_id = 'r-main-brand-new'`
+    ).get();
+    assert.equal(brandNewThread, undefined, "全新 0 回复根不得凭空写线程索引行");
+
+    const rows = await runWithDb(d1, () =>
+      commentsModule.listRootComments(d1, CONTENT_PK, { limit: 10, offset: 0, liveOnly: true }, bucket)
+    );
+    const retryRow = rows.find(r => r.id === "r-main-live-empty");
+    assert.equal(retryRow.child_count, 0, "live_only=1 必须返回现网 child_count=0");
+    assert.equal(retryRow.is_complete, 0);
+    assert.equal(retryRow.needs_thread_retry, 1, "归档失败必须暴露 needs_thread_retry=1");
+    const brandNewRow = rows.find(r => r.id === "r-main-brand-new");
+    assert.equal(brandNewRow.child_count, 0);
+    assert.equal(brandNewRow.is_complete, 0);
+    assert.equal(brandNewRow.needs_thread_retry, 0, "全新 0 回复根不得误触发重试");
+
+    // 归档恢复成功后：旧回复标 isDeleted 归档，needs_thread_retry 归 0
+    failKey = null;
+    await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(payload, { DB: d1, BUCKET: bucket }));
+    const threadAfter = sqlite.prepare(
+      `SELECT child_count, is_complete FROM comment_threads WHERE root_id = 'r-main-live-empty'`
+    ).get();
+    assert.equal(threadAfter.is_complete, 1);
+    assert.equal(threadAfter.child_count, 2);
+    const archived = JSON.parse(r2Store.get("childcomments/r-main-live-empty.json"));
+    assert.deepEqual(archived.children.map(c => c.id).sort(), ["main-old-1", "main-old-2"]);
+    assert.ok(archived.children.every(c => c.isDeleted === true));
+    const rowsAfter = await runWithDb(d1, () =>
+      commentsModule.listRootComments(d1, CONTENT_PK, { limit: 10, offset: 0, liveOnly: true }, bucket)
+    );
+    assert.equal(rowsAfter.find(r => r.id === "r-main-live-empty").needs_thread_retry, 0);
+  }
+
+  // 2) offload：活根原有回复在原站删光，本轮外部库 blob 读取失败 → 不用空快照覆盖，留下待重试行
+  {
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+    const remoteSqlite = new Database(":memory:");
+    const offloadTarget = {
+      id: "ext-pr2-needs-retry",
+      name: "Turso Needs Retry",
+      provider: "turso",
+      enabled: true,
+      syncScopes: ["comments"],
+      storageRole: "offload",
+      overflowThresholdRows: 1500000,
+      endpointUrl: "https://ext-pr2-needs-retry.example.com",
+      authToken: "tok",
+      createdAt: NOW_ISO,
+      updatedAt: NOW_ISO
+    };
+    const originalFetch = globalThis.fetch;
+    let failBlobRead = false;
+    globalThis.fetch = async (_url, init = {}) => {
+      const body = JSON.parse(String(init.body));
+      const results = [];
+      for (const req of body.requests) {
+        if (req.type === "close") { results.push({ type: "ok", response: { type: "close" } }); continue; }
+        const sql = req.stmt.sql;
+        if (failBlobRead && /SELECT root_id, payload_json FROM child_comment_blobs WHERE root_id IN/i.test(sql)) {
+          throw new Error("remote blob read failed");
+        }
+        const args = (req.stmt.args || []).map(a => (!a || a.type === "null") ? null : (a.type === "integer" || a.type === "float") ? Number(a.value) : String(a.value));
+        const st = remoteSqlite.prepare(sql);
+        if (st.reader) {
+          const cols = st.columns().map(c => ({ name: c.name }));
+          const rows = st.all(...args).map(r => cols.map(c => tursoCell(r[c.name])));
+          results.push({ type: "ok", response: { type: "execute", result: { cols, rows, affected_row_count: 0, last_insert_rowid: null } } });
+        } else {
+          const info = st.run(...args);
+          results.push({ type: "ok", response: { type: "execute", result: { cols: [], rows: [], affected_row_count: info.changes, last_insert_rowid: null } } });
+        }
+      }
+      return { ok: true, status: 200, json: async () => ({ results }), text: async () => "" };
+    };
+    const offloadBucket = {
+      async get(k) {
+        if (k === auth.R2_EXTERNAL_TARGETS_KEY) {
+          return { async text() { return JSON.stringify([offloadTarget]); } };
+        }
+        return null;
+      },
+      async put() {},
+      async delete() {}
+    };
+    const { sqlite: mainSqlite, d1: mainD1 } = createMemoryDb();
+    seedContent(mainSqlite);
+
+    try {
+      await auth.ensureRemoteCommentSchema(offloadTarget);
+      remoteSqlite.prepare(`
+        INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, child_count, first_seen_at, last_seen_at, is_deleted)
+        VALUES ('r-off-live-empty', ?, NULL, 'Root', 'off root', 1, 'h-off', 2, ?, ?, 0)
+      `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+      remoteSqlite.prepare(`
+        INSERT INTO comment_threads (root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at)
+        VALUES ('r-off-live-empty', ?, 'childcomments/r-off-live-empty.json', 2, 1, 'th-off', 'in-off', '[]', ?)
+      `).run(CONTENT_PK, NOW_ISO);
+      remoteSqlite.prepare(`
+        INSERT INTO child_comment_blobs (root_id, content_pk, payload_json, complete, updated_at)
+        VALUES ('r-off-live-empty', ?, ?, 1, ?)
+      `).run(CONTENT_PK, JSON.stringify({
+        children: [
+          { id: "off-old-1", author: "A", content: "old off 1", likes: 1 },
+          { id: "off-old-2", author: "B", content: "old off 2", likes: 2 }
+        ],
+        complete: true
+      }), NOW_ISO);
+      remoteSqlite.prepare(`
+        INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, child_count, first_seen_at, last_seen_at, is_deleted)
+        VALUES ('r-off-brand-new', ?, NULL, 'Root', 'brand new', 1, 'h-new', 0, ?, ?, 0)
+      `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+
+      const payload = {
+        contentPk: CONTENT_PK,
+        partial: false,
+        allRootIds: ["r-off-live-empty", "r-off-brand-new"],
+        roots: [makeZeroRoot("r-off-live-empty"), makeZeroRoot("r-off-brand-new")]
+      };
+
+      failBlobRead = true;
+      await runWithDb(mainD1, () => commentsModule.replaceCommentsByRoot(payload, { DB: mainD1, BUCKET: offloadBucket }));
+
+      const blobBefore = remoteSqlite.prepare(
+        `SELECT payload_json FROM child_comment_blobs WHERE root_id = 'r-off-live-empty'`
+      ).get();
+      const parsedBefore = JSON.parse(blobBefore.payload_json);
+      assert.deepEqual(parsedBefore.children.map(c => c.id).sort(), ["off-old-1", "off-old-2"], "失败时绝不能用空快照覆盖既有楼中楼");
+      assert.ok(parsedBefore.children.every(c => c.isDeleted !== true));
+      const thread = remoteSqlite.prepare(
+        `SELECT child_count, is_complete, thread_hash, incoming_hash FROM comment_threads WHERE root_id = 'r-off-live-empty'`
+      ).get();
+      assert.equal(thread.is_complete, 0);
+      assert.equal(thread.incoming_hash, "");
+      assert.equal(thread.thread_hash, "th-off");
+      assert.equal(thread.child_count, 2, "失败时 child_count 必须保留既有历史水位");
+      assert.equal(
+        remoteSqlite.prepare(`SELECT root_id FROM comment_threads WHERE root_id = 'r-off-brand-new'`).get(),
+        undefined,
+        "全新 0 回复根不得凭空写线程索引行"
+      );
+
+      const rows = await runWithDb(mainD1, () =>
+        commentsModule.listRootComments(mainD1, CONTENT_PK, { limit: 10, offset: 0, liveOnly: true }, offloadBucket)
+      );
+      const retryRow = rows.find(r => r.id === "r-off-live-empty");
+      assert.equal(retryRow.child_count, 0);
+      assert.equal(retryRow.is_complete, 0);
+      assert.equal(retryRow.needs_thread_retry, 1, "offload 归档失败必须暴露 needs_thread_retry=1");
+      const brandNewRow = rows.find(r => r.id === "r-off-brand-new");
+      assert.equal(brandNewRow.needs_thread_retry, 0, "offload 全新 0 回复根不得误触发重试");
+
+      failBlobRead = false;
+      await runWithDb(mainD1, () => commentsModule.replaceCommentsByRoot(payload, { DB: mainD1, BUCKET: offloadBucket }));
+      const blobAfter = remoteSqlite.prepare(
+        `SELECT payload_json, complete FROM child_comment_blobs WHERE root_id = 'r-off-live-empty'`
+      ).get();
+      const parsedAfter = JSON.parse(blobAfter.payload_json);
+      assert.deepEqual(parsedAfter.children.map(c => c.id).sort(), ["off-old-1", "off-old-2"]);
+      assert.ok(parsedAfter.children.every(c => c.isDeleted === true));
+      assert.equal(blobAfter.complete, 1);
+      const threadAfter = remoteSqlite.prepare(
+        `SELECT child_count, is_complete FROM comment_threads WHERE root_id = 'r-off-live-empty'`
+      ).get();
+      assert.equal(threadAfter.is_complete, 1);
+      assert.equal(threadAfter.child_count, 2);
+      const rowsAfter = await runWithDb(mainD1, () =>
+        commentsModule.listRootComments(mainD1, CONTENT_PK, { limit: 10, offset: 0, liveOnly: true }, offloadBucket)
+      );
+      assert.equal(rowsAfter.find(r => r.id === "r-off-live-empty").needs_thread_retry, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
+  // 3) 爬虫消费 needs_thread_retry：即使 comment_count 未变化且 child_count=0 也要重抓；归档成功后不再重复
+  {
+    const crawlerSrc = readFileSync(crawlerMainPath, "utf8").replace(/\r\n/g, "\n");
+    const crawlerJs = ts.transpileModule(crawlerSrc, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+    }).outputText;
+    const extractTopLevelFunction = (src, name) => {
+      const start = src.indexOf(`function ${name}(`);
+      assert.ok(start >= 0, `源码中缺少函数 ${name}`);
+      const end = src.indexOf("\n}\n", start);
+      assert.ok(end >= 0, `函数 ${name} 缺少顶层结束括号`);
+      return src.slice(start, end + 3);
+    };
+    const fnBlock = [
+      extractTopLevelFunction(crawlerJs, "shouldSyncComments"),
+      extractTopLevelFunction(crawlerJs, "isStoredRootCommentRow"),
+      "async " + extractTopLevelFunction(crawlerJs, "fetchStoredCommentState"),
+      "async " + extractTopLevelFunction(crawlerJs, "shouldSyncCommentsDeep")
+    ].join("\n");
+    let returnedRows = [];
+    const ctx = vm.createContext({
+      apiUrl: "https://worker.example",
+      apiSecret: "sec",
+      commentSyncIncomplete: new Set(),
+      fetch: async () => ({ ok: true, json: async () => ({ data: returnedRows }) })
+    });
+    vm.runInContext(
+      `${fnBlock}\nglobalThis.__state = fetchStoredCommentState;\nglobalThis.__deep = shouldSyncCommentsDeep;`,
+      ctx
+    );
+
+    // 归档失败：needs_thread_retry=1，child_count=0 且 comment_count 未变化也必须重抓
+    returnedRows = [{ child_count: 0, is_complete: 0, needs_thread_retry: 1, thread_synced_at: NOW_ISO }];
+    const retryState = await ctx.__state("answer:needs-retry");
+    assert.equal(retryState.incompleteRoots, 1);
+    assert.equal(await ctx.__deep("answer:needs-retry", 1, 1, "full"), true);
+
+    // 归档成功：needs_thread_retry=0，不再重复抓取
+    returnedRows = [{ child_count: 0, is_complete: 1, needs_thread_retry: 0, thread_synced_at: NOW_ISO }];
+    const doneState = await ctx.__state("answer:needs-retry-done");
+    assert.equal(doneState.incompleteRoots, 0);
+    assert.equal(await ctx.__deep("answer:needs-retry-done", 1, 1, "full"), false);
+
+    // 全新 0 回复根（无 comment_threads 行）与闭评冻结 is_complete=2 均不误触发
+    returnedRows = [{ child_count: 0, is_complete: 0, needs_thread_retry: 0, thread_synced_at: null }];
+    assert.equal((await ctx.__state("answer:brand-new-zero")).incompleteRoots, 0);
+    returnedRows = [{ child_count: 0, is_complete: 2, needs_thread_retry: 0, thread_synced_at: NOW_ISO }];
+    assert.equal((await ctx.__state("answer:closed-zero")).incompleteRoots, 0);
+
+    // 兼容旧接口：无 needs_thread_retry 字段但已有线程同步时间且 is_complete=0 时仍触发重抓
+    returnedRows = [{ child_count: 0, is_complete: 0, thread_synced_at: NOW_ISO }];
+    assert.equal((await ctx.__state("answer:legacy-retry")).incompleteRoots, 1);
   }
 });
 
