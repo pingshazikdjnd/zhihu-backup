@@ -3279,3 +3279,97 @@ test("crawler fetchStoredCommentState 采信服务端显式 has_incomplete_roots
   assert.equal(incompleteState.incompleteRoots, 1, "服务端显式 has_incomplete_roots: true 强制 >= 1");
   assert.equal(await ctx.__deep("answer:explicit-incomplete", 2, 2, "full"), true);
 });
+
+test("releaseSyncLockBeforeExit 在 syncLockSkippedOnAbort=true 时直接 0 次 fetch 返回，且 abortSignalHandled=true 时绝不调用 Actor.exit", async () => {
+  const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const crawlerRequire = createRequire(path.join(ROOT, "apps", "apify-crawler", "package.json"));
+  const tsMod = await import(pathToFileURL(crawlerRequire.resolve("typescript")).href);
+  const ts = tsMod.default ?? tsMod;
+  const crawlerJs = ts.transpileModule(crawlerSrc, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+  }).outputText;
+
+  const fnCode = [
+    "async " + extractFunction(crawlerJs, "releaseSyncLockBeforeExit"),
+    "async " + extractFunction(crawlerJs, "handleAbortExitBeforeExit")
+  ].join("\n");
+
+  let fetchCalls = 0;
+  let actorExitCalls = 0;
+  let actorExitCode = null;
+  let actorFailCalls = 0;
+  let processExitCalls = 0;
+
+  const ctx = vm.createContext({
+    AbortSignal,
+    Error,
+    Promise,
+    syncOwnerId: "owner-test",
+    apiUrl: "https://worker.example",
+    apiSecret: "sec",
+    syncLockReleasePromise: null,
+    fetch: async () => {
+      fetchCalls++;
+      return { ok: true, json: async () => ({ ok: true }) };
+    },
+    Actor: {
+      exit: async opts => {
+        actorExitCalls++;
+        actorExitCode = opts?.exitCode;
+      },
+      fail: async () => {
+        actorFailCalls++;
+      }
+    },
+    process: {
+      exit: () => {
+        processExitCalls++;
+      }
+    },
+    stopWorkAndReleaseSyncLock: async () => {}
+  });
+
+  const prefix = `
+    let abortRequested = true;
+    let syncLockSkippedOnAbort = false;
+    let abortSignalHandled = false;
+  `;
+
+  vm.runInContext(
+    `${prefix}\n${fnCode}
+    globalThis.__release = releaseSyncLockBeforeExit;
+    globalThis.__handleAbort = handleAbortExitBeforeExit;
+    globalThis.__setSkipped = v => { syncLockSkippedOnAbort = v; };
+    globalThis.__setSignalHandled = v => { abortSignalHandled = v; };`,
+    ctx
+  );
+
+  // 1) 验证 releaseSyncLockBeforeExit() 在 syncLockSkippedOnAbort = true 时直接 0 次 fetch 返回
+  fetchCalls = 0;
+  ctx.__setSkipped(true);
+  await ctx.__release();
+  assert.equal(fetchCalls, 0, "syncLockSkippedOnAbort=true 时调用 releaseSyncLockBeforeExit 必须产生 0 次 fetch");
+
+  // 对照组：syncLockSkippedOnAbort = false 时会正常发出 1 次 fetch 释放请求
+  fetchCalls = 0;
+  ctx.__setSkipped(false);
+  await ctx.__release();
+  assert.equal(fetchCalls, 1, "syncLockSkippedOnAbort=false 时正常发起 1 次 release fetch");
+
+  // 2) 验证 abortSignalHandled = true 时 handleAbortExitBeforeExit() 绝不调用 Actor.exit / Actor.fail / process.exit
+  actorExitCalls = 0;
+  actorFailCalls = 0;
+  processExitCalls = 0;
+  ctx.__setSignalHandled(true);
+
+  // handleAbortExitBeforeExit 在 abortSignalHandled=true 时会等待 handleCrawlerSignal 的退出
+  // 用短定时器等待，确保微任务队列执行后仍绝不调用 Actor.exit
+  ctx.__handleAbort();
+  await new Promise(resolve => setTimeout(resolve, 30));
+
+  assert.equal(actorExitCalls, 0, "abortSignalHandled=true 时绝不可调用 Actor.exit（交由信号钩子 process.exit）");
+  assert.equal(actorFailCalls, 0, "abortSignalHandled=true 时绝不可调用 Actor.fail");
+  assert.equal(processExitCalls, 0, "abortSignalHandled=true 时不在 handleAbort 内部重复调用 process.exit");
+});
