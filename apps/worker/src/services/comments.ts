@@ -255,6 +255,9 @@ type ExistingRootRow = {
   time_text: string | null;
   location: string | null;
   child_count: number;
+  /** 软删根的新鲜度判断用（与 deleted_at 取最大值），随根行一次 SELECT 取回，无额外查询 */
+  last_seen_at: string | null;
+  deleted_at: string | null;
 };
 
 export type ChildCommentRecord = Record<string, unknown> & { id: string; isDeleted?: boolean };
@@ -290,6 +293,8 @@ type ExistingThreadRow = {
   thread_hash: string;
   incoming_hash: string;
   preview_json: string;
+  /** 收敛时间：命中「已确认收敛」快路径后按需刷新，防止非活跃库更晚的失败记录反复触发重抓 */
+  synced_at: string | null;
 };
 
 export type RootCommentRow = {
@@ -491,6 +496,165 @@ async function readStoredChildThread(
   }
 }
 
+// ---------------------------------------------------------------------------
+// 「已确认收敛但命中快路径」的按需刷新
+//
+// 场景：实际写入库里已有较早的完整快照（is_complete=1, synced_at=T1），非活跃库
+// 还残留更晚的失败记录（is_complete=0, synced_at=T2 > T1）。补抓回来的回复若与 T1
+// 完全一致，写路径会命中快路径直接跳过，synced_at 停留在 T1，hasIncompleteLiveRoot
+// 每轮都会再次判定未收敛 → 无休止全量重抓。
+// 因此只在「本轮已确认收敛」的快路径上按需探测非活跃库；若确有更晚的未完成活根
+// 时间戳，才在实际写入库执行一条轻量 UPDATE，把 synced_at（或已软删根的
+// last_seen_at）推过 T2。平时重复同步仍然 0 写入。
+// ---------------------------------------------------------------------------
+
+/** 与 hasIncompleteLiveRoot 完全一致的「未完成活根」判定条件（contentPk 占位符在前） */
+const INCOMPLETE_LIVE_ROOT_WHERE_SQL = `
+    FROM comments c
+    LEFT JOIN comment_threads t ON t.root_id = c.id
+    WHERE c.content_pk = ? AND c.parent_comment_id IS NULL AND c.is_deleted = 0
+      AND (
+        (t.root_id IS NOT NULL AND COALESCE(t.is_complete, 0) = 0)
+        OR (
+          t.root_id IS NULL AND (
+            COALESCE(c.child_count, 0) > 0
+            OR EXISTS (
+              SELECT 1 FROM comments ch
+              WHERE ch.parent_comment_id = c.id AND ch.is_deleted = 0
+            )
+          )
+        )
+      )
+  `;
+
+/** 按 contentPk（可选限定候选根 ID）查询未完成活根及其新鲜度时间戳 */
+function buildIncompleteLiveRootProbeSql(contentPk: string, ids: string[]) {
+  const useIdFilter = ids.length > 0 && ids.length <= D1_MAX_SQL_PARAMS - 1;
+  return {
+    sql: `
+      SELECT
+        c.id AS id,
+        c.last_seen_at AS root_last_seen_at,
+        t.synced_at AS thread_synced_at,
+        (
+          SELECT MAX(ch.last_seen_at)
+          FROM comments ch
+          WHERE ch.parent_comment_id = c.id AND ch.is_deleted = 0
+        ) AS latest_child_seen_at
+      ${INCOMPLETE_LIVE_ROOT_WHERE_SQL}
+      ${useIdFilter ? `AND c.id IN (${ids.map(() => "?").join(", ")})` : ""}
+    `,
+    params: useIdFilter ? [contentPk, ...ids] : [contentPk]
+  };
+}
+
+/** 汇总未完成活根；同一根出现在多个非活跃库时取最新状态，任一库时间未知则保持 null */
+function mergeIncompleteRootTimestamps(
+  rows: IncompleteRootRow[],
+  unresolved: Map<string, number | null>
+): void {
+  for (const row of rows) {
+    const id = row.id == null ? "" : String(row.id);
+    if (!id) continue;
+    const ts = maxTimestampMs(row.root_last_seen_at, row.thread_synced_at, row.latest_child_seen_at);
+    if (!unresolved.has(id)) {
+      unresolved.set(id, ts);
+      continue;
+    }
+    const prev = unresolved.get(id) ?? null;
+    unresolved.set(id, prev === null || ts === null ? null : Math.max(prev, ts));
+  }
+}
+
+/** 探测非活跃库（主 D1 / 其他外部库）里的未完成活根；逐库 try/catch，绝不阻断当前写入 */
+async function probeInactiveIncompleteTimestamps(args: {
+  contentPk: string;
+  ids: string[];
+  mainDatabase?: D1Database | null;
+  remoteTargets: ExternalStorageTarget[];
+}): Promise<Map<string, number | null>> {
+  const inactiveIncomplete = new Map<string, number | null>();
+  if (args.ids.length === 0) return inactiveIncomplete;
+  const { sql, params } = buildIncompleteLiveRootProbeSql(args.contentPk, args.ids);
+  if (args.mainDatabase) {
+    try {
+      const { results } = await args.mainDatabase.prepare(sql).bind(...params).all<IncompleteRootRow>();
+      mergeIncompleteRootTimestamps(results ?? [], inactiveIncomplete);
+    } catch (err) {
+      console.warn("[comments] inactive incomplete probe failed (main D1):", err);
+    }
+  }
+  for (const target of args.remoteTargets) {
+    try {
+      const result = await executeRemoteSql(target, sql, params);
+      mergeIncompleteRootTimestamps(result.rows as IncompleteRootRow[], inactiveIncomplete);
+    } catch (err) {
+      console.warn(`[comments] inactive incomplete probe failed (${target.name || target.id}):`, err);
+    }
+  }
+  return inactiveIncomplete;
+}
+
+type InactiveRefreshPlan = {
+  threadRootIds: string[];
+  threadBumpIso: string;
+  deletedRootIds: string[];
+  deletedBumpIso: string;
+};
+
+/**
+ * 决定哪些「已确认收敛」的根需要把 synced_at 推过非活跃库的未完成时间戳，
+ * 以及哪些已软删根需要刷新 last_seen_at。只有确实更晚的未完成记录才进入计划。
+ */
+function planInactiveIncompleteRefreshes(args: {
+  now: string;
+  confirmedFastPathRoots: Map<string, string | null>;
+  alreadyDeletedRoots: ExistingRootRow[];
+  inactiveIncomplete: Map<string, number | null>;
+}): InactiveRefreshPlan {
+  const parsedNow = Date.parse(args.now);
+  const baseNowMs = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+
+  const threadRootIds: string[] = [];
+  let threadBumpMs = baseNowMs;
+  for (const [rootId, existingSyncedAt] of args.confirmedFastPathRoots) {
+    if (!args.inactiveIncomplete.has(rootId)) continue;
+    const incompleteTs = args.inactiveIncomplete.get(rootId) ?? null;
+    const existingMs = parseTimestampMs(existingSyncedAt);
+    // 与 hasIncompleteLiveRoot 的收敛判定完全对称：已有 synced_at 不旧于未完成记录时无需刷新
+    if (existingMs !== null && (incompleteTs === null || existingMs >= incompleteTs)) continue;
+    threadRootIds.push(rootId);
+    if (incompleteTs !== null) threadBumpMs = Math.max(threadBumpMs, incompleteTs);
+  }
+
+  const deletedRootIds: string[] = [];
+  let deletedBumpMs = baseNowMs;
+  for (const row of args.alreadyDeletedRoots) {
+    if (!row.id || !args.inactiveIncomplete.has(row.id)) continue;
+    const incompleteTs = args.inactiveIncomplete.get(row.id) ?? null;
+    // 软删根的收敛证据是 max(deleted_at, last_seen_at)，刷新时只推进 last_seen_at、保留 deleted_at
+    const freshness = maxTimestampMs(row.deleted_at, row.last_seen_at);
+    if (freshness !== null && (incompleteTs === null || freshness >= incompleteTs)) continue;
+    deletedRootIds.push(row.id);
+    if (incompleteTs !== null) deletedBumpMs = Math.max(deletedBumpMs, incompleteTs);
+  }
+
+  return {
+    threadRootIds,
+    threadBumpIso: new Date(threadBumpMs).toISOString(),
+    deletedRootIds,
+    deletedBumpIso: new Date(deletedBumpMs).toISOString()
+  };
+}
+
+/** 按 D1 单句绑定参数上限切分 ID 列表（时间戳占 1 个参数） */
+function chunkIdsForUpdate(ids: string[]): string[][] {
+  const chunks: string[][] = [];
+  const maxIds = D1_MAX_SQL_PARAMS - 1;
+  for (let i = 0; i < ids.length; i += maxIds) chunks.push(ids.slice(i, i + maxIds));
+  return chunks;
+}
+
 function buildRootChangeStatement(
   database: D1Database,
   eventType: "comment.added" | "comment.updated" | "comment.deleted",
@@ -551,7 +715,8 @@ async function replaceCommentsByRootInner(
   const database = env.DB;
 
   const existingResult = await database.prepare(`
-    SELECT id, comment_hash, is_deleted, author_avatar, likes, time_text, location, child_count
+    SELECT id, comment_hash, is_deleted, author_avatar, likes, time_text, location, child_count,
+           last_seen_at, deleted_at
     FROM comments
     WHERE content_pk = ? AND parent_comment_id IS NULL
   `).bind(input.contentPk).all<ExistingRootRow>();
@@ -560,7 +725,7 @@ async function replaceCommentsByRootInner(
 
   // 线程索引现状：1 条 SQL 取全（不是每根 1 次），供「输入未变 → 0 R2 / 0 D1 写」快路径使用
   const threadResult = await database.prepare(`
-    SELECT root_id, child_count, is_complete, thread_hash, incoming_hash, preview_json
+    SELECT root_id, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at
     FROM comment_threads
     WHERE content_pk = ?
   `).bind(input.contentPk).all<ExistingThreadRow>();
@@ -611,6 +776,11 @@ async function replaceCommentsByRootInner(
   }
 
   const incomingRootIds = new Set(input.allRootIds ?? prepared.map(p => p.root.id));
+
+  // 命中「已确认收敛」快路径的根（rootId → 实际写入库现有 synced_at）；
+  // 以及全量对账时已经软删、不在本次 incoming 里的根（可能在非活跃库留下更晚的失败记录）。
+  const confirmedFastPathRoots = new Map<string, string | null>();
+  const alreadyDeletedRoots: ExistingRootRow[] = [];
 
   let added = 0;
   let updated = 0;
@@ -755,7 +925,14 @@ async function replaceCommentsByRootInner(
   // 删除对账只针对根评论：子评论在 R2，由覆盖/合并逻辑处理，不删 D1 里的子评论行
   if (!input.partial) {
     for (const row of existingRoots) {
-      if (!incomingRootIds.has(row.id) && row.is_deleted === 0) {
+      if (incomingRootIds.has(row.id)) continue;
+      // 已经软删的根不重复写；但若非活跃库残留更晚的失败记录（incompleteTs 更新），
+      // 收敛证据 max(deleted_at, last_seen_at) 可能仍更旧，后面需要按需刷新 last_seen_at。
+      if (row.is_deleted === 1) {
+        alreadyDeletedRoots.push(row);
+        continue;
+      }
+      if (row.is_deleted === 0) {
         rootStmts.push(database.prepare(`
           UPDATE comments
           SET is_deleted = 1, deleted_at = ?, last_seen_at = ?
@@ -829,6 +1006,9 @@ async function replaceCommentsByRootInner(
         existingThread.is_complete === 1 &&
         existingThread.thread_hash !== ""
       ) {
+        // 已确认收敛（0 回复 + complete 权威归档）：若非活跃库还有更晚的失败记录，
+        // 后面会按需刷新 synced_at，否则 hasIncompleteLiveRoot 会永久反复重抓。
+        confirmedFastPathRoots.set(root.id, existingThread.synced_at ?? null);
         continue;
       }
 
@@ -957,6 +1137,15 @@ async function replaceCommentsByRootInner(
       (existingThread.is_complete === 1 || (!root.isChildrenComplete && (!isChildrenClosed || existingThread.is_complete === 2))) &&
       (!hasChildren || existingThread.thread_hash !== "")
     ) {
+      // 只有「本次确实抓全/闭评」且写入库已是完整态才算确认收敛；
+      // hot/未抓全的 partial 同步绝不能刷新 synced_at，否则会把非活跃库的待重试根误洗白。
+      if (
+        !legacyChildrenReadFailed &&
+        ((root.isChildrenComplete && existingThread.is_complete === 1) ||
+          (isChildrenClosed && existingThread.is_complete === 2))
+      ) {
+        confirmedFastPathRoots.set(root.id, existingThread.synced_at ?? null);
+      }
       continue;
     }
 
@@ -969,6 +1158,10 @@ async function replaceCommentsByRootInner(
         existingThread.child_count === effectiveChildCount &&
         existingThread.is_complete === desiredComplete
       ) {
+        // 闭评冻结态（is_complete=2）本身就是权威收敛证据；非闭评的「未抓全跳过」不刷新。
+        if (isChildrenClosed && existingThread.is_complete === 2) {
+          confirmedFastPathRoots.set(root.id, existingThread.synced_at ?? null);
+        }
         continue;
       }
       threadStmts.push(database.prepare(
@@ -1095,6 +1288,14 @@ async function replaceCommentsByRootInner(
       existingThread.is_complete === isComplete &&
       existingThread.thread_hash === storedThreadHash
     ) {
+      // 写后字段一致说明本轮没有写入；若本次确实抓全/闭评且已有完整态，按需补 synced_at。
+      if (
+        !readFailed &&
+        ((root.isChildrenComplete && existingThread.is_complete === 1) ||
+          (isChildrenClosed && existingThread.is_complete === 2))
+      ) {
+        confirmedFastPathRoots.set(root.id, existingThread.synced_at ?? null);
+      }
       continue;
     }
 
@@ -1122,6 +1323,44 @@ async function replaceCommentsByRootInner(
       previewJson,
       now
     ));
+  }
+
+  // 「已确认收敛却命中快路径」时按需探测非活跃库（主 D1 是实际写入目标时即全部可读外部库）：
+  // 只有对方存在更晚的未完成活根，才追加一条轻量 synced_at / last_seen_at 刷新；
+  // 无外部目标或无更晚记录时保持 0 额外写入（重复同步的零写回归不受影响）。
+  if (confirmedFastPathRoots.size > 0 || (!input.partial && alreadyDeletedRoots.length > 0)) {
+    const readableTargets = await listReadableCommentOffloadTargets(env.BUCKET).catch(() => []);
+    if (readableTargets.length > 0) {
+      const candidateIds = Array.from(new Set([
+        ...confirmedFastPathRoots.keys(),
+        ...alreadyDeletedRoots.map(row => row.id)
+      ]));
+      const inactiveIncomplete = await probeInactiveIncompleteTimestamps({
+        contentPk: input.contentPk,
+        ids: candidateIds,
+        remoteTargets: readableTargets
+      });
+      if (inactiveIncomplete.size > 0) {
+        const plan = planInactiveIncompleteRefreshes({
+          now,
+          confirmedFastPathRoots,
+          alreadyDeletedRoots,
+          inactiveIncomplete
+        });
+        for (const chunk of chunkIdsForUpdate(plan.threadRootIds)) {
+          const placeholders = chunk.map(() => "?").join(", ");
+          threadStmts.push(database.prepare(
+            `UPDATE comment_threads SET synced_at = ? WHERE root_id IN (${placeholders})`
+          ).bind(plan.threadBumpIso, ...chunk));
+        }
+        for (const chunk of chunkIdsForUpdate(plan.deletedRootIds)) {
+          const placeholders = chunk.map(() => "?").join(", ");
+          threadStmts.push(database.prepare(
+            `UPDATE comments SET last_seen_at = ? WHERE id IN (${placeholders})`
+          ).bind(plan.deletedBumpIso, ...chunk));
+        }
+      }
+    }
   }
 
   await runBatchedStatements(database, threadStmts, ROOT_BATCH_SIZE);
@@ -1403,7 +1642,9 @@ function toRemoteRootRow(row: Record<string, any>): ExistingRootRow {
     likes: Number(row.likes ?? 0) || 0,
     time_text: row.time_text == null ? null : String(row.time_text),
     location: row.location == null ? null : String(row.location),
-    child_count: Number(row.child_count ?? 0) || 0
+    child_count: Number(row.child_count ?? 0) || 0,
+    last_seen_at: row.last_seen_at == null ? null : String(row.last_seen_at),
+    deleted_at: row.deleted_at == null ? null : String(row.deleted_at)
   };
 }
 
@@ -1414,7 +1655,8 @@ function toRemoteThreadRow(row: Record<string, any>): ExistingThreadRow {
     is_complete: Number(row.is_complete ?? 0) || 0,
     thread_hash: String(row.thread_hash ?? ""),
     incoming_hash: String(row.incoming_hash ?? ""),
-    preview_json: String(row.preview_json ?? "[]")
+    preview_json: String(row.preview_json ?? "[]"),
+    synced_at: row.synced_at == null ? null : String(row.synced_at)
   };
 }
 
@@ -1491,13 +1733,14 @@ async function replaceCommentsByRootOffloaded(
   // 远端现状：根评论 + 线程索引（有提交根时顺带取旧扁平子评论供防删归档合并）合成 1 次 pipeline 读取
   const readBatchStatements: RemoteSqlStatement[] = [
     {
-      sql: `SELECT id, comment_hash, is_deleted, author_avatar, likes, time_text, location, child_count
+      sql: `SELECT id, comment_hash, is_deleted, author_avatar, likes, time_text, location, child_count,
+                   last_seen_at, deleted_at
             FROM comments
             WHERE content_pk = ? AND parent_comment_id IS NULL`,
       params: [input.contentPk]
     },
     {
-      sql: `SELECT root_id, child_count, is_complete, thread_hash, incoming_hash, preview_json
+      sql: `SELECT root_id, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at
             FROM comment_threads
             WHERE content_pk = ?`,
       params: [input.contentPk]
@@ -1550,6 +1793,11 @@ async function replaceCommentsByRootOffloaded(
 
   const incomingRootIds = new Set(input.allRootIds ?? prepared.map(p => p.root.id));
   const isSqliteRemote = target.provider === "cloudflare_d1" || target.provider === "turso";
+
+  // 命中「已确认收敛」快路径的根（rootId → 外部库现有 synced_at）；
+  // 以及全量对账时已经软删、不在本次 incoming 里的根（可能在其他库留下更晚的失败记录）。
+  const confirmedFastPathRoots = new Map<string, string | null>();
+  const alreadyDeletedRoots: ExistingRootRow[] = [];
 
   let added = 0;
   let updated = 0;
@@ -1698,7 +1946,13 @@ async function replaceCommentsByRootOffloaded(
   if (!input.partial) {
     const deleteIds: string[] = [];
     for (const row of existingRoots) {
-      if (!incomingRootIds.has(row.id) && row.is_deleted === 0) {
+      if (incomingRootIds.has(row.id)) continue;
+      // 已软删根不重复写；若非活跃库残留更晚的失败记录，后面按需刷新 last_seen_at。
+      if (row.is_deleted === 1) {
+        alreadyDeletedRoots.push(row);
+        continue;
+      }
+      if (row.is_deleted === 0) {
         deleteIds.push(row.id);
         deleted++;
       }
@@ -1981,6 +2235,8 @@ async function replaceCommentsByRootOffloaded(
         existingThread.is_complete === 1 &&
         existingThread.thread_hash !== ""
       ) {
+        // 已确认收敛（0 回复 + complete 权威归档）：非活跃库若有更晚失败记录，后面按需刷新 synced_at。
+        confirmedFastPathRoots.set(root.id, existingThread.synced_at ?? null);
         continue;
       }
 
@@ -2093,6 +2349,14 @@ async function replaceCommentsByRootOffloaded(
       (existingThread.is_complete === 1 || (!root.isChildrenComplete && (!isChildrenClosed || existingThread.is_complete === 2))) &&
       (!hasChildren || existingThread.thread_hash !== "")
     ) {
+      // 只有本次确实抓全/闭评且外部库已是完整态才算确认收敛；hot/partial 不刷新。
+      if (
+        !remoteLegacyReadFailed &&
+        ((root.isChildrenComplete && existingThread.is_complete === 1) ||
+          (isChildrenClosed && existingThread.is_complete === 2))
+      ) {
+        confirmedFastPathRoots.set(root.id, existingThread.synced_at ?? null);
+      }
       continue;
     }
 
@@ -2105,6 +2369,10 @@ async function replaceCommentsByRootOffloaded(
         existingThread.child_count === effectiveChildCount &&
         existingThread.is_complete === desiredComplete
       ) {
+        // 闭评冻结态（is_complete=2）本身就是权威收敛证据；非闭评的「未抓全跳过」不刷新。
+        if (isChildrenClosed && existingThread.is_complete === 2) {
+          confirmedFastPathRoots.set(root.id, existingThread.synced_at ?? null);
+        }
         continue;
       }
       const rowParams = [
@@ -2209,6 +2477,14 @@ async function replaceCommentsByRootOffloaded(
       existingThread.is_complete === isComplete &&
       existingThread.thread_hash === storedThreadHash
     ) {
+      // 写后字段一致说明本轮没有写入；若本次确实抓全/闭评且外部库已有完整态，按需补 synced_at。
+      if (
+        !readFailed &&
+        ((root.isChildrenComplete && existingThread.is_complete === 1) ||
+          (isChildrenClosed && existingThread.is_complete === 2))
+      ) {
+        confirmedFastPathRoots.set(root.id, existingThread.synced_at ?? null);
+      }
       continue;
     }
 
@@ -2223,6 +2499,46 @@ async function replaceCommentsByRootOffloaded(
       previewJson,
       now
     ]);
+  }
+
+  // 「已确认收敛却命中快路径」时按需探测非活跃库（主 D1 + 其他可读外部库）：
+  // 只有对方存在更晚的未完成活根，才追加一条轻量 synced_at / last_seen_at 刷新；
+  // 任何非活跃库查询异常都在探测内部吞掉，绝不影响当前写入；无匹配时保持 0 外部库写入。
+  if (confirmedFastPathRoots.size > 0 || (!input.partial && alreadyDeletedRoots.length > 0)) {
+    const otherReadableTargets = (await listReadableCommentOffloadTargets(env.BUCKET).catch(() => []))
+      .filter(t => t.id !== target.id);
+    const candidateIds = Array.from(new Set([
+      ...confirmedFastPathRoots.keys(),
+      ...alreadyDeletedRoots.map(row => row.id)
+    ]));
+    const inactiveIncomplete = await probeInactiveIncompleteTimestamps({
+      contentPk: input.contentPk,
+      ids: candidateIds,
+      mainDatabase: env.DB,
+      remoteTargets: otherReadableTargets
+    });
+    if (inactiveIncomplete.size > 0) {
+      const plan = planInactiveIncompleteRefreshes({
+        now,
+        confirmedFastPathRoots,
+        alreadyDeletedRoots,
+        inactiveIncomplete
+      });
+      for (const chunk of chunkIdsForUpdate(plan.threadRootIds)) {
+        const placeholders = chunk.map(() => "?").join(", ");
+        childStatements.push({
+          sql: `UPDATE comment_threads SET synced_at = ? WHERE root_id IN (${placeholders})`,
+          params: [plan.threadBumpIso, ...chunk]
+        });
+      }
+      for (const chunk of chunkIdsForUpdate(plan.deletedRootIds)) {
+        const placeholders = chunk.map(() => "?").join(", ");
+        childStatements.push({
+          sql: `UPDATE comments SET last_seen_at = ? WHERE id IN (${placeholders})`,
+          params: [plan.deletedBumpIso, ...chunk]
+        });
+      }
+    }
   }
 
   if (isSqliteRemote) {
@@ -2411,24 +2727,7 @@ export async function hasIncompleteLiveRoot(
   contentPk: string,
   bucket?: any
 ): Promise<boolean> {
-  const incompleteWhereSql = `
-    FROM comments c
-    LEFT JOIN comment_threads t ON t.root_id = c.id
-    WHERE c.content_pk = ? AND c.parent_comment_id IS NULL AND c.is_deleted = 0
-      AND (
-        (t.root_id IS NOT NULL AND COALESCE(t.is_complete, 0) = 0)
-        OR (
-          t.root_id IS NULL AND (
-            COALESCE(c.child_count, 0) > 0
-            OR EXISTS (
-              SELECT 1 FROM comments ch
-              WHERE ch.parent_comment_id = c.id AND ch.is_deleted = 0
-            )
-          )
-        )
-      )
-  `;
-  const hasAnySql = `SELECT 1 AS has_any ${incompleteWhereSql} LIMIT 1`;
+  const hasAnySql = `SELECT 1 AS has_any ${INCOMPLETE_LIVE_ROOT_WHERE_SQL} LIMIT 1`;
   const rootRowsSql = `
     SELECT
       c.id AS id,
@@ -2439,7 +2738,7 @@ export async function hasIncompleteLiveRoot(
         FROM comments ch
         WHERE ch.parent_comment_id = c.id AND ch.is_deleted = 0
       ) AS latest_child_seen_at
-    ${incompleteWhereSql}
+    ${INCOMPLETE_LIVE_ROOT_WHERE_SQL}
   `;
 
   // 配置读取走 db 代理，必须与入参 database 绑定同一 AsyncLocalStorage 上下文：
@@ -2466,19 +2765,7 @@ export async function hasIncompleteLiveRoot(
     : null;
 
   /** 汇总未完成活根；同一根出现在多个非活跃库时取最新状态，任一库时间未知则保持 null */
-  const mergeIncompleteRows = (rows: IncompleteRootRow[], unresolved: Map<string, number | null>) => {
-    for (const row of rows) {
-      const id = row.id == null ? "" : String(row.id);
-      if (!id) continue;
-      const ts = maxTimestampMs(row.root_last_seen_at, row.thread_synced_at, row.latest_child_seen_at);
-      if (!unresolved.has(id)) {
-        unresolved.set(id, ts);
-        continue;
-      }
-      const prev = unresolved.get(id) ?? null;
-      unresolved.set(id, prev === null || ts === null ? null : Math.max(prev, ts));
-    }
-  };
+  const mergeIncompleteRows = mergeIncompleteRootTimestamps;
 
   /** 只剔除实际写入库里有明确收敛证据、且不旧于待重试副本的根 */
   const applySettledRows = (rows: SettledRootRow[], unresolved: Map<string, number | null>) => {

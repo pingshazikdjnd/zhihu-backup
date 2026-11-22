@@ -107,6 +107,8 @@ let cachedExternalTargets: {
   d1UpdatedAt: string | null;
   /** R2 对象版本；null=对象尚不存在，undefined=无法取得版本（读取失败/未传 bucket） */
   r2Etag: string | null | undefined;
+  /** 配置内容指纹：用于让 overflow 行数缓存与「当前生效目标」严格同版本 */
+  configVersion: string;
 } | null = null;
 let lastExternalTargetsWriteMs = 0;
 
@@ -160,18 +162,40 @@ function readR2ObjectEtag(obj: any): string | undefined {
   return undefined;
 }
 
+/**
+ * 外部目标配置的确定性版本号。
+ * 只要任何一个影响「实际写入目标」的字段变化（storageRole / overflowThresholdRows /
+ * syncScopes / enabled / 配置更新时间），或 D1/R2 版本标记变化，版本号就会变化；
+ * 配置完全没变时版本号稳定，让 overflow 行数缓存可以安全跨 isolate 复用。
+ */
+function computeExternalTargetsVersion(
+  targets: ExternalStorageTarget[],
+  d1UpdatedAt: string | null,
+  r2Etag: string | null | undefined
+): string {
+  const fingerprint = targets
+    .map(
+      t =>
+        `${t.id}:${t.enabled ? 1 : 0}:${t.storageRole}:${t.overflowThresholdRows}:${t.syncScopes.join(",")}:${t.updatedAt}`
+    )
+    .join("|");
+  return `${d1UpdatedAt ?? ""}|${r2Etag ?? ""}|${fingerprint}`;
+}
+
 async function readExternalTargetsWithVersion(
   bucket?: any
 ): Promise<{
   targets: ExternalStorageTarget[];
   d1UpdatedAt: string | null;
   r2Etag: string | null | undefined;
+  configVersion: string;
 }> {
   if (cachedExternalTargets && Date.now() - cachedExternalTargets.at < EXTERNAL_TARGETS_CACHE_TTL_MS) {
     return {
       targets: cloneTargets(cachedExternalTargets.list),
       d1UpdatedAt: cachedExternalTargets.d1UpdatedAt,
-      r2Etag: cachedExternalTargets.r2Etag
+      r2Etag: cachedExternalTargets.r2Etag,
+      configVersion: cachedExternalTargets.configVersion
     };
   }
 
@@ -258,8 +282,19 @@ async function readExternalTargetsWithVersion(
     if (cleaned.length >= 10) break;
   }
 
-  cachedExternalTargets = { at: Date.now(), list: cloneTargets(cleaned), d1UpdatedAt, r2Etag };
-  return { targets: cleaned, d1UpdatedAt, r2Etag };
+  cachedExternalTargets = {
+    at: Date.now(),
+    list: cloneTargets(cleaned),
+    d1UpdatedAt,
+    r2Etag,
+    configVersion: computeExternalTargetsVersion(cleaned, d1UpdatedAt, r2Etag)
+  };
+  return {
+    targets: cleaned,
+    d1UpdatedAt,
+    r2Etag,
+    configVersion: cachedExternalTargets.configVersion
+  };
 }
 
 export async function getExternalTargetsRaw(bucket?: any): Promise<ExternalStorageTarget[]> {
@@ -367,11 +402,13 @@ export async function saveExternalTargetsRaw(
   // 主库评论行数缓存必须一起失效，否则 resolveActiveOffloadTarget 会在 5 分钟 TTL 内
   // 继续用旧行数判断，导致 hasIncompleteLiveRoot 认错实际写入目标。
   invalidateMainCommentCountCache();
+  const savedD1UpdatedAt = d1Err ? (opts?.expectedUpdatedAt ?? null) : now;
   cachedExternalTargets = {
     at: Date.now(),
     list: cloneTargets(saved),
-    d1UpdatedAt: d1Err ? (opts?.expectedUpdatedAt ?? null) : now,
-    r2Etag: nextR2Etag
+    d1UpdatedAt: savedD1UpdatedAt,
+    r2Etag: nextR2Etag,
+    configVersion: computeExternalTargetsVersion(saved, savedD1UpdatedAt, nextR2Etag)
   };
 }
 
@@ -659,22 +696,29 @@ export function resetRemoteSchemaCache(): void {
   initializedSchemaTargets.clear();
 }
 
-// 主 D1 评论行数：overflow 水位判断用。每条 /ingest 都 COUNT(*) 太贵，缓存 5 分钟
+// 主 D1 评论行数：overflow 水位判断用。每条 /ingest 都 COUNT(*) 太贵，缓存 5 分钟。
+// 缓存必须与「外部目标配置版本」绑定：其他 isolate 在 60 秒后可能读到新配置
+// （切换 storageRole / 调整 overflowThresholdRows），此时旧行数判断已不再可信，
+// 必须立即按新版本重查；配置完全没变时继续复用 5 分钟缓存，避免无意义 COUNT(*)。
 const MAIN_COMMENT_COUNT_TTL_MS = 5 * 60_000;
-let cachedMainCommentCount: { at: number; count: number } | null = null;
+let cachedMainCommentCount: { at: number; count: number; configVersion: string } | null = null;
 
 export function invalidateMainCommentCountCache(): void {
   cachedMainCommentCount = null;
 }
 
-async function getMainCommentRowCount(): Promise<number> {
-  if (cachedMainCommentCount && Date.now() - cachedMainCommentCount.at < MAIN_COMMENT_COUNT_TTL_MS) {
+async function getMainCommentRowCount(configVersion = ""): Promise<number> {
+  if (
+    cachedMainCommentCount &&
+    cachedMainCommentCount.configVersion === configVersion &&
+    Date.now() - cachedMainCommentCount.at < MAIN_COMMENT_COUNT_TTL_MS
+  ) {
     return cachedMainCommentCount.count;
   }
   try {
     const row = await db.prepare(`SELECT COUNT(*) AS n FROM comments`).get<{ n: number }>();
     const count = Number(row?.n ?? 0) || 0;
-    cachedMainCommentCount = { at: Date.now(), count };
+    cachedMainCommentCount = { at: Date.now(), count, configVersion };
     return count;
   } catch {
     // 读不到就按「未达水位」处理：宁可继续写主库，也不能误判后把数据写进没配置好的外部库
@@ -700,7 +744,13 @@ export async function resolveActiveOffloadTarget(
   bucket: any,
   scope: ExternalSyncScope
 ): Promise<ExternalStorageTarget | null> {
-  const targets = await getExternalTargetsRaw(bucket).catch(() => [] as ExternalStorageTarget[]);
+  // 一次性拿到目标列表与配置版本：overflow 行数缓存必须与该版本严格对应，
+  // 否则其他 isolate 更新配置后，本 isolate 会在行数缓存 5 分钟 TTL 内用旧行数
+  // 选错实际写入目标（hasIncompleteLiveRoot 随之误判权威库）。
+  const { targets, configVersion } = await readExternalTargetsWithVersion(bucket).catch(() => ({
+    targets: [] as ExternalStorageTarget[],
+    configVersion: ""
+  }));
   for (const target of targets) {
     if (!target.enabled) continue;
     if (!Array.isArray(target.syncScopes) || !target.syncScopes.includes(scope)) continue;
@@ -709,7 +759,7 @@ export async function resolveActiveOffloadTarget(
     if (role === "offload") return target;
     if (role === "mirror") continue;
     const threshold = normalizeOverflowThreshold(target.overflowThresholdRows);
-    if ((await getMainCommentRowCount()) >= threshold) return target;
+    if ((await getMainCommentRowCount(configVersion)) >= threshold) return target;
   }
   return null;
 }

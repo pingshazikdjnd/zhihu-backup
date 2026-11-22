@@ -7965,3 +7965,323 @@ test("[PR2-5] 非活跃 overflow 旧 is_complete = 0 在新主库完成归档后
     auth.resetRemoteSchemaCache();
   }
 });
+
+// ---------- PR #2 P2 审查项：配置版本绑定行数缓存 + 快路径收敛刷新 ----------
+
+/** 可热更新配置的可变 R2 bucket（仍为纯内存 Map，不接触真实 R2） */
+function makeMutableTargetBucket(initialConfig) {
+  const store = new Map([[workerModules.auth.R2_EXTERNAL_TARGETS_KEY, JSON.stringify(initialConfig)]]);
+  return {
+    store,
+    async get(key) {
+      const value = store.get(key);
+      return value === undefined ? null : { async text() { return value; } };
+    },
+    async put(key, value) { store.set(key, String(value)); },
+    async head() { return null; },
+    async delete(key) { store.delete(key); }
+  };
+}
+
+test("[PR2-6] 跨 isolate overflow 行数缓存必须绑定目标配置版本（cubic P2）", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.invalidateMainCommentCountCache();
+  auth.resetRemoteSchemaCache();
+
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+
+  // 主库 1 条评论（低于阈值 2），其中一条根在主动探测路径上处于未完成态
+  seedPr24Root(sqlite, { id: "root-cache", likes: 10, lastSeenAt: PR24_T1 });
+  seedPr24Thread(sqlite, { rootId: "root-cache", isComplete: 0, syncedAt: PR24_T2 });
+
+  const remoteSqlite = new Database(":memory:");
+  const target = {
+    ...makeTursoTarget("ext-pr2-config-version", "https://ext-pr2-config-version.example.com"),
+    storageRole: "overflow",
+    overflowThresholdRows: 2
+  };
+  const bucket = makeMutableTargetBucket([target]);
+  const mock = installTursoPipelineMock(remoteSqlite);
+  try {
+    await runWithDb(d1, () => auth.ensureRemoteCommentSchema(target));
+    // 外部库在 T3 已完成同一根的归档：一旦它成为实际写入库，主库 T2 的失败记录即可收敛
+    seedPr24Root(remoteSqlite, { id: "root-cache", likes: 10, lastSeenAt: PR24_T1 });
+    seedPr24Thread(remoteSqlite, { rootId: "root-cache", isComplete: 1, syncedAt: PR24_T3 });
+
+    assert.equal(
+      await runWithDb(d1, () => auth.resolveActiveOffloadTarget(bucket, "comments")),
+      null,
+      "主库 1 行低于阈值 2，overflow 尚未激活（并填充 5 分钟行数缓存）"
+    );
+    assert.equal(
+      await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+      true,
+      "主库为实际写入库时，自身 is_complete = 0 必须触发重试"
+    );
+
+    // 模拟另一个 isolate：主库新增 2 条评论（总数 3），并更新 D1 + R2 中的目标配置
+    seedPr24Root(sqlite, { id: "root-cache-2", likes: 5 });
+    seedPr24Root(sqlite, { id: "root-cache-3", likes: 4 });
+    const updatedTarget = { ...target, updatedAt: PR24_T2 };
+    bucket.store.set(auth.R2_EXTERNAL_TARGETS_KEY, JSON.stringify([updatedTarget]));
+    sqlite.prepare(`
+      INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+    `).run(auth.EXTERNAL_TARGETS_KEY, JSON.stringify([updatedTarget]), PR24_T2);
+
+    // 只模拟本 isolate 的 60 秒目标缓存过期，绝不清 5 分钟行数缓存
+    auth.invalidateExternalTargetsCache();
+
+    let countQueries = 0;
+    const originalPrepare = d1.prepare.bind(d1);
+    d1.prepare = sql => {
+      if (/COUNT\(\*\)\s+AS\s+n\s+FROM\s+comments/i.test(sql)) countQueries++;
+      return originalPrepare(sql);
+    };
+    try {
+      const active = await runWithDb(d1, () => auth.resolveActiveOffloadTarget(bucket, "comments"));
+      assert.equal(active?.id, target.id, "配置版本变化后必须刷新主库行数并选中该 overflow 目标");
+      assert.equal(countQueries, 1, "版本变化后应恰好重查一次 COUNT(*)");
+
+      assert.equal(
+        await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+        false,
+        "实际写入库切到外部后，外部 T3 完成副本必须证明主库 T2 失败记录已收敛"
+      );
+      assert.equal(countQueries, 1, "同一配置版本内必须复用行数缓存，不得重复 COUNT(*)");
+
+      // 再次只清 60 秒目标缓存、配置完全没变：5 分钟行数缓存仍应命中
+      countQueries = 0;
+      auth.invalidateExternalTargetsCache();
+      const activeAgain = await runWithDb(d1, () => auth.resolveActiveOffloadTarget(bucket, "comments"));
+      assert.equal(activeAgain?.id, target.id);
+      assert.equal(countQueries, 0, "配置版本未变化时不得重查 COUNT(*)（无谓读放大回归）");
+    } finally {
+      d1.prepare = originalPrepare;
+    }
+  } finally {
+    mock.restore();
+    auth.invalidateExternalTargetsCache();
+    auth.invalidateMainCommentCountCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
+
+test("[PR2-6] offload 补抓内容未变命中快路径后刷新 synced_at 并收敛（greptile P2）", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.invalidateMainCommentCountCache();
+  auth.resetRemoteSchemaCache();
+
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+
+  // 主库前 50 根完整，第 51 根留在 is_complete = 0 / synced_at = T2
+  for (let i = 1; i <= 50; i++) {
+    seedPr24Root(sqlite, { id: `root-${i}`, likes: 1000 - i, lastSeenAt: PR24_T1 });
+    seedPr24Thread(sqlite, { rootId: `root-${i}`, isComplete: 1, syncedAt: PR24_T2 });
+  }
+  seedPr24Root(sqlite, { id: "root-51", likes: 945, lastSeenAt: PR24_T2 });
+  seedPr24Thread(sqlite, { rootId: "root-51", isComplete: 0, syncedAt: PR24_T2 });
+
+  const remoteSqlite = new Database(":memory:");
+  const target = makeTursoTarget("ext-pr2-fastpath-refresh", "https://ext-pr2-fastpath-refresh.example.com");
+  const bucket = makeTargetBucket(target);
+  const mock = installTursoPipelineMock(remoteSqlite);
+  try {
+    await runWithDb(d1, () => auth.ensureRemoteCommentSchema(target));
+
+    const fullPayload = {
+      contentPk: CONTENT_PK,
+      partial: false,
+      allRootIds: ["root-51"],
+      roots: [{
+        id: "root-51",
+        author: "U",
+        authorAvatar: "",
+        content: "root body",
+        img: "",
+        time: NOW_ISO,
+        location: "",
+        likes: 945,
+        isAuthor: false,
+        isTop: false,
+        isFeatured: false,
+        childCount: 1,
+        isChildrenComplete: true,
+        children: [{ id: "ch-51", parentId: "root-51", author: "A", content: "reply 51", likes: 1, isAuthor: false }]
+      }]
+    };
+
+    // 外部库先在 T1 落完整快照（真实走一遍写路径，保证哈希/预览完全一致）
+    await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(fullPayload, { DB: d1, BUCKET: bucket }));
+    remoteSqlite.prepare(`UPDATE comment_threads SET synced_at = ? WHERE root_id = 'root-51'`).run(PR24_T1);
+    remoteSqlite.prepare(`UPDATE comments SET last_seen_at = ? WHERE id = 'root-51'`).run(PR24_T1);
+    assert.equal(
+      remoteSqlite.prepare(`SELECT synced_at FROM comment_threads WHERE root_id = 'root-51'`).get().synced_at,
+      PR24_T1
+    );
+
+    assert.equal(
+      await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+      true,
+      "主库 T2 的失败记录晚于外部库 T1 完整快照时必须继续触发补抓"
+    );
+    const liveBefore = await callPr24LiveRootComments(d1, bucket);
+    assert.equal(liveBefore.status, 200);
+    assert.equal(liveBefore.body.has_incomplete_roots, true);
+
+    // 非完整 hot 同步（未抓到回复）：绝不能刷新 synced_at 洗白
+    const hotPayload = {
+      ...fullPayload,
+      roots: [{ ...fullPayload.roots[0], isChildrenComplete: false, children: [] }]
+    };
+    const hotRes = await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(hotPayload, { DB: d1, BUCKET: bucket }));
+    assert.equal(hotRes.offloadedTo, target.name);
+    assert.equal(
+      remoteSqlite.prepare(`SELECT synced_at FROM comment_threads WHERE root_id = 'root-51'`).get().synced_at,
+      PR24_T1,
+      "未抓全的 hot 同步命中跳过分支时不得刷新 synced_at"
+    );
+    assert.equal(
+      await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+      true,
+      "hot 同步后仍必须保持待重试"
+    );
+
+    // 全量同步完全相同的回复：不重写 blob / 线程索引，但必须把 synced_at 推过 T2
+    const callsBefore = mock.calls.length;
+    const fullRes = await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(fullPayload, { DB: d1, BUCKET: bucket }));
+    assert.equal(fullRes.offloadedTo, target.name);
+    const newCalls = mock.calls.slice(callsBefore);
+    assert.equal(
+      newCalls.filter(sql => /INSERT OR REPLACE INTO child_comment_blobs/i.test(sql)).length,
+      0,
+      "内容未变时不得重写 child_comment_blobs"
+    );
+    assert.equal(
+      newCalls.filter(sql => /INSERT INTO comment_threads/i.test(sql)).length,
+      0,
+      "内容未变时不得重写线程索引"
+    );
+    const refreshedSyncedAt = remoteSqlite.prepare(`SELECT synced_at FROM comment_threads WHERE root_id = 'root-51'`).get().synced_at;
+    assert.ok(
+      Date.parse(refreshedSyncedAt) >= Date.parse(PR24_T2),
+      `快路径收敛刷新必须把 synced_at 推过主库失败时间，实际 ${refreshedSyncedAt}`
+    );
+    assert.equal(
+      await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+      false,
+      "刷新 synced_at 后必须立即收敛"
+    );
+    const liveAfter = await callPr24LiveRootComments(d1, bucket);
+    assert.equal(liveAfter.status, 200);
+    assert.equal(liveAfter.body.has_incomplete_roots, false);
+
+    // 再次提交完全相同的全量同步：不再触发任何远端写入（0 写快路径保持完好）
+    const callsBeforeRepeat = mock.calls.length;
+    await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(fullPayload, { DB: d1, BUCKET: bucket }));
+    const repeatWrites = mock.calls
+      .slice(callsBeforeRepeat)
+      .filter(sql => !/^\s*(SELECT|CREATE)\b/i.test(sql));
+    assert.deepEqual(repeatWrites, [], `重复全量同步必须 0 远端写入，实际: ${repeatWrites.join(" | ")}`);
+  } finally {
+    mock.restore();
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
+
+test("[PR2-6] 主 D1 为实际写入目标时非活跃 overflow 的较新未完成根也能刷新收敛（greptile P2）", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.invalidateMainCommentCountCache();
+  auth.resetRemoteSchemaCache();
+
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+
+  const remoteSqlite = new Database(":memory:");
+  const target = {
+    ...makeTursoTarget("ext-pr2-main-active-refresh", "https://ext-pr2-main-active-refresh.example.com"),
+    storageRole: "overflow",
+    overflowThresholdRows: 1_500_000
+  };
+  const bucket = makeTargetBucket(target);
+  const mock = installTursoPipelineMock(remoteSqlite);
+  try {
+    await runWithDb(d1, () => auth.ensureRemoteCommentSchema(target));
+
+    // 非活跃 overflow 库残留较新的未完成根（T2 > T1）
+    seedPr24Root(remoteSqlite, { id: "root-ov", likes: 7, lastSeenAt: PR24_T1 });
+    seedPr24Thread(remoteSqlite, { rootId: "root-ov", isComplete: 0, syncedAt: PR24_T2 });
+
+    const fullPayload = {
+      contentPk: CONTENT_PK,
+      partial: false,
+      allRootIds: ["root-ov"],
+      roots: [{
+        id: "root-ov",
+        author: "U",
+        authorAvatar: "",
+        content: "root ov",
+        img: "",
+        time: NOW_ISO,
+        location: "",
+        likes: 7,
+        isAuthor: false,
+        isTop: false,
+        isFeatured: false,
+        childCount: 1,
+        isChildrenComplete: true,
+        children: [{ id: "ch-ov", parentId: "root-ov", author: "A", content: "reply ov", likes: 1, isAuthor: false }]
+      }]
+    };
+
+    // 主 D1 首次写入完整快照，随后把 synced_at 回拨到更早的 T1
+    const first = await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(fullPayload, { DB: d1, BUCKET: bucket }));
+    assert.equal(first.r2Puts, 1);
+    sqlite.prepare(`UPDATE comment_threads SET synced_at = ? WHERE root_id = 'root-ov'`).run(PR24_T1);
+
+    assert.equal(
+      await runWithDb(d1, () => auth.resolveActiveOffloadTarget(bucket, "comments")),
+      null,
+      "未达阈值的 overflow 不得成为实际写入库"
+    );
+    assert.equal(
+      await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+      true,
+      "非活跃库 T2 的未完成记录晚于主库 T1 完整快照时必须继续触发重试"
+    );
+
+    // 向主 D1 提交相同回复的全量同步：0 R2 PUT，但必须刷新主库 synced_at 收敛
+    const callsBefore = mock.calls.length;
+    const second = await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(fullPayload, { DB: d1, BUCKET: bucket }));
+    assert.equal(second.r2Puts, 0, "内容未变时不得写主 R2");
+    const mainSyncedAt = sqlite.prepare(`SELECT synced_at FROM comment_threads WHERE root_id = 'root-ov'`).get().synced_at;
+    assert.ok(
+      Date.parse(mainSyncedAt) >= Date.parse(PR24_T2),
+      `主库 synced_at 必须推过非活跃库的未完成时间，实际 ${mainSyncedAt}`
+    );
+    const externalWrites = mock.calls
+      .slice(callsBefore)
+      .filter(sql => !/^\s*(SELECT|CREATE)\b/i.test(sql));
+    assert.deepEqual(externalWrites, [], "主 D1 为实际写入目标时不得写外部库（探测只读）");
+    assert.equal(
+      await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+      false,
+      "主库 synced_at 刷新后必须立即收敛"
+    );
+
+    // 再重复一次：主库行数/线程写入都应为 0
+    const third = await runWithDb(d1, () => commentsModule.replaceCommentsByRoot(fullPayload, { DB: d1, BUCKET: bucket }));
+    assert.equal(third.r2Puts, 0);
+    assert.equal(third.threadUpserts, 0);
+  } finally {
+    mock.restore();
+    auth.invalidateExternalTargetsCache();
+    auth.invalidateMainCommentCountCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
