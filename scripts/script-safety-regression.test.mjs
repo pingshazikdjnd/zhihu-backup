@@ -2908,6 +2908,12 @@ test("[AUDIT-9] local-sync 在强杀或子进程退出码 131 时不释放云端
   assert.equal(res130.retained, false);
   assert.equal(res130.relCalls, 1, "子进程正常排空退出 130 时必须释放 1 次云端锁");
   assert.equal(res130.exitCodeSeen, 130);
+
+  // 4) 验证主循环的两个 close handler 都包含 sig === "SIGKILL" 条件（外部直接 SIGKILL 杀掉子进程时保留云端锁）
+  const proxyCloseMatch = localSyncSrc.match(/child\.on\("close",\s*\(exitCode,\s*sig\)\s*=>\s*\{[^}]*SIGKILL/s);
+  assert.ok(proxyCloseMatch, "代理子进程 close handler 必须包含 sig === 'SIGKILL' 分支");
+  const crawlerCloseMatch = localSyncSrc.match(/runProc\.on\("close",\s*\(c,\s*sig\)\s*=>\s*\{[^}]*SIGKILL/s);
+  assert.ok(crawlerCloseMatch, "爬虫子进程 close handler 必须包含 sig === 'SIGKILL' 分支");
 });
 
 test("[AUDIT-10] repair-local-images 在 retry > 0 时短暂退避并继续消费下一批；crawler 0 评论清零 aborted 时记入 incomplete", async () => {
@@ -2939,6 +2945,27 @@ test("[AUDIT-10] repair-local-images 在 retry > 0 时短暂退避并继续消�
   await ctx.__consume({ value: "sec" });
   assert.equal(batchNo, 3, "retry > 0 时不应中止消费，应继续拉完后续批次");
   assert.deepEqual(delays, [25], "retry > 0 且继续下一批前必须执行退避等待");
+
+  // 1b) REPAIR_IMAGE_RETRY_BACKOFF_MS 为纯空白字符串时回退默认 1500ms
+  let batchNoB = 0;
+  const delaysB = [];
+  const ctxB = vm.createContext({
+    opts: { imageBatchSize: 10, imageMaxBatches: 2 },
+    IMAGE_BATCH_TIMEOUT_MS: 5000,
+    process: { env: { REPAIR_IMAGE_RETRY_BACKOFF_MS: "   " } },
+    setTimeout: (fn, ms) => { delaysB.push(ms); return setTimeout(fn, 0); },
+    log() {},
+    localRequest: async () => {
+      batchNoB++;
+      if (batchNoB === 1) {
+        return { res: { ok: true }, json: { claimed: 5, done: 4, failed: 0, retry: 1 } };
+      }
+      return { res: { ok: true }, json: { claimed: 0, done: 0, failed: 0, retry: 0 } };
+    }
+  });
+  vm.runInContext(`${fnCode}\nglobalThis.__consumeB = consumeImageBatches;`, ctxB);
+  await ctxB.__consumeB({ value: "sec" });
+  assert.deepEqual(delaysB, [1500], "REPAIR_IMAGE_RETRY_BACKOFF_MS 为空白字符串时必须回退默认 1500ms");
 
   // 2) crawler explicitCommentCount === 0 被 aborted 时登记 commentSyncIncomplete
   const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");

@@ -859,7 +859,8 @@ async function consumeImageBatches(secret) {
       break;
     }
     if (one.retry > 0 && (opts.imageMaxBatches === 0 || batches < opts.imageMaxBatches)) {
-      const envBackoff = typeof process !== "undefined" ? Number(process.env?.REPAIR_IMAGE_RETRY_BACKOFF_MS) : NaN;
+      const rawBackoff = typeof process !== "undefined" ? process.env?.REPAIR_IMAGE_RETRY_BACKOFF_MS : undefined;
+      const envBackoff = rawBackoff?.trim() ? Number(rawBackoff) : NaN;
       const backoffMs = Number.isFinite(envBackoff) && envBackoff >= 0 ? Math.trunc(envBackoff) : 1500;
       if (backoffMs > 0 && typeof setTimeout === "function") {
         log(`[consume] 本批有 ${one.retry} 张图待重试，等待 ${backoffMs}ms 后继续下一批...`);

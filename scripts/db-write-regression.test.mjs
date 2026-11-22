@@ -8963,22 +8963,29 @@ test("[AUDIT-6] saveExternalTargetsRaw 清空最后一个目标时 D1 新版本�
   }
 });
 
-test("[AUDIT-7] claimImageTasks 按 attempts ASC, id ASC 优先领取低尝试次数任务", async () => {
+test("[AUDIT-7] claimImageTasks 按 updated_at ASC, id ASC 优先领取旧任务；刚重试的退后、历史重试不饿死", async () => {
   const { sqlite, d1 } = createMemoryDb();
   seedContent(sqlite);
-  const nowIso = new Date().toISOString();
-  // id=1 已重试 2 次；id=2 全新 0 次
+  const baseTime = new Date("2026-01-01T00:00:00Z");
+  const olderIso = new Date(baseTime.getTime() - 60000).toISOString();  // 1 分钟前
+  const nowIso = baseTime.toISOString();
+  const newerIso = new Date(baseTime.getTime() + 60000).toISOString();  // 1 分钟后
+
+  // id=1: 刚失败重试 (attempts=2)，updated_at 刚刷新为 newerIso
+  // id=2: 全新任务 (attempts=0)，updated_at = nowIso
+  // id=3: 历史重试任务 (attempts=3)，updated_at 较早 = olderIso
   sqlite.prepare(`
     INSERT INTO image_tasks (content_pk, image_url, object_key, status, attempts, created_at, updated_at)
     VALUES
-      (?, 'https://pic1.zhimg.com/old-bad.jpg', 'images/bad.jpg', 'pending', 2, ?, ?),
-      (?, 'https://pic1.zhimg.com/fresh.jpg', 'images/fresh.jpg', 'pending', 0, ?, ?)
-  `).run(CONTENT_PK, nowIso, nowIso, CONTENT_PK, nowIso, nowIso);
+      (?, 'https://pic1.zhimg.com/retry-fresh.jpg', 'images/retry-fresh.jpg', 'pending', 2, ?, ?),
+      (?, 'https://pic1.zhimg.com/brand-new.jpg', 'images/brand-new.jpg', 'pending', 0, ?, ?),
+      (?, 'https://pic1.zhimg.com/retry-old.jpg', 'images/retry-old.jpg', 'pending', 3, ?, ?)
+  `).run(CONTENT_PK, nowIso, newerIso, CONTENT_PK, nowIso, nowIso, CONTENT_PK, olderIso, olderIso);
 
-  const claimedObjectKeys = [];
+  const claimedUrls = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async url => {
-    claimedObjectKeys.push(String(url));
+    claimedUrls.push(String(url));
     return new Response(new Uint8Array([1, 2, 3]), {
       status: 200,
       headers: { "content-type": "image/jpeg", "content-length": "3" }
@@ -8990,10 +8997,22 @@ test("[AUDIT-7] claimImageTasks 按 attempts ASC, id ASC 优先领取低尝试�
     async put() {}
   };
   try {
-    const res = await runWithDb(d1, () => imageTasksModule.processImageBatch(bucket, 1));
-    assert.equal(res.claimed, 1);
-    assert.equal(res.done, 1);
-    assert.deepEqual(claimedObjectKeys, ["https://pic1.zhimg.com/fresh.jpg"], "limit=1 时必须优先领取 attempts=0 的新任务");
+    // (1) limit=1 时，应优先领取 updated_at 最早的 id=3（历史重试不饿死）
+    const res1 = await runWithDb(d1, () => imageTasksModule.processImageBatch(bucket, 1));
+    assert.equal(res1.claimed, 1);
+    assert.equal(res1.done, 1);
+    assert.deepEqual(claimedUrls, ["https://pic1.zhimg.com/retry-old.jpg"],
+      "limit=1 时必须优先领取 updated_at 最早的历史重试任务（不饿死）");
+
+    // (2) limit=2 时继续，应按 updated_at 排序领取 id=2（新任务 nowIso）先于 id=1（刚重试 newerIso）
+    claimedUrls.length = 0;
+    const res2 = await runWithDb(d1, () => imageTasksModule.processImageBatch(bucket, 2));
+    assert.equal(res2.claimed, 2);
+    assert.equal(res2.done, 2);
+    assert.deepEqual(claimedUrls, [
+      "https://pic1.zhimg.com/brand-new.jpg",
+      "https://pic1.zhimg.com/retry-fresh.jpg"
+    ], "刚失败刷新 updated_at 的重试任务必须排在同期新任务之后");
   } finally {
     globalThis.fetch = originalFetch;
   }

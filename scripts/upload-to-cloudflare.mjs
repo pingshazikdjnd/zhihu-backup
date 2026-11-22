@@ -1200,7 +1200,7 @@ if (shouldWipe) {
   console.log("  A1. wrangler d1 migrations apply --remote ...");
   const mig = await withRetry(
     async () => {
-      const r = await runWrangler(["d1", "migrations", "apply", DB_NAME, "--remote", "--yes"], {
+      const r = await runWrangler(["d1", "migrations", "apply", DB_NAME, "--remote"], {
         timeoutMs: 10 * 60 * 1000
       });
       if (r.code !== 0) throw new Error(`wrangler 退出码 ${r.code}：${(r.stderr || r.stdout).slice(-800)}`);

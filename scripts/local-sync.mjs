@@ -329,7 +329,7 @@ async function runMain() {
           activeChild = child;
           child.on("close", (exitCode, sig) => {
             activeChild = null;
-            if (exitCode === CRAWLER_LOCK_RETAINED_EXIT_CODE) {
+            if (exitCode === CRAWLER_LOCK_RETAINED_EXIT_CODE || sig === "SIGKILL") {
               retainCloudLockOnExit = true;
             }
             resolve(exitCode !== null ? exitCode : (sig ? 130 : 1));
@@ -584,7 +584,7 @@ async function runMain() {
         activeChild = runProc;
         runProc.on("close", (c, sig) => {
           activeChild = null;
-          if (c === CRAWLER_LOCK_RETAINED_EXIT_CODE) {
+          if (c === CRAWLER_LOCK_RETAINED_EXIT_CODE || sig === "SIGKILL") {
             retainCloudLockOnExit = true;
           }
           resolve(c !== null ? c : (sig ? 130 : 1));

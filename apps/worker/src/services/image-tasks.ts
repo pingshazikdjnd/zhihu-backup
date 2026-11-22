@@ -131,7 +131,7 @@ async function claimImageTasks(limit: number): Promise<ImageTaskRow[]> {
     SELECT id, content_pk, image_url, object_key, status, attempts, updated_at
     FROM image_tasks
     WHERE status = 'pending' OR (status = 'processing' AND updated_at < ?)
-    ORDER BY attempts ASC, id ASC
+    ORDER BY updated_at ASC, id ASC  -- 失败重试刷新 updated_at 自动退到同期新任务之后，旧重试/陈旧 processing 随 updated_at 老化不饿死
     LIMIT ?
   `).all<ImageTaskRow>(staleBefore, limit);
   if (!candidates.length) return [];

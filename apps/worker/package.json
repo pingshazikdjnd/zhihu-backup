@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler d1 migrations apply zhihu-backup --remote --yes && wrangler deploy"
+    "deploy": "wrangler d1 migrations apply zhihu-backup --remote && wrangler deploy"
   },
   "dependencies": {
     "hono": "^4.6.16",
