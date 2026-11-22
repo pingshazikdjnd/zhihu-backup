@@ -512,9 +512,62 @@ function parseCloudflareD1DatabaseId(databaseId: string | undefined): { accId: s
   return accId && dbId ? { accId, dbId } : null;
 }
 
+/** 外部库 SQL 调用的可选超时 / 取消控制 */
+export type RemoteSqlOptions = {
+  /** 整次调用超时毫秒数，默认 10_000ms */
+  timeoutMs?: number;
+  /** 外部取消信号，可与 timeoutMs 叠加 */
+  signal?: AbortSignal;
+};
+
+const DEFAULT_REMOTE_SQL_TIMEOUT_MS = 10_000;
+
+/** 把任意 abort reason 归一为 Error，保证调用方能看到明确的中止原因 */
+function remoteAbortError(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  if (typeof reason === "string" && reason) return new Error(reason);
+  return new Error("外部库 SQL 请求已中止");
+}
+
+/**
+ * 读取响应体时保持取消能力。
+ * fetch 的 signal 只保证「响应头返回前」reject：服务端先回 200 再卡住 body 时，
+ * res.json() / res.text() 会一直挂着，必须在这里与 abort 事件 race，
+ * 并在中止时立刻取消底层流，避免连接处于半开状态持续占用。
+ */
+async function readRemoteResponseBody<T>(
+  res: Response,
+  signal: AbortSignal,
+  read: () => Promise<T>
+): Promise<T> {
+  if (signal.aborted) {
+    await res.body?.cancel().catch(() => {});
+    throw remoteAbortError(signal.reason);
+  }
+  let rejectAbort: ((err: Error) => void) | null = null;
+  const aborted = new Promise<never>((_, reject) => {
+    rejectAbort = reject;
+  });
+  const onAbort = () => rejectAbort?.(remoteAbortError(signal.reason));
+  signal.addEventListener("abort", onAbort, { once: true });
+  const readPromise = read();
+  readPromise.catch(() => {});
+  try {
+    return await Promise.race([readPromise, aborted]);
+  } catch (err) {
+    // 超时/中止/解析失败：尽力取消底层流；中止场景统一抛出可读的超时错误
+    res.body?.cancel().catch(() => {});
+    if (signal.aborted) throw remoteAbortError(signal.reason);
+    throw err;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 async function executeTursoBatch(
   target: ExternalStorageTarget,
-  statements: RemoteSqlStatement[]
+  statements: RemoteSqlStatement[],
+  signal: AbortSignal
 ): Promise<RemoteSqlResult[]> {
   const url = `${target.endpointUrl.replace(/\/+$/, "")}/v2/pipeline`;
   const res = await fetch(url, {
@@ -532,13 +585,24 @@ async function executeTursoBatch(
         })),
         { type: "close" }
       ]
-    })
+    }),
+    signal
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
+    let text = "";
+    try {
+      text = await readRemoteResponseBody(res, signal, () => res.text());
+    } catch (err) {
+      if (signal.aborted) throw err;
+    }
     throw new Error(`Turso ${res.status}: ${text.slice(0, 180)}`);
   }
-  const json = await res.json().catch(() => null) as any;
+  let json: any = null;
+  try {
+    json = await readRemoteResponseBody(res, signal, () => res.json());
+  } catch (err) {
+    if (signal.aborted) throw err;
+  }
   const results = Array.isArray(json?.results) ? json.results : [];
   // 每条 execute 都按序对应一个 result；close 的 result 在最后
   return statements.map((_, i) => parseTursoExecuteResult(results[i], i));
@@ -547,7 +611,8 @@ async function executeTursoBatch(
 async function executeD1Statement(
   target: ExternalStorageTarget,
   sql: string,
-  params: unknown[]
+  params: unknown[],
+  signal: AbortSignal
 ): Promise<RemoteSqlResult> {
   const ids = parseCloudflareD1DatabaseId(target.databaseId);
   if (!ids) throw new Error("跨账号 D1 需要按 AccountID/DatabaseID 填写数据库标识");
@@ -563,13 +628,24 @@ async function executeD1Statement(
       "Content-Type": "application/json",
       ...(target.authToken ? { Authorization: `Bearer ${target.authToken}` } : {})
     },
-    body: JSON.stringify({ sql, params: params.map(p => (p === undefined ? null : p)) })
+    body: JSON.stringify({ sql, params: params.map(p => (p === undefined ? null : p)) }),
+    signal
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
+    let text = "";
+    try {
+      text = await readRemoteResponseBody(res, signal, () => res.text());
+    } catch (err) {
+      if (signal.aborted) throw err;
+    }
     throw new Error(`Cloudflare D1 ${res.status}: ${text.slice(0, 180)}`);
   }
-  const json = await res.json().catch(() => null) as any;
+  let json: any = null;
+  try {
+    json = await readRemoteResponseBody(res, signal, () => res.json());
+  } catch (err) {
+    if (signal.aborted) throw err;
+  }
   if (json?.success === false) {
     throw new Error(`Cloudflare D1 错误: ${JSON.stringify(json?.errors || json).slice(0, 180)}`);
   }
@@ -585,22 +661,46 @@ async function executeD1Statement(
  */
 export async function executeRemoteSqlBatch(
   target: ExternalStorageTarget,
-  statements: RemoteSqlStatement[]
+  statements: RemoteSqlStatement[],
+  opts: RemoteSqlOptions = {}
 ): Promise<RemoteSqlResult[]> {
   if (!statements.length) return [];
   if (!target?.endpointUrl) throw new Error("外部库连接地址为空");
 
-  if (target.provider === "turso") {
-    return executeTursoBatch(target, statements);
-  }
-  if (target.provider === "cloudflare_d1") {
-    const results: RemoteSqlResult[] = [];
-    for (const statement of statements) {
-      results.push(await executeD1Statement(target, statement.sql, statement.params ?? []));
+  // 外部已取消：立刻中止，绝不再发起网络请求
+  if (opts.signal?.aborted) throw remoteAbortError(opts.signal.reason);
+
+  // 整批共享同一个超时预算：cloudflare_d1 需要逐条串行，不能被放大成 N × timeout
+  const timeoutMs =
+    typeof opts.timeoutMs === "number" && opts.timeoutMs > 0
+      ? opts.timeoutMs
+      : DEFAULT_REMOTE_SQL_TIMEOUT_MS;
+  const controller = new AbortController();
+  const onExternalAbort = () => controller.abort(opts.signal?.reason);
+  opts.signal?.addEventListener("abort", onExternalAbort, { once: true });
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`外部库 SQL 超时（${timeoutMs}ms，${target.name || target.id}）`));
+  }, timeoutMs);
+
+  try {
+    if (target.provider === "turso") {
+      return await executeTursoBatch(target, statements, controller.signal);
     }
-    return results;
+    if (target.provider === "cloudflare_d1") {
+      const results: RemoteSqlResult[] = [];
+      for (const statement of statements) {
+        if (controller.signal.aborted) throw remoteAbortError(controller.signal.reason);
+        results.push(
+          await executeD1Statement(target, statement.sql, statement.params ?? [], controller.signal)
+        );
+      }
+      return results;
+    }
+    throw new Error(`外部存储类型 ${target.provider} 不支持远程 SQL`);
+  } finally {
+    clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", onExternalAbort);
   }
-  throw new Error(`外部存储类型 ${target.provider} 不支持远程 SQL`);
 }
 
 /**
@@ -610,9 +710,10 @@ export async function executeRemoteSqlBatch(
 export async function executeRemoteSql(
   target: ExternalStorageTarget,
   sql: string,
-  params: unknown[] = []
+  params: unknown[] = [],
+  opts: RemoteSqlOptions = {}
 ): Promise<RemoteSqlResult> {
-  const results = await executeRemoteSqlBatch(target, [{ sql, params }]);
+  const results = await executeRemoteSqlBatch(target, [{ sql, params }], opts);
   return results[0] ?? { rows: [], changes: 0 };
 }
 

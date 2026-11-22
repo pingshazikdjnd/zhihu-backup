@@ -24,6 +24,8 @@ const BATCH_SIZE = 100;
 const CHILD_THREAD_CACHE_TTL_SECONDS = 30;
 // Cloudflare D1 单条 SQL 绑定参数硬上限为 100，统一封顶 90 留足安全余量
 const D1_MAX_SQL_PARAMS = 90;
+// 非活跃外部库探测只是收敛判定用的旁路查询：必须短超时，绝不能被闲置外库拖住主库提交
+const INACTIVE_REMOTE_PROBE_TIMEOUT_MS = 1500;
 
 /**
  * 评论同步。
@@ -566,12 +568,14 @@ function mergeIncompleteRootTimestamps(
   }
 }
 
-/** 探测非活跃库（主 D1 / 其他外部库）里的未完成活根；逐库 try/catch，绝不阻断当前写入 */
+/** 探测非活跃库（主 D1 / 其他外部库）里的未完成活根；逐库隔离失败，绝不阻断当前写入 */
 async function probeInactiveIncompleteTimestamps(args: {
   contentPk: string;
   ids: string[];
   mainDatabase?: D1Database | null;
   remoteTargets: ExternalStorageTarget[];
+  /** 短超时覆盖（单测用）；生产默认 INACTIVE_REMOTE_PROBE_TIMEOUT_MS */
+  probeTimeoutMs?: number;
 }): Promise<Map<string, number | null>> {
   const inactiveIncomplete = new Map<string, number | null>();
   if (args.ids.length === 0) return inactiveIncomplete;
@@ -584,13 +588,23 @@ async function probeInactiveIncompleteTimestamps(args: {
       console.warn("[comments] inactive incomplete probe failed (main D1):", err);
     }
   }
-  for (const target of args.remoteTargets) {
-    try {
-      const result = await executeRemoteSql(target, sql, params);
-      mergeIncompleteRootTimestamps(result.rows as IncompleteRootRow[], inactiveIncomplete);
-    } catch (err) {
-      console.warn(`[comments] inactive incomplete probe failed (${target.name || target.id}):`, err);
-    }
+  if (args.remoteTargets.length > 0) {
+    const timeoutMs = args.probeTimeoutMs ?? INACTIVE_REMOTE_PROBE_TIMEOUT_MS;
+    // 并发探测：同一批的总等待上限封顶为单次短超时，而不是 N × timeout。
+    // 单个目标超时/异常只记 warn 并跳过，绝不阻塞或中断主库/当前活跃库的后续提交。
+    const settled = await Promise.allSettled(
+      args.remoteTargets.map(target =>
+        executeRemoteSql(target, sql, params, { timeoutMs })
+      )
+    );
+    settled.forEach((outcome, index) => {
+      const target = args.remoteTargets[index];
+      if (outcome.status === "fulfilled") {
+        mergeIncompleteRootTimestamps(outcome.value.rows as IncompleteRootRow[], inactiveIncomplete);
+      } else {
+        console.warn(`[comments] inactive incomplete probe failed (${target.name || target.id}):`, outcome.reason);
+      }
+    });
   }
   return inactiveIncomplete;
 }
@@ -691,22 +705,32 @@ function buildRootChangeStatement(
  */
 export function replaceCommentsByRoot(
   input: IngestCommentsByRootInput,
-  env: { BUCKET: R2Bucket; DB: D1Database }
+  env: CommentsRootWriteEnv
 ) {
   return withKeyLock(`comments:${input.contentPk}`, () => replaceCommentsByRootInner(input, env));
 }
 
+/** 按根写入评论的 env；inactiveProbeTimeoutMs 仅供单测缩短非活跃外库探测超时 */
+type CommentsRootWriteEnv = {
+  BUCKET: R2Bucket;
+  DB: D1Database;
+  inactiveProbeTimeoutMs?: number;
+};
+
 async function replaceCommentsByRootInner(
   input: IngestCommentsByRootInput,
-  env: { BUCKET: R2Bucket; DB: D1Database }
+  env: CommentsRootWriteEnv
 ) {
   // 扩容分流：命中外部分流库时，整批评论（根评论 + 线程索引 + 楼中楼 JSON）只写外部库，
   // 主 D1 的 comments / comment_threads / change_events 与主 R2 的 childcomments/* 全部跳过。
   const offloadTarget = await resolveActiveOffloadTarget(env.BUCKET, "comments").catch(() => null);
+  // 活跃分流库写入失败降级回主 D1 时，本次绝不回头探测该故障外库（探测只会再等一次超时）
+  let offloadWriteFailed = false;
   if (offloadTarget && (offloadTarget.provider === "turso" || offloadTarget.provider === "cloudflare_d1")) {
     try {
       return await replaceCommentsByRootOffloaded(input, offloadTarget, env);
     } catch (err) {
+      offloadWriteFailed = true;
       console.warn(`[comments] 外部扩容库写入失败 (${offloadTarget.name})，降级写回主库:`, err);
     }
   }
@@ -1328,7 +1352,13 @@ async function replaceCommentsByRootInner(
   // 「已确认收敛却命中快路径」时按需探测非活跃库（主 D1 是实际写入目标时即全部可读外部库）：
   // 只有对方存在更晚的未完成活根，才追加一条轻量 synced_at / last_seen_at 刷新；
   // 无外部目标或无更晚记录时保持 0 额外写入（重复同步的零写回归不受影响）。
-  if (confirmedFastPathRoots.size > 0 || (!input.partial && alreadyDeletedRoots.length > 0)) {
+  // 只有当 offloadTarget === null（主 D1 本身就是当前实际写入目标，例如未达阈值的 overflow）时才去探测非活跃外部库；
+  // 若本次是从刚失败的活跃外库降级回主 D1，直接跳过外部库探测，避免对刚故障的外部库再等一次超时。
+  if (
+    !offloadWriteFailed &&
+    offloadTarget === null &&
+    (confirmedFastPathRoots.size > 0 || (!input.partial && alreadyDeletedRoots.length > 0))
+  ) {
     const readableTargets = await listReadableCommentOffloadTargets(env.BUCKET).catch(() => []);
     if (readableTargets.length > 0) {
       const candidateIds = Array.from(new Set([
@@ -1338,7 +1368,8 @@ async function replaceCommentsByRootInner(
       const inactiveIncomplete = await probeInactiveIncompleteTimestamps({
         contentPk: input.contentPk,
         ids: candidateIds,
-        remoteTargets: readableTargets
+        remoteTargets: readableTargets,
+        probeTimeoutMs: env.inactiveProbeTimeoutMs
       });
       if (inactiveIncomplete.size > 0) {
         const plan = planInactiveIncompleteRefreshes({
@@ -1725,7 +1756,7 @@ async function flushRemoteStatements(
 async function replaceCommentsByRootOffloaded(
   input: IngestCommentsByRootInput,
   target: ExternalStorageTarget,
-  env: { BUCKET: R2Bucket; DB: D1Database }
+  env: CommentsRootWriteEnv
 ) {
   const now = new Date().toISOString();
   await ensureRemoteCommentSchema(target);
@@ -2515,7 +2546,8 @@ async function replaceCommentsByRootOffloaded(
       contentPk: input.contentPk,
       ids: candidateIds,
       mainDatabase: env.DB,
-      remoteTargets: otherReadableTargets
+      remoteTargets: otherReadableTargets,
+      probeTimeoutMs: env.inactiveProbeTimeoutMs
     });
     if (inactiveIncomplete.size > 0) {
       const plan = planInactiveIncompleteRefreshes({
@@ -2827,15 +2859,20 @@ export async function hasIncompleteLiveRoot(
     }
 
     // A2) 再看非活跃外部库残留的未完成活根。
+    // 并发 + 短超时：闲置外库挂起时总等待封顶为单次超时，绝不能拖死读探测。
     const unresolved = new Map<string, number | null>();
-    for (const target of offloadTargets) {
-      try {
-        const result = await executeRemoteSql(target, rootRowsSql, [contentPk]);
-        mergeIncompleteRows(result.rows as IncompleteRootRow[], unresolved);
-      } catch (err) {
-        warnProbeFailure(target, err);
+    const inactiveSettled = await Promise.allSettled(
+      offloadTargets.map(target =>
+        executeRemoteSql(target, rootRowsSql, [contentPk], { timeoutMs: INACTIVE_REMOTE_PROBE_TIMEOUT_MS })
+      )
+    );
+    inactiveSettled.forEach((outcome, index) => {
+      if (outcome.status === "fulfilled") {
+        mergeIncompleteRows(outcome.value.rows as IncompleteRootRow[], unresolved);
+      } else {
+        warnProbeFailure(offloadTargets[index], outcome.reason);
       }
-    }
+    });
     if (unresolved.size === 0) return false;
 
     // A3) 只允许主 D1 的收敛证据剔除旧副本；收敛查询失败时保守触发重试。
@@ -2869,15 +2906,20 @@ export async function hasIncompleteLiveRoot(
   } catch (err) {
     console.warn("[comments] hasIncompleteLiveRoot main probe failed:", err);
   }
-  for (const target of offloadTargets) {
-    if (target.id === activeOffloadTarget.id) continue;
-    try {
-      const result = await executeRemoteSql(target, rootRowsSql, [contentPk]);
-      mergeIncompleteRows(result.rows as IncompleteRootRow[], unresolved);
-    } catch (err) {
-      warnProbeFailure(target, err);
+  const inactiveTargets = offloadTargets.filter(target => target.id !== activeOffloadTarget.id);
+  // 并发 + 短超时：单个闲置外库挂起只跳过该库，绝不让整个读探测等到 N × 超时。
+  const inactiveSettled = await Promise.allSettled(
+    inactiveTargets.map(target =>
+      executeRemoteSql(target, rootRowsSql, [contentPk], { timeoutMs: INACTIVE_REMOTE_PROBE_TIMEOUT_MS })
+    )
+  );
+  inactiveSettled.forEach((outcome, index) => {
+    if (outcome.status === "fulfilled") {
+      mergeIncompleteRows(outcome.value.rows as IncompleteRootRow[], unresolved);
+    } else {
+      warnProbeFailure(inactiveTargets[index], outcome.reason);
     }
-  }
+  });
   if (unresolved.size === 0) return false;
 
   // B3) 实际写入库不可达时无法证明已收敛，保守触发重试。

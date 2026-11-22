@@ -8285,3 +8285,276 @@ test("[PR2-6] 主 D1 为实际写入目标时非活跃 overflow 的较新未完�
     auth.resetRemoteSchemaCache();
   }
 });
+
+// ---------- PR #2 P1 审查项：外部库探测超时与并发隔离 ----------
+
+/** 单根 payload（r1 + 一条子回复），用于快速路径/挂起隔离回归 */
+function pr2RootPayload(id, childId) {
+  return {
+    contentPk: CONTENT_PK,
+    partial: false,
+    allRootIds: [id],
+    roots: [{
+      id,
+      author: "U",
+      authorAvatar: "",
+      content: `root ${id}`,
+      img: "",
+      time: NOW_ISO,
+      location: "",
+      likes: 10,
+      isAuthor: false,
+      isTop: false,
+      isFeatured: false,
+      childCount: 1,
+      isChildrenComplete: true,
+      children: [{ id: childId, parentId: id, author: "A", content: `reply ${childId}`, likes: 1, isAuthor: false }]
+    }]
+  };
+}
+
+function pr2Root(id, childId) {
+  return {
+    id,
+    author: "U",
+    authorAvatar: "",
+    content: `root ${id}`,
+    img: "",
+    time: NOW_ISO,
+    location: "",
+    likes: 10,
+    isAuthor: false,
+    isTop: false,
+    isFeatured: false,
+    childCount: 1,
+    isChildrenComplete: true,
+    children: [{ id: childId, parentId: id, author: "A", content: `reply ${childId}`, likes: 1, isAuthor: false }]
+  };
+}
+
+test("[PR2-P1] 闲置 overflow 外库挂起不阻塞主库提交（greptile P1）", { timeout: 10_000 }, async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.invalidateMainCommentCountCache();
+  auth.resetRemoteSchemaCache();
+
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+
+  const { bucket, store } = makeTrackedBucket();
+  // 先在无外库配置下写入 r1 的完整快照：后续同 payload 会命中已抓全快路径
+  const first = await runWithDb(d1, () =>
+    commentsModule.replaceCommentsByRoot(pr2RootPayload("r1", "ch1"), { DB: d1, BUCKET: bucket })
+  );
+  assert.equal(first.r2Puts, 1);
+
+  // 配置未达阈值的 overflow：实际写入目标仍是主 D1
+  const target = {
+    ...makeTursoTarget("ext-pr2-idle-overflow", "https://ext-pr2-idle-overflow.example.com"),
+    storageRole: "overflow",
+    overflowThresholdRows: 1_500_000
+  };
+  store.set(auth.R2_EXTERNAL_TARGETS_KEY, JSON.stringify([target]));
+  auth.invalidateExternalTargetsCache();
+  auth.invalidateMainCommentCountCache();
+  assert.equal(
+    await runWithDb(d1, () => auth.resolveActiveOffloadTarget(bucket, "comments")),
+    null,
+    "阈值未达时 overflow 不得成为实际写入库"
+  );
+
+  // 闲置外库「建连后永不响应」，只在收到 AbortSignal abort 时 reject
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  const warnings = [];
+  let fetchCalls = 0;
+  let receivedSignal = null;
+  console.warn = (...args) => { warnings.push(args); };
+  globalThis.fetch = (_url, init = {}) => {
+    fetchCalls++;
+    receivedSignal = init.signal ?? null;
+    return new Promise((_resolve, reject) => {
+      const signal = init.signal;
+      if (!signal) return; // 没有超时信号的实现会永久挂起（本回归要抓的 P1）
+      const fail = () => reject(new Error("idle external db aborted"));
+      if (signal.aborted) fail();
+      else signal.addEventListener("abort", fail, { once: true });
+    });
+  };
+  try {
+    const started = Date.now();
+    const second = await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot(
+        {
+          ...pr2RootPayload("r1", "ch1"),
+          allRootIds: ["r1", "r2"],
+          roots: [pr2Root("r1", "ch1"), pr2Root("r2", "ch2")]
+        },
+        { DB: d1, BUCKET: bucket, inactiveProbeTimeoutMs: 50 }
+      )
+    );
+    const elapsed = Date.now() - started;
+
+    assert.ok(elapsed < 2000, `主库提交不得被闲置外库拖住，实际耗时 ${elapsed}ms`);
+    assert.equal(fetchCalls, 1, "同一批只应探测闲置外库一次");
+    assert.ok(receivedSignal, "探测必须把 AbortSignal 传给 fetch");
+    assert.equal(receivedSignal.aborted, true, "短超时后 fetch 的 AbortSignal 必须真正 abort");
+
+    // r2 的根评论 / 线程索引 / R2 子评论必须已提交
+    assert.ok(
+      sqlite.prepare(`SELECT 1 AS found FROM comments WHERE id = 'r2' AND content_pk = ?`).get(CONTENT_PK),
+      "主库 comments 必须落库 r2"
+    );
+    assert.ok(
+      sqlite.prepare(`SELECT 1 AS found FROM comment_threads WHERE root_id = 'r2'`).get(),
+      "主库 comment_threads 必须落库 r2"
+    );
+    assert.ok(store.has("childcomments/r2.json"), "主 R2 必须写入 r2 的子评论");
+    assert.equal(second.r2Puts, 1, "只有新增 r2 需要写 R2");
+    assert.equal(second.threadUpserts, 1, "r1 命中已抓全快路径，线程索引只写 r2");
+    assert.ok(
+      warnings.some(args => String(args[0]).includes("inactive incomplete probe failed")),
+      "闲置外库超时只记 warn 并跳过，不得影响主库提交"
+    );
+  } finally {
+    console.warn = originalWarn;
+    globalThis.fetch = originalFetch;
+    auth.invalidateExternalTargetsCache();
+    auth.invalidateMainCommentCountCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
+
+test("[PR2-P1] 响应头 200 后响应体卡死也必须被超时取消（executeRemoteSql）", { timeout: 10_000 }, async () => {
+  const auth = workerModules.auth;
+  const target = makeTursoTarget("ext-pr2-body-hang", "https://ext-pr2-body-hang.example.com");
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  let fetchCalls = 0;
+  let cancelCalls = 0;
+  const pendingProbeTimers = new Set();
+
+  globalThis.fetch = async () => {
+    fetchCalls++;
+    // 先回 200 头，再让 json()/text() 永远不 resolve：模拟响应体卡死
+    return {
+      ok: true,
+      status: 200,
+      json: () => new Promise(() => {}),
+      text: () => new Promise(() => {}),
+      body: {
+        cancel: async () => {
+          cancelCalls++;
+        }
+      }
+    };
+  };
+  // 只追踪本次探测的 50ms 定时器，避免误伤测试框架内部计时器
+  globalThis.setTimeout = (fn, ms, ...args) => {
+    const handle = originalSetTimeout(fn, ms, ...args);
+    if (ms === 50) pendingProbeTimers.add(handle);
+    return handle;
+  };
+  globalThis.clearTimeout = handle => {
+    pendingProbeTimers.delete(handle);
+    return originalClearTimeout(handle);
+  };
+
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      auth.executeRemoteSql(target, "SELECT 1 AS x", [], { timeoutMs: 50 }),
+      /超时|中止/,
+      "响应体卡死必须在超时后 reject，而不是永久挂起"
+    );
+    assert.ok(Date.now() - started < 2000, "必须在短超时附近返回");
+    assert.equal(cancelCalls, 1, "超时中断等待后必须尽力 cancel 响应体");
+    assert.equal(pendingProbeTimers.size, 0, "超时定时器必须在 finally 中清理，不得泄漏");
+
+    // 外部 signal 已 aborted：立刻中止且绝不发起 fetch
+    const callsBefore = fetchCalls;
+    await assert.rejects(
+      auth.executeRemoteSql(target, "SELECT 1 AS x", [], {
+        signal: AbortSignal.abort(new Error("client cancelled"))
+      }),
+      /client cancelled|中止/
+    );
+    assert.equal(fetchCalls, callsBefore, "外部 signal 已 aborted 时不得再发起 fetch");
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+});
+
+test("[PR2-P1] 活跃 offload 写入失败降级回主库时不得二次探测故障外库", { timeout: 10_000 }, async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.invalidateMainCommentCountCache();
+  auth.resetRemoteSchemaCache();
+
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+
+  const { bucket, store } = makeTrackedBucket();
+  // 先在无外库配置下写入 r1 的完整快照
+  await runWithDb(d1, () =>
+    commentsModule.replaceCommentsByRoot(pr2RootPayload("r1", "ch1"), { DB: d1, BUCKET: bucket })
+  );
+
+  // 配置直接分流的 offload 外库：所有远端请求立刻失败
+  const target = makeTursoTarget("ext-pr2-offload-down", "https://ext-pr2-offload-down.example.com");
+  store.set(auth.R2_EXTERNAL_TARGETS_KEY, JSON.stringify([target]));
+  auth.invalidateExternalTargetsCache();
+  assert.equal(
+    (await runWithDb(d1, () => auth.resolveActiveOffloadTarget(bucket, "comments")))?.id,
+    target.id,
+    "offload 角色必须成为实际写入库"
+  );
+
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  const warnings = [];
+  let fetchCalls = 0;
+  console.warn = (...args) => { warnings.push(args); };
+  globalThis.fetch = async () => {
+    fetchCalls++;
+    throw new Error("offload unavailable");
+  };
+  try {
+    const res = await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot(
+        {
+          ...pr2RootPayload("r1", "ch1"),
+          allRootIds: ["r1", "r2"],
+          roots: [pr2Root("r1", "ch1"), pr2Root("r2", "ch2")]
+        },
+        { DB: d1, BUCKET: bucket, inactiveProbeTimeoutMs: 50 }
+      )
+    );
+
+    assert.equal(fetchCalls, 1, "只允许失败的分流写入尝试一次；降级后不得再探测故障外库");
+    assert.equal(res.r2Puts, 1, "r1 快路径不写 R2，只有 r2 需要写入");
+    assert.equal(res.threadUpserts, 1, "r1 命中快路径，主库线程索引只写 r2");
+    assert.ok(
+      sqlite.prepare(`SELECT 1 AS found FROM comments WHERE id = 'r2' AND content_pk = ?`).get(CONTENT_PK),
+      "降级后主库必须成功提交 r2 根评论"
+    );
+    assert.ok(
+      sqlite.prepare(`SELECT 1 AS found FROM comment_threads WHERE root_id = 'r2'`).get(),
+      "降级后主库必须成功提交 r2 线程索引"
+    );
+    assert.ok(store.has("childcomments/r2.json"), "降级后主 R2 必须写入 r2 子评论");
+    assert.ok(
+      warnings.some(args => String(args[0]).includes("外部扩容库写入失败")),
+      "必须记录分库失败降级 warn"
+    );
+  } finally {
+    console.warn = originalWarn;
+    globalThis.fetch = originalFetch;
+    auth.invalidateExternalTargetsCache();
+    auth.invalidateMainCommentCountCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
