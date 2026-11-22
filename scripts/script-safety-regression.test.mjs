@@ -1807,6 +1807,7 @@ test("[P1-7][P2-9] local-sync 代理 IPC 软停/等 close 再放锁/幂等、cra
     apiUrl: "https://worker.example",
     apiSecret: "sec",
     syncLockReleasePromise: null,
+    syncLockSkippedOnAbort: false,
     fetch: () => {
       fetchCalls++;
       return new Promise(r => { resolveFetch = r; });
@@ -2096,12 +2097,13 @@ test("[M1] crawler 中止停写、排空在途写入后再放锁，并在途挂�
     extractFunction(crawlerJs, "sanitizeErrorForLog"),
     "async " + extractFunction(crawlerJs, "releaseSyncLockBeforeExit"),
     extractFunction(crawlerJs, "waitForInFlightIngestWrites"),
+    "async " + extractFunction(crawlerJs, "closeActiveBrowsers"),
     "async " + extractFunction(crawlerJs, "stopWorkAndReleaseSyncLock"),
     "async " + extractFunction(crawlerJs, "post"),
     "async " + extractFunction(crawlerJs, "postCommentsByRoot")
   ].join("\n");
 
-  const runScenario = async ({ hangInFlight }) => {
+  const runScenario = async ({ hangInFlight, hangBrowser = false }) => {
     let releaseCalls = 0;
     const writeCalls = [];
     let resolveInFlight;
@@ -2149,13 +2151,27 @@ test("[M1] crawler 中止停写、排空在途写入后再放锁，并在途挂�
       const inFlightIngestWrites = new Set();
       const INGEST_ABORT_DRAIN_TIMEOUT_MS = 40;
       const INGEST_ABORT_CANCEL_GRACE_MS = 25;
+      const BROWSER_CLOSE_TIMEOUT_MS = 30;
+      const activeBrowsers = new Set();
+      const pendingBrowserLaunches = new Set();
       let stopAndReleasePromise = null;
       let syncLockSkippedOnAbort = false;
     `;
     vm.runInContext(
-      `${patchedPrefix}\n${fnCode}\nglobalThis.__stop = stopWorkAndReleaseSyncLock;\nglobalThis.__post = post;\nglobalThis.__postRoots = postCommentsByRoot;\nglobalThis.__getStats = () => stats;\nglobalThis.__getAbortReq = () => abortRequested;\nglobalThis.__getSkipped = () => syncLockSkippedOnAbort;`,
+      `${patchedPrefix}\n${fnCode}\nglobalThis.__stop = stopWorkAndReleaseSyncLock;\nglobalThis.__post = post;\nglobalThis.__postRoots = postCommentsByRoot;\nglobalThis.__getStats = () => stats;\nglobalThis.__getAbortReq = () => abortRequested;\nglobalThis.__getSkipped = () => syncLockSkippedOnAbort;\nglobalThis.__activeBrowsers = activeBrowsers;\nglobalThis.__pendingLaunches = pendingBrowserLaunches;`,
       ctx
     );
+
+    let browserClosed = false;
+    const mockBrowser = {
+      close: async () => {
+        if (hangBrowser) {
+          return new Promise(() => {});
+        }
+        browserClosed = true;
+      }
+    };
+    ctx.__activeBrowsers.add(mockBrowser);
 
     // 发起一个在途写请求并等其进入 fetch
     const inFlightPromise = ctx.__post("/ingest/content", { pk: "answer:1" });
@@ -2183,17 +2199,19 @@ test("[M1] crawler 中止停写、排空在途写入后再放锁，并在途挂�
       await stopPromise;
       assert.equal(releaseCalls, 1, "全部在途写入结束后才释放 1 次云端锁");
       assert.equal(ctx.__getSkipped(), false);
+      assert.equal(browserClosed, true, "正常中止时活跃浏览器必须被关闭");
     } else {
       await stopPromise;
       assert.equal(abortSignals.length, 1);
       assert.equal(abortSignals[0].aborted, true, "超时后必须调用 ingestAbortController.abort()");
       assert.equal(releaseCalls, 0, "仍有未确认结束的挂死写入时绝不可提前释放云端锁");
       assert.equal(ctx.__getSkipped(), true, "强制 abort 后必须置 syncLockSkippedOnAbort=true 以退出 131");
+      assert.equal(browserClosed, false, "挂死的 browser.close() 受超时约束不阻塞退出");
     }
   };
 
-  await runScenario({ hangInFlight: false });
-  await runScenario({ hangInFlight: true });
+  await runScenario({ hangInFlight: false, hangBrowser: false });
+  await runScenario({ hangInFlight: true, hangBrowser: true });
 });
 
 test("[M2][M3] crawler hot 模式不传 partial:false、score 回退保留在 commentSyncIncomplete、syncHotCommentsForContent 空页二次确认", async () => {
@@ -2837,11 +2855,12 @@ test("[AUDIT-9] local-sync 在强杀或子进程退出码 131 时不释放云端
       off(ev, fn) { if (listeners.get(ev) === fn) listeners.delete(ev); },
       kill(sig) {
         kills.push(sig);
-        onKill(sig, childMock, code => {
+        onKill(sig, childMock, (code, sigCode = null) => {
           childMock.exitCode = code;
+          if (sigCode) childMock.signalCode = sigCode;
           const fn = listeners.get("close");
           listeners.delete("close");
-          fn?.(code);
+          fn?.(code, sigCode);
         });
       }
     };
@@ -2908,6 +2927,16 @@ test("[AUDIT-9] local-sync 在强杀或子进程退出码 131 时不释放云端
   assert.equal(res130.retained, false);
   assert.equal(res130.relCalls, 1, "子进程正常排空退出 130 时必须释放 1 次云端锁");
   assert.equal(res130.exitCodeSeen, 130);
+
+  // 3d) 子进程被外部 SIGKILL 杀死（close 事件携带 sig="SIGKILL"）：保留云端锁
+  const resExternalKill = await runSignalScenario({
+    onKill: (_sig, child, emitClose) => {
+      child.signalCode = "SIGKILL";
+      setTimeout(() => emitClose(null, "SIGKILL"), 5);
+    }
+  });
+  assert.equal(resExternalKill.retained, true, "子进程被外部 SIGKILL 杀死时必须保留云端锁");
+  assert.equal(resExternalKill.relCalls, 0, "子进程被外部 SIGKILL 杀死时绝不可释放云端锁");
 
   // 4) 验证主循环的两个 close handler 都包含 sig === "SIGKILL" 条件（外部直接 SIGKILL 杀掉子进程时保留云端锁）
   const proxyCloseMatch = localSyncSrc.match(/child\.on\("close",\s*\(exitCode,\s*sig\)\s*=>\s*\{[^}]*SIGKILL/s);
@@ -3021,4 +3050,232 @@ test("[AUDIT-10] repair-local-images 在 retry > 0 时短暂退避并继续消�
   vm.runInContext(`${runBodyCode}\nglobalThis.__run = runScraperBody;`, cCtx);
   await cCtx.__run({});
   assert.equal(incompleteSet.has("answer:ans-zero-abort"), true, "0 评论快捷清零返回 aborted 时必须记入 commentSyncIncomplete");
+});
+
+// ---------- 审查修复专项回归用例 ----------
+
+test("crawler setupBrowser 在 abortRequested=true 时拒绝启动，且 launch 期间触发中止时立即关闭浏览器并抛错", async () => {
+  const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const crawlerRequire = createRequire(path.join(ROOT, "apps", "apify-crawler", "package.json"));
+  const tsMod = await import(pathToFileURL(crawlerRequire.resolve("typescript")).href);
+  const ts = tsMod.default ?? tsMod;
+  const crawlerJs = ts.transpileModule(crawlerSrc, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+  }).outputText;
+
+  const fnCode = [
+    "async " + extractFunction(crawlerJs, "setupBrowser"),
+    "async " + extractFunction(crawlerJs, "withBrowser")
+  ].join("\n");
+
+  let chromiumLaunchCalls = 0;
+  let browserClosed = false;
+  let launchResolve;
+  const mockChromium = {
+    launch: async () => {
+      chromiumLaunchCalls++;
+      return new Promise(resolve => {
+        launchResolve = resolve;
+      });
+    }
+  };
+
+  const ctx = vm.createContext({
+    chromium: mockChromium,
+    Error,
+    Set,
+    Array,
+    Promise,
+    console: { log() {}, warn() {}, error() {} }
+  });
+
+  const prefix = `
+    let abortRequested = false;
+    const activeBrowsers = new Set();
+    const pendingBrowserLaunches = new Set();
+  `;
+
+  vm.runInContext(
+    `${prefix}\n${fnCode}
+    globalThis.__setup = setupBrowser;
+    globalThis.__with = withBrowser;
+    globalThis.__setAbort = v => { abortRequested = v; };
+    globalThis.__active = activeBrowsers;
+    globalThis.__pending = pendingBrowserLaunches;`,
+    ctx
+  );
+
+  // 1) abortRequested=true 时 setupBrowser 必须直接拒绝，不启动 Chromium
+  ctx.__setAbort(true);
+  await assert.rejects(
+    () => ctx.__setup(),
+    /browser_launch_aborted/,
+    "已请求中止时必须拒绝启动新浏览器"
+  );
+  assert.equal(chromiumLaunchCalls, 0, "已中止时绝不调用 chromium.launch");
+
+  // 2) launch 期间变为 abortRequested=true，resolve 后必须立即关闭浏览器并抛错
+  ctx.__setAbort(false);
+  const launchPromise = ctx.__setup();
+  assert.equal(chromiumLaunchCalls, 1);
+  assert.equal(ctx.__pending.size, 1, "launch 中必须加入 pendingBrowserLaunches");
+
+  ctx.__setAbort(true);
+  launchResolve({
+    close: async () => { browserClosed = true; }
+  });
+
+  await assert.rejects(
+    () => launchPromise,
+    /browser_launch_aborted/,
+    "launch 期间中止必须抛出中止错误"
+  );
+  assert.equal(browserClosed, true, "launch resolve 后必须立即调用 browser.close()");
+  assert.equal(ctx.__pending.size, 0, "launch 结束必须从 pendingBrowserLaunches 移除");
+
+  // 3) withBrowser 正确管理 activeBrowsers 集合并在 finally 中清理
+  ctx.__setAbort(false);
+  let insideActiveCount = 0;
+  let withBrowserClosed = false;
+  const mockBrowserInstance = {
+    close: async () => { withBrowserClosed = true; }
+  };
+  mockChromium.launch = async () => mockBrowserInstance;
+  await ctx.__with(async b => {
+    insideActiveCount = ctx.__active.size;
+    assert.equal(ctx.__active.has(b), true);
+  });
+  assert.equal(insideActiveCount, 1, "运行中浏览器应存在于 activeBrowsers");
+  assert.equal(ctx.__active.size, 0, "运行结束后从 activeBrowsers 移除");
+  assert.equal(withBrowserClosed, true, "运行结束后关闭浏览器");
+});
+
+test("crawler 顶层 abortRequested=true + syncLockSkippedOnAbort=true 时绝不调用 releaseSyncLockBeforeExit，也不落入 circuitBroken -> exit(2)", async () => {
+  const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const crawlerRequire = createRequire(path.join(ROOT, "apps", "apify-crawler", "package.json"));
+  const tsMod = await import(pathToFileURL(crawlerRequire.resolve("typescript")).href);
+  const ts = tsMod.default ?? tsMod;
+  const crawlerJs = ts.transpileModule(crawlerSrc, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+  }).outputText;
+
+  const fnCode = [
+    "async " + extractFunction(crawlerJs, "handleAbortExitBeforeExit")
+  ].join("\n");
+
+  let exitCalledWith = null;
+  let actorExitCode = null;
+  let actorFailCalled = false;
+  let releaseCalls = 0;
+
+  const ctx = vm.createContext({
+    Error,
+    Promise,
+    console: { log() {}, warn() {}, error() {} },
+    process: {
+      exit: code => { exitCalledWith = code; }
+    },
+    Actor: {
+      exit: async opts => { actorExitCode = opts?.exitCode; },
+      fail: async () => { actorFailCalled = true; }
+    },
+    stopWorkAndReleaseSyncLock: async () => {},
+    releaseSyncLockBeforeExit: async () => { releaseCalls++; }
+  });
+
+  const prefix = `
+    let abortRequested = true;
+    let syncLockSkippedOnAbort = true;
+    let abortSignalHandled = false;
+  `;
+
+  vm.runInContext(
+    `${prefix}\n${fnCode}
+    globalThis.__handleAbort = handleAbortExitBeforeExit;
+    globalThis.__setSignalHandled = v => { abortSignalHandled = v; };
+    globalThis.__setSkipped = v => { syncLockSkippedOnAbort = v; };`,
+    ctx
+  );
+
+  // 1) 平台触发 aborting（未走信号）：保留云锁退出 131，绝不调 releaseSyncLockBeforeExit / Actor.fail / exit(2)
+  await ctx.__handleAbort();
+  assert.equal(actorExitCode, 131, "保留云锁时 Actor.exit 必须为 131");
+  assert.equal(exitCalledWith, 131, "保留云锁时 process.exit 必须为 131");
+  assert.equal(releaseCalls, 0, "绝不可调用 releaseSyncLockBeforeExit");
+  assert.equal(actorFailCalled, false, "绝不可误报 Actor.fail");
+
+  // 2) 平台触发 aborting 且未跳过云锁：正常退出 0
+  exitCalledWith = null;
+  actorExitCode = null;
+  ctx.__setSkipped(false);
+  await ctx.__handleAbort();
+  assert.equal(actorExitCode, 0);
+  assert.equal(exitCalledWith, 0);
+  assert.equal(releaseCalls, 0);
+});
+
+test("crawler fetchStoredCommentState 采信服务端显式 has_incomplete_roots: false 且兼容缺省行为", async () => {
+  const crawlerSrc = readScript("apps/apify-crawler/src/main.ts").replace(/\r\n/g, "\n");
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const crawlerRequire = createRequire(path.join(ROOT, "apps", "apify-crawler", "package.json"));
+  const tsMod = await import(pathToFileURL(crawlerRequire.resolve("typescript")).href);
+  const ts = tsMod.default ?? tsMod;
+  const crawlerJs = ts.transpileModule(crawlerSrc, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+  }).outputText;
+
+  const fnBlock = [
+    extractFunction(crawlerJs, "shouldSyncComments"),
+    extractFunction(crawlerJs, "isStoredRootCommentRow"),
+    "async " + extractFunction(crawlerJs, "fetchStoredCommentState"),
+    "async " + extractFunction(crawlerJs, "shouldSyncCommentsDeep")
+  ].join("\n");
+
+  let returnedJson = { data: [] };
+  const ctx = vm.createContext({
+    apiUrl: "https://worker.example",
+    apiSecret: "sec",
+    commentSyncIncomplete: new Set(),
+    fetch: async () => ({
+      ok: true,
+      json: async () => returnedJson
+    })
+  });
+  vm.runInContext(`${fnBlock}\nglobalThis.__state = fetchStoredCommentState;\nglobalThis.__deep = shouldSyncCommentsDeep;`, ctx);
+
+  // 1) 收到 { data: [{ child_count: 1, is_complete: 0, needs_thread_retry: 1 }], has_incomplete_roots: false }
+  //    服务端显式 false 权威清零，返回 incompleteRoots: 0 且不触发重抓
+  returnedJson = {
+    data: [{ child_count: 1, is_complete: 0, needs_thread_retry: 1 }],
+    has_incomplete_roots: false
+  };
+  const offloadCleanState = await ctx.__state("answer:offload-converged");
+  assert.equal(offloadCleanState.incompleteRoots, 0, "服务端显式 has_incomplete_roots: false 时权威清零");
+  assert.equal(
+    await ctx.__deep("answer:offload-converged", 2, 2, "full"),
+    false,
+    "incompleteRoots=0 且已存量与预期一致时不触发重抓"
+  );
+
+  // 2) 缺失 has_incomplete_roots 字段（兼容旧版 Worker）：保持逐行统计 incompleteRoots = 1
+  returnedJson = {
+    data: [{ child_count: 1, is_complete: 0, needs_thread_retry: 1 }]
+  };
+  const legacyState = await ctx.__state("answer:legacy-worker");
+  assert.equal(legacyState.incompleteRoots, 1, "缺失 has_incomplete_roots 时保持逐行统计");
+  assert.equal(await ctx.__deep("answer:legacy-worker", 2, 2, "full"), true, "旧版 Worker 待重试根触发重抓");
+
+  // 3) 显式 has_incomplete_roots: true：强制 incompleteRoots >= 1 并触发重抓
+  returnedJson = {
+    data: [{ child_count: 0, is_complete: 1, needs_thread_retry: 0 }],
+    has_incomplete_roots: true
+  };
+  const incompleteState = await ctx.__state("answer:explicit-incomplete");
+  assert.equal(incompleteState.incompleteRoots, 1, "服务端显式 has_incomplete_roots: true 强制 >= 1");
+  assert.equal(await ctx.__deep("answer:explicit-incomplete", 2, 2, "full"), true);
 });

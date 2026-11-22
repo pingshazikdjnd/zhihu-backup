@@ -230,17 +230,17 @@ async function runMain() {
         let done = false;
         let forceKillTimer = null;
         let killedByForce = false;
-        const finish = (exitCode = null) => {
+        const finish = (exitCode = null, sig = null) => {
           if (done) return;
           done = true;
           clearTimeout(timer);
           if (forceKillTimer) clearTimeout(forceKillTimer);
           childToStop.off("close", finish);
-          resolve({ killedByForce, exitCode });
+          resolve({ killedByForce, exitCode, signal: sig });
         };
         const timer = setTimeout(() => {
           if (childToStop.exitCode !== null || childToStop.signalCode !== null) {
-            finish(childToStop.exitCode);
+            finish(childToStop.exitCode, childToStop.signalCode);
             return;
           }
           // 无论代理父进程还是直接子进程，超时后均先强杀并等待 close（带保底）再清理锁
@@ -249,7 +249,7 @@ async function runMain() {
           retainCloudLockOnExit = true;
           try { childToStop.kill("SIGKILL"); } catch { /* ignore */ }
           forceKillTimer = setTimeout(() => {
-            finish(null);
+            finish(null, "SIGKILL");
           }, FORCE_KILL_CLOSE_WAIT_MS);
         }, isProxyParent ? PROXY_SHUTDOWN_TIMEOUT_MS : CRAWLER_STOP_TIMEOUT_MS);
         childToStop.once("close", finish);
@@ -277,7 +277,11 @@ async function runMain() {
           }
         }
       });
-      if (childOutcome?.killedByForce || childOutcome?.exitCode === CRAWLER_LOCK_RETAINED_EXIT_CODE) {
+      if (
+        childOutcome?.killedByForce ||
+        childOutcome?.exitCode === CRAWLER_LOCK_RETAINED_EXIT_CODE ||
+        childOutcome?.signal === "SIGKILL"
+      ) {
         retainCloudLockOnExit = true;
       }
     }

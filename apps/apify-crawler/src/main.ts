@@ -44,9 +44,10 @@ const syncOwnerId = String(input.syncOwnerId || process.env.SYNC_OWNER_ID || "")
 
 // 幂等释放云端同步锁：共享同一进行中 Promise，确保 Actor.on("aborting") 与信号钩子并发触发时
 // 只发一次释放请求并等待在途请求完成再退出。
+let syncLockSkippedOnAbort = false;
 let syncLockReleasePromise: Promise<void> | null = null;
 async function releaseSyncLockBeforeExit(): Promise<void> {
-  if (!syncOwnerId) return;
+  if (!syncOwnerId || syncLockSkippedOnAbort) return;
   if (!syncLockReleasePromise) {
     syncLockReleasePromise = (async () => {
       const base = apiUrl.endsWith("/") ? apiUrl.slice(0, -1) : apiUrl;
@@ -73,7 +74,39 @@ const inFlightIngestWrites = new Set<Promise<unknown>>();
 const INGEST_ABORT_DRAIN_TIMEOUT_MS = 3_000;
 const INGEST_ABORT_CANCEL_GRACE_MS = 1_500;
 let stopAndReleasePromise: Promise<void> | null = null;
-let syncLockSkippedOnAbort = false;
+
+type PlaywrightBrowser = Awaited<ReturnType<typeof chromium.launch>>;
+const BROWSER_CLOSE_TIMEOUT_MS = 1_500;
+const activeBrowsers = new Set<PlaywrightBrowser>();
+const pendingBrowserLaunches = new Set<Promise<PlaywrightBrowser>>();
+
+async function closeActiveBrowsers(timeoutMs: number = BROWSER_CLOSE_TIMEOUT_MS): Promise<void> {
+  const closePromises: Promise<unknown>[] = [];
+  for (const b of Array.from(activeBrowsers)) {
+    closePromises.push(
+      Promise.resolve()
+        .then(() => b.close())
+        .catch(() => {})
+    );
+  }
+  for (const p of Array.from(pendingBrowserLaunches)) {
+    closePromises.push(
+      p.then(b => b.close().catch(() => {})).catch(() => {})
+    );
+  }
+  if (closePromises.length === 0) return;
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    await Promise.race([
+      Promise.allSettled(closePromises),
+      new Promise<void>(resolve => {
+        timer = setTimeout(resolve, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function waitForInFlightIngestWrites(timeoutMs: number): Promise<void> {
   if (inFlightIngestWrites.size === 0) return Promise.resolve();
@@ -105,12 +138,14 @@ async function stopWorkAndReleaseSyncLock(): Promise<void> {
     stopAndReleasePromise = (async () => {
       abortRequested = true;
       stats.circuitBroken = true;
+      const browserClosePromise = closeActiveBrowsers(BROWSER_CLOSE_TIMEOUT_MS);
       let forcedAbort = false;
       if (inFlightIngestWrites.size > 0) {
         await waitForInFlightIngestWrites(INGEST_ABORT_DRAIN_TIMEOUT_MS);
       }
       if (inFlightIngestWrites.size > 0) {
         forcedAbort = true;
+        syncLockSkippedOnAbort = true;
         ingestAbortController.abort();
         await waitForInFlightIngestWrites(INGEST_ABORT_CANCEL_GRACE_MS);
       }
@@ -122,6 +157,7 @@ async function stopWorkAndReleaseSyncLock(): Promise<void> {
           `⚠️ 中止超时后已强制中止或仍有 ${inFlightIngestWrites.size} 个在途写入未确认结束，跳过提前释放云端锁（交由 15 分钟租约过期）`
         );
       }
+      await browserClosePromise;
     })();
   }
   await stopAndReleasePromise;
@@ -142,6 +178,17 @@ const handleCrawlerSignal = () => {
 };
 process.once("SIGINT", handleCrawlerSignal);
 process.once("SIGTERM", handleCrawlerSignal);
+
+async function handleAbortExitBeforeExit(): Promise<void> {
+  if (!abortRequested) return;
+  await stopWorkAndReleaseSyncLock();
+  if (abortSignalHandled) {
+    await new Promise(() => {});
+  } else {
+    await Actor.exit({ exitCode: syncLockSkippedOnAbort ? 131 : 0 });
+    process.exit(syncLockSkippedOnAbort ? 131 : 0);
+  }
+}
 const cfg = {
   commentsMyAnswers: syncConfig?.commentsMyAnswers || "full",
   commentsCollections: syncConfig?.commentsCollections || "hot",
@@ -588,11 +635,12 @@ async function fetchStoredCommentState(contentPk: string): Promise<StoredComment
     }
     // 新版 Worker 会在 live_only 探测时额外返回 has_incomplete_roots：
     // 当前页最多 50 根，第 50 根之后的失败归档线程不会出现在 rows 里，必须据此强制重抓。
-    // 旧版 Worker 不返回该字段，保持下面的逐行判断，向后兼容。
-    const hasIncompleteRoots =
-      Boolean(json) &&
-      typeof json === "object" &&
-      (json as { has_incomplete_roots?: unknown }).has_incomplete_roots === true;
+    // 若服务端显式返回布尔类型，以服务端跨库权威判定为准（false 权威清零，true 保证 >=1）；
+    // 旧版 Worker 不返回该字段（undefined），保持下面的逐行统计向后兼容。
+    const rawHasIncomplete =
+      json !== null && typeof json === "object" && "has_incomplete_roots" in json
+        ? (json as { has_incomplete_roots?: unknown }).has_incomplete_roots
+        : undefined;
     let liveRoots = 0;
     let incompleteRoots = 0;
     let storedComments = 0;
@@ -612,10 +660,14 @@ async function fetchStoredCommentState(contentPk: string): Promise<StoredComment
       }
       storedComments += 1 + (Number(row.child_count) || 0);
     }
+    const finalIncompleteRoots =
+      typeof rawHasIncomplete === "boolean"
+        ? (rawHasIncomplete ? Math.max(incompleteRoots, 1) : 0)
+        : incompleteRoots;
     return {
       roots: liveRoots,
       storedComments,
-      incompleteRoots: hasIncompleteRoots ? Math.max(incompleteRoots, 1) : incompleteRoots
+      incompleteRoots: finalIncompleteRoots
     };
   } catch {
     return null;
@@ -716,10 +768,36 @@ const BROWSER_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 
 async function setupBrowser() {
-  return chromium.launch({
+  if (abortRequested) {
+    throw new Error("browser_launch_aborted: crawler is shutting down");
+  }
+  const launchPromise = chromium.launch({
     headless: true,
     args: ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
   });
+  pendingBrowserLaunches.add(launchPromise);
+  let browser: PlaywrightBrowser;
+  try {
+    browser = await launchPromise;
+  } finally {
+    pendingBrowserLaunches.delete(launchPromise);
+  }
+  if (abortRequested) {
+    await browser.close().catch(() => {});
+    throw new Error("browser_launch_aborted: crawler is shutting down");
+  }
+  return browser;
+}
+
+async function withBrowser<T>(fn: (browser: PlaywrightBrowser) => Promise<T>): Promise<T> {
+  const browser = await setupBrowser();
+  activeBrowsers.add(browser);
+  try {
+    return await fn(browser);
+  } finally {
+    activeBrowsers.delete(browser);
+    await browser.close().catch(() => {});
+  }
 }
 
 /** 创建带桌面浏览器指纹伪装的 Playwright Context，降低 Headless 特征被风控概率 */
@@ -849,13 +927,7 @@ function normalizeCommentImage(
 }
 
 export async function runScraper() {
-  const browser = await setupBrowser();
-  try {
-    await runScraperBody(browser);
-  } finally {
-    // 异常/中止退出也必须关闭 Chromium，否则本地脚本反复跑会残留僵尸浏览器进程
-    await browser.close().catch(() => {});
-  }
+  await withBrowser(browser => runScraperBody(browser));
 }
 
 async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
@@ -1410,12 +1482,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
  * runScraper 内一旦请求 /articles 会直接抛 "unexpected crawler URL" 让回归测试挂掉。
  */
 export async function runArticleScraper() {
-  const browser = await setupBrowser();
-  try {
-    await runArticleScraperBody(browser);
-  } finally {
-    await browser.close().catch(() => {});
-  }
+  await withBrowser(browser => runArticleScraperBody(browser));
 }
 
 async function runArticleScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
@@ -1921,12 +1988,7 @@ export async function syncHotCommentsForContent(
  * 目标由编排脚本按「根评论数明显少于评论总数」从本地 D1 查出后分批传入。
  */
 export async function runCommentRepairScraper() {
-  const browser = await setupBrowser();
-  try {
-    await runCommentRepairScraperBody(browser);
-  } finally {
-    await browser.close().catch(() => {});
-  }
+  await withBrowser(browser => runCommentRepairScraperBody(browser));
 }
 
 async function runCommentRepairScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
@@ -1999,12 +2061,7 @@ async function runCommentRepairScraperBody(browser: Awaited<ReturnType<typeof se
 }
 
 export async function runCollectionScraper() {
-  const browser = await setupBrowser();
-  try {
-    await runCollectionScraperBody(browser);
-  } finally {
-    await browser.close().catch(() => {});
-  }
+  await withBrowser(browser => runCollectionScraperBody(browser));
 }
 
 async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
@@ -2336,12 +2393,7 @@ function isUpvotesTargetTruncated(target: any, cleanedHtml: string): boolean {
 }
 
 export async function runUpvotesScraper() {
-  const browser = await setupBrowser();
-  try {
-    await runUpvotesScraperBody(browser);
-  } finally {
-    await browser.close().catch(() => {});
-  }
+  await withBrowser(browser => runUpvotesScraperBody(browser));
 }
 
 async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
@@ -2711,12 +2763,7 @@ async function evaluateFollowingCandidatesWithAI(
 }
 
 export async function runFollowingScraper(onlyList = false) {
-  const browser = await setupBrowser();
-  try {
-    await runFollowingScraperBody(browser, onlyList);
-  } finally {
-    await browser.close().catch(() => {});
-  }
+  await withBrowser(browser => runFollowingScraperBody(browser, onlyList));
 }
 
 async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>, onlyList: boolean) {
@@ -3550,6 +3597,9 @@ try {
     }
   }
 } catch (e) {
+  if (abortRequested) {
+    await handleAbortExitBeforeExit();
+  }
   const errMsg = sanitizeErrorForLog(e);
   log.error(errMsg);
   await releaseSyncLockBeforeExit();
@@ -3562,6 +3612,10 @@ try {
 // 其它 runType 下 repairSummary 为 null，savedForTerminal 恒等于 stats.saved，语义不变。
 const repairSummary = repairState.summary;
 const savedForTerminal = repairSummary ? repairSummary.ok : stats.saved;
+
+if (abortRequested) {
+  await handleAbortExitBeforeExit();
+}
 
 if (stats.circuitBroken) {
   log.warning(`本轮触发连续失败断路器暂停（已保存 ${savedForTerminal} 条数据，失败 ${stats.failed} 次），断点已保留供下次继续`);
