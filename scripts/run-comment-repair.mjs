@@ -68,9 +68,11 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
+
 function resolveRepairTimeoutMs(envName, fallbackMs, minMs = 1) {
   const raw = Number(process.env[envName]);
-  return Number.isFinite(raw) && raw >= minMs ? Math.trunc(raw) : fallbackMs;
+  return Number.isFinite(raw) && raw >= minMs && raw <= MAX_NODE_TIMEOUT_MS ? Math.trunc(raw) : fallbackMs;
 }
 const CRAWLER_STOP_TIMEOUT_MS = resolveRepairTimeoutMs("REPAIR_COMMENTS_CRAWLER_STOP_TIMEOUT_MS", 5_000);
 const CRAWLER_FORCE_KILL_WAIT_MS = resolveRepairTimeoutMs("REPAIR_COMMENTS_FORCE_KILL_WAIT_MS", 1_000);

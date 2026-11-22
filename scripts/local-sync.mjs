@@ -43,9 +43,11 @@ let ownsLocalLock = false;
 // 无论是否超过 TTL，都不会自动删除/接管锁文件（见 acquireLocalLock）。
 const LOCK_TTL_MS = 12 * 60 * 60 * 1000;
 
+const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
+
 function resolveTimeoutMs(envName, fallbackMs, minMs = 1) {
   const raw = Number(process.env[envName]);
-  return Number.isFinite(raw) && raw >= minMs ? Math.trunc(raw) : fallbackMs;
+  return Number.isFinite(raw) && raw >= minMs && raw <= MAX_NODE_TIMEOUT_MS ? Math.trunc(raw) : fallbackMs;
 }
 // 代理父进程兜底超时由 5s 停爬虫 + 3s 强杀等 close + 30s 放云锁 + 2s 余量推导，可通过环境变量注入以便测试
 const CRAWLER_STOP_TIMEOUT_MS = 5_000;

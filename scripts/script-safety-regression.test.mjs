@@ -1787,8 +1787,8 @@ test("[P1-7][P2-9] local-sync 代理 IPC 软停/等 close 再放锁/幂等、cra
 
   // 1) 静态与行为校验：crawler/main.ts 已挂载 Actor.on("aborting") 与 SIGINT/SIGTERM，且并发释放严格幂等
   assert.match(crawlerSrc, /Actor\.on\("aborting"/);
-  assert.match(crawlerSrc, /process\.once\("SIGINT", handleCrawlerSignal\)/);
-  assert.match(crawlerSrc, /process\.once\("SIGTERM", handleCrawlerSignal\)/);
+  assert.match(crawlerSrc, /process\.on\("SIGINT", handleCrawlerSignal\)/);
+  assert.match(crawlerSrc, /process\.on\("SIGTERM", handleCrawlerSignal\)/);
 
   const { createRequire } = await import("node:module");
   const { pathToFileURL } = await import("node:url");
@@ -2684,6 +2684,7 @@ test("[AUDIT-8] run-comment-repair 收到 SIGTERM/SIGHUP 时先停止并等待�
       events.push(`crawler.kill:${sig}`);
       setTimeout(() => {
         fakeChild.exitCode = 130;
+        events.push("crawler.close");
         emitChildClose?.(130, null);
       }, 30);
     }
@@ -2718,7 +2719,7 @@ test("[AUDIT-8] run-comment-repair 收到 SIGTERM/SIGHUP 时先停止并等待�
   sigCtx.__handleSignal("SIGTERM");
   await sigCtx.signalCleanupPromise;
   assert.equal(exitedCode, 130);
-  assert.deepEqual(events, ["crawler.kill:SIGTERM", "saveProgress", "rmInput", "cleanupWorker", "releaseLock", "exit:130"]);
+  assert.deepEqual(events, ["crawler.kill:SIGTERM", "crawler.close", "saveProgress", "rmInput", "cleanupWorker", "releaseLock", "exit:130"]);
 
   // 同时验证 SIGHUP 走同一路径
   const eventsHup = [];
@@ -2732,6 +2733,7 @@ test("[AUDIT-8] run-comment-repair 收到 SIGTERM/SIGHUP 时先停止并等待�
       eventsHup.push(`crawler.kill:${sig}`);
       setTimeout(() => {
         fakeChildHup.exitCode = 130;
+        eventsHup.push("crawler.close");
         emitHupClose?.(130, null);
       }, 20);
     }
@@ -2757,7 +2759,7 @@ test("[AUDIT-8] run-comment-repair 收到 SIGTERM/SIGHUP 时先停止并等待�
   vm.runInContext(`${stopFnSrc}\n${handleSrc}\nglobalThis.__handleSignal = handleSignal;`, hupCtx);
   hupCtx.__handleSignal("SIGHUP");
   await hupCtx.signalCleanupPromise;
-  assert.deepEqual(eventsHup, ["crawler.kill:SIGTERM", "rmInput", "cleanupWorker", "releaseLock", "exit:130"]);
+  assert.deepEqual(eventsHup, ["crawler.kill:SIGTERM", "crawler.close", "rmInput", "cleanupWorker", "releaseLock", "exit:130"]);
 });
 
 test("[AUDIT-9] local-sync 在强杀或子进程退出码 131 时不释放云端锁，正常排空退出 130 时释放", async () => {
@@ -3372,4 +3374,43 @@ test("releaseSyncLockBeforeExit 在 syncLockSkippedOnAbort=true 时直接 0 次 
   assert.equal(actorExitCalls, 0, "abortSignalHandled=true 时绝不可调用 Actor.exit（交由信号钩子 process.exit）");
   assert.equal(actorFailCalls, 0, "abortSignalHandled=true 时绝不可调用 Actor.fail");
   assert.equal(processExitCalls, 0, "abortSignalHandled=true 时不在 handleAbort 内部重复调用 process.exit");
+});
+
+test("[AUDIT-TIMEOUT-OVERFLOW] resolveRepairTimeoutMs 与 resolveTimeoutMs 遇到 2147483648 溢出值时回退默认值", async () => {
+  const repairCommentsSrc = readScript("scripts/run-comment-repair.mjs");
+  const localSyncSrc = readScript("scripts/local-sync.mjs");
+
+  const repairFnSrc = extractFunction(repairCommentsSrc, "resolveRepairTimeoutMs");
+  const localSyncFnSrc = extractFunction(localSyncSrc, "resolveTimeoutMs");
+
+  const ctx = vm.createContext({
+    process: { env: {} },
+    Math,
+    Number,
+    Boolean
+  });
+
+  vm.runInContext(
+    `const MAX_NODE_TIMEOUT_MS = 2_147_483_647;\n${repairFnSrc}\n${localSyncFnSrc}\nglobalThis.resolveRepair = resolveRepairTimeoutMs;\nglobalThis.resolveSync = resolveTimeoutMs;`,
+    ctx
+  );
+
+  // 1) 溢出值 2147483648 (MAX_NODE_TIMEOUT_MS + 1) 回退 fallbackMs
+  ctx.process.env.TEST_TIMEOUT = "2147483648";
+  assert.equal(ctx.resolveRepair("TEST_TIMEOUT", 5000), 5000, "resolveRepairTimeoutMs 遇 2147483648 溢出值必须回退默认值");
+  assert.equal(ctx.resolveSync("TEST_TIMEOUT", 3000), 3000, "resolveTimeoutMs 遇 2147483648 溢出值必须回退默认值");
+
+  // 2) 边界值 2147483647 正常解析
+  ctx.process.env.TEST_TIMEOUT = "2147483647";
+  assert.equal(ctx.resolveRepair("TEST_TIMEOUT", 5000), 2147483647);
+  assert.equal(ctx.resolveSync("TEST_TIMEOUT", 3000), 2147483647);
+
+  // 3) 非数字、负数、零等非法值回退默认值
+  ctx.process.env.TEST_TIMEOUT = "-1";
+  assert.equal(ctx.resolveRepair("TEST_TIMEOUT", 5000), 5000);
+  assert.equal(ctx.resolveSync("TEST_TIMEOUT", 3000), 3000);
+
+  ctx.process.env.TEST_TIMEOUT = "invalid";
+  assert.equal(ctx.resolveRepair("TEST_TIMEOUT", 5000), 5000);
+  assert.equal(ctx.resolveSync("TEST_TIMEOUT", 3000), 3000);
 });

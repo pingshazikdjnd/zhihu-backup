@@ -176,8 +176,8 @@ const handleCrawlerSignal = () => {
     process.exit(syncLockSkippedOnAbort ? 131 : 130);
   });
 };
-process.once("SIGINT", handleCrawlerSignal);
-process.once("SIGTERM", handleCrawlerSignal);
+process.on("SIGINT", handleCrawlerSignal);
+process.on("SIGTERM", handleCrawlerSignal);
 
 async function handleAbortExitBeforeExit(): Promise<void> {
   if (!abortRequested) return;

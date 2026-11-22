@@ -2048,6 +2048,34 @@ async function replaceCommentsByRootOffloaded(
       ];
       await runBatchedStatements(env.DB, mainCleanupStmts, ROOT_BATCH_SIZE);
     } catch { /* 主库状态更新失败不阻塞外部库已完成的软删归档 */ }
+  } else if (!input.partial) {
+    try {
+      const liveMainRootsRes = await env.DB.prepare(
+        `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL AND is_deleted = 0`
+      ).bind(input.contentPk).all<{ id: string }>();
+      const staleMainRootIds: string[] = [];
+      for (const row of liveMainRootsRes.results ?? []) {
+        if (row.id && !incomingRootIds.has(String(row.id))) {
+          staleMainRootIds.push(String(row.id));
+        }
+      }
+      if (staleMainRootIds.length > 0) {
+        const maxIdsPerChunk = D1_MAX_SQL_PARAMS - 2;
+        const mainUpdateStmts: any[] = [];
+        for (let i = 0; i < staleMainRootIds.length; i += maxIdsPerChunk) {
+          const chunk = staleMainRootIds.slice(i, i + maxIdsPerChunk);
+          const placeholders = chunk.map(() => "?").join(", ");
+          mainUpdateStmts.push(
+            env.DB.prepare(
+              `UPDATE comments SET is_deleted = 1, deleted_at = ?, last_seen_at = ? WHERE id IN (${placeholders})`
+            ).bind(now, now, ...chunk)
+          );
+        }
+        await runBatchedStatements(env.DB, mainUpdateStmts, ROOT_BATCH_SIZE);
+      }
+    } catch (err) {
+      console.warn(`[comments] replaceCommentsByRootOffloaded: failed to reconcile stale main D1 roots for pk=${input.contentPk}`, err);
+    }
   }
 
   // 在进入根循环前向本地主 D1 与外部库各查一次该内容是否存在迁移前旧楼中楼历史，
@@ -2883,6 +2911,7 @@ export async function probeIncompleteLiveRoot(
     // A2) 再看非活跃外部库残留的未完成活根。
     // 并发 + 短超时：闲置外库挂起时总等待封顶为单次超时，绝不能拖死读探测。
     const unresolved = new Map<string, number | null>();
+    let inactiveRemoteFailed = false;
     const inactiveSettled = await Promise.allSettled(
       offloadTargets.map(target =>
         executeRemoteSql(target, rootRowsSql, [contentPk], { timeoutMs: INACTIVE_REMOTE_PROBE_TIMEOUT_MS })
@@ -2892,10 +2921,11 @@ export async function probeIncompleteLiveRoot(
       if (outcome.status === "fulfilled") {
         mergeIncompleteRows(outcome.value.rows as IncompleteRootRow[], unresolved);
       } else {
+        inactiveRemoteFailed = true;
         warnProbeFailure(offloadTargets[index], outcome.reason);
       }
     });
-    if (unresolved.size === 0) return "complete";
+    if (unresolved.size === 0) return inactiveRemoteFailed ? "unknown" : "complete";
 
     // A3) 只允许主 D1 的收敛证据剔除旧副本；收敛查询失败时保守触发重试。
     const { sql, params } = buildSettledQuery(Array.from(unresolved.keys()));
@@ -2906,7 +2936,7 @@ export async function probeIncompleteLiveRoot(
       console.warn("[comments] hasIncompleteLiveRoot main convergence probe failed:", err);
       return "incomplete";
     }
-    return unresolved.size > 0 ? "incomplete" : "complete";
+    return unresolved.size > 0 ? "incomplete" : inactiveRemoteFailed ? "unknown" : "complete";
   }
 
   // 分支 B：当前实际写入库是某个外部库。
@@ -2921,10 +2951,12 @@ export async function probeIncompleteLiveRoot(
 
   // B2) 收集所有非活跃库（主 D1 + 其余外部库）的未完成活根。
   const unresolved = new Map<string, number | null>();
+  let mainProbeFailed = false;
   try {
     const { results } = await database.prepare(rootRowsSql).bind(contentPk).all<IncompleteRootRow>();
     mergeIncompleteRows(results ?? [], unresolved);
   } catch (err) {
+    mainProbeFailed = true;
     console.warn("[comments] hasIncompleteLiveRoot main probe failed:", err);
   }
   const inactiveTargets = offloadTargets.filter(target => target.id !== activeOffloadTarget.id);
@@ -2941,7 +2973,7 @@ export async function probeIncompleteLiveRoot(
       warnProbeFailure(inactiveTargets[index], outcome.reason);
     }
   });
-  if (unresolved.size === 0) return "complete";
+  if (unresolved.size === 0) return mainProbeFailed ? "unknown" : "complete";
 
   // B3) 仅用实际写入库的收敛证据剔除；失败时同样保守触发重试。
   const { sql, params } = buildSettledQuery(Array.from(unresolved.keys()));
@@ -2955,7 +2987,7 @@ export async function probeIncompleteLiveRoot(
     );
     return "incomplete";
   }
-  return unresolved.size > 0 ? "incomplete" : "complete";
+  return unresolved.size > 0 ? "incomplete" : mainProbeFailed ? "unknown" : "complete";
 }
 
 /**
