@@ -131,7 +131,7 @@ async function claimImageTasks(limit: number): Promise<ImageTaskRow[]> {
     SELECT id, content_pk, image_url, object_key, status, attempts, updated_at
     FROM image_tasks
     WHERE status = 'pending' OR (status = 'processing' AND updated_at < ?)
-    ORDER BY id
+    ORDER BY attempts ASC, id ASC
     LIMIT ?
   `).all<ImageTaskRow>(staleBefore, limit);
   if (!candidates.length) return [];

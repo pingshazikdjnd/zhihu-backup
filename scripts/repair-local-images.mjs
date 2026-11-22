@@ -858,6 +858,14 @@ async function consumeImageBatches(secret) {
       log("[consume] 本批无成功下载（全部失败/重试），停止消费，避免连续打图床");
       break;
     }
+    if (one.retry > 0 && (opts.imageMaxBatches === 0 || batches < opts.imageMaxBatches)) {
+      const envBackoff = typeof process !== "undefined" ? Number(process.env?.REPAIR_IMAGE_RETRY_BACKOFF_MS) : NaN;
+      const backoffMs = Number.isFinite(envBackoff) && envBackoff >= 0 ? Math.trunc(envBackoff) : 1500;
+      if (backoffMs > 0 && typeof setTimeout === "function") {
+        log(`[consume] 本批有 ${one.retry} 张图待重试，等待 ${backoffMs}ms 后继续下一批...`);
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      }
+    }
   }
 
   log(

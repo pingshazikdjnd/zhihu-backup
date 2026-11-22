@@ -73,6 +73,7 @@ const inFlightIngestWrites = new Set<Promise<unknown>>();
 const INGEST_ABORT_DRAIN_TIMEOUT_MS = 3_000;
 const INGEST_ABORT_CANCEL_GRACE_MS = 1_500;
 let stopAndReleasePromise: Promise<void> | null = null;
+let syncLockSkippedOnAbort = false;
 
 function waitForInFlightIngestWrites(timeoutMs: number): Promise<void> {
   if (inFlightIngestWrites.size === 0) return Promise.resolve();
@@ -104,18 +105,21 @@ async function stopWorkAndReleaseSyncLock(): Promise<void> {
     stopAndReleasePromise = (async () => {
       abortRequested = true;
       stats.circuitBroken = true;
+      let forcedAbort = false;
       if (inFlightIngestWrites.size > 0) {
         await waitForInFlightIngestWrites(INGEST_ABORT_DRAIN_TIMEOUT_MS);
       }
       if (inFlightIngestWrites.size > 0) {
+        forcedAbort = true;
         ingestAbortController.abort();
         await waitForInFlightIngestWrites(INGEST_ABORT_CANCEL_GRACE_MS);
       }
-      if (inFlightIngestWrites.size === 0) {
+      if (!forcedAbort && inFlightIngestWrites.size === 0) {
         await releaseSyncLockBeforeExit();
       } else {
+        syncLockSkippedOnAbort = true;
         console.warn(
-          `⚠️ 中止超时后仍有 ${inFlightIngestWrites.size} 个在途写入未确认结束，跳过提前释放云端锁（交由 15 分钟租约过期）`
+          `⚠️ 中止超时后已强制中止或仍有 ${inFlightIngestWrites.size} 个在途写入未确认结束，跳过提前释放云端锁（交由 15 分钟租约过期）`
         );
       }
     })();
@@ -133,7 +137,7 @@ const handleCrawlerSignal = () => {
   if (abortSignalHandled) return;
   abortSignalHandled = true;
   void stopWorkAndReleaseSyncLock().finally(() => {
-    process.exit(130);
+    process.exit(syncLockSkippedOnAbort ? 131 : 130);
   });
 };
 process.once("SIGINT", handleCrawlerSignal);
@@ -1044,9 +1048,16 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       // 直接发一次空 roots 的全量对账，让 Worker 软删旧根、清零 comment_count 与线程索引。
       if (task.explicitCommentCount === 0) {
         try {
-          await postCommentsByRoot(contentPk, [], { partial: false, allRootIds: [] });
-          console.log(`🧹 评论已清零，完成删除对账 (回答 ID: ${task.answerId})`);
+          const res = await postCommentsByRoot(contentPk, [], { partial: false, allRootIds: [] });
+          if (!res.aborted) {
+            commentSyncIncomplete.delete(contentPk);
+            console.log(`🧹 评论已清零，完成删除对账 (回答 ID: ${task.answerId})`);
+          } else {
+            commentSyncIncomplete.add(contentPk);
+            console.warn(`⚠️ 评论清零对账未完成（断路器中止，回答 ${task.answerId}）`);
+          }
         } catch (e: any) {
+          commentSyncIncomplete.add(contentPk);
           console.warn(`⚠️ 评论清零对账失败 (回答 ${task.answerId}): ${sanitizeErrorForLog(e)}`);
         }
         continue;

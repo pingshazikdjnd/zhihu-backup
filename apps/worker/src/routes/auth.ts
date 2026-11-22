@@ -107,6 +107,8 @@ let cachedExternalTargets: {
   d1UpdatedAt: string | null;
   /** R2 对象版本；null=对象尚不存在，undefined=无法取得版本（读取失败/未传 bucket） */
   r2Etag: string | null | undefined;
+  /** 本次读取或最近一次写入确认的 R2 快照时间戳（ms） */
+  r2UpdatedMs: number;
   /** 配置内容指纹：用于让 overflow 行数缓存与「当前生效目标」严格同版本 */
   configVersion: string;
 } | null = null;
@@ -188,6 +190,7 @@ async function readExternalTargetsWithVersion(
   targets: ExternalStorageTarget[];
   d1UpdatedAt: string | null;
   r2Etag: string | null | undefined;
+  r2UpdatedMs: number;
   configVersion: string;
 }> {
   if (cachedExternalTargets && Date.now() - cachedExternalTargets.at < EXTERNAL_TARGETS_CACHE_TTL_MS) {
@@ -195,6 +198,7 @@ async function readExternalTargetsWithVersion(
       targets: cloneTargets(cachedExternalTargets.list),
       d1UpdatedAt: cachedExternalTargets.d1UpdatedAt,
       r2Etag: cachedExternalTargets.r2Etag,
+      r2UpdatedMs: cachedExternalTargets.r2UpdatedMs,
       configVersion: cachedExternalTargets.configVersion
     };
   }
@@ -287,12 +291,14 @@ async function readExternalTargetsWithVersion(
     list: cloneTargets(cleaned),
     d1UpdatedAt,
     r2Etag,
+    r2UpdatedMs,
     configVersion: computeExternalTargetsVersion(cleaned, d1UpdatedAt, r2Etag)
   };
   return {
     targets: cleaned,
     d1UpdatedAt,
     r2Etag,
+    r2UpdatedMs,
     configVersion: cachedExternalTargets.configVersion
   };
 }
@@ -305,12 +311,20 @@ export async function getExternalTargetsRaw(bucket?: any): Promise<ExternalStora
 export async function saveExternalTargetsRaw(
   bucket: any,
   targets: ExternalStorageTarget[],
-  opts?: { expectedUpdatedAt?: string | null; expectedR2Etag?: string | null }
+  opts?: { expectedUpdatedAt?: string | null; expectedR2Etag?: string | null; expectedR2UpdatedMs?: number }
 ): Promise<void> {
   const saved = targets.slice(0, 10);
   const payload = JSON.stringify(saved);
   const expectedMs = parseIsoMs(opts?.expectedUpdatedAt);
-  const writeMs = Math.max(Date.now(), lastExternalTargetsWriteMs + 1, resolveTargetsUpdatedMs(saved), expectedMs + 1);
+  const rawExpectedR2Ms = Number(opts?.expectedR2UpdatedMs ?? cachedExternalTargets?.r2UpdatedMs ?? 0);
+  const expectedR2Ms = Number.isFinite(rawExpectedR2Ms) && rawExpectedR2Ms > 0 ? Math.trunc(rawExpectedR2Ms) : 0;
+  const writeMs = Math.max(
+    Date.now(),
+    lastExternalTargetsWriteMs + 1,
+    resolveTargetsUpdatedMs(saved),
+    expectedMs + 1,
+    expectedR2Ms + 1
+  );
   lastExternalTargetsWriteMs = writeMs;
   const now = new Date(writeMs).toISOString();
   const hasExpected = Boolean(opts && "expectedUpdatedAt" in opts);
@@ -408,6 +422,7 @@ export async function saveExternalTargetsRaw(
     list: cloneTargets(saved),
     d1UpdatedAt: savedD1UpdatedAt,
     r2Etag: nextR2Etag,
+    r2UpdatedMs: r2Ok ? writeMs : expectedR2Ms,
     configVersion: computeExternalTargetsVersion(saved, savedD1UpdatedAt, nextR2Etag)
   };
 }
@@ -417,15 +432,16 @@ async function runWithExternalTargetsCas<T>(
   fn: (
     currentTargets: ExternalStorageTarget[],
     expectedUpdatedAt: string | null,
-    expectedR2Etag: string | null | undefined
+    expectedR2Etag: string | null | undefined,
+    expectedR2UpdatedMs: number
   ) => Promise<T>
 ): Promise<T> {
   return await withKeyLock(EXTERNAL_TARGETS_LOCK_KEY, async () => {
     for (let attempt = 0; attempt <= EXTERNAL_TARGETS_MAX_CAS_RETRIES; attempt++) {
       invalidateExternalTargetsCache();
-      const { targets, d1UpdatedAt, r2Etag } = await readExternalTargetsWithVersion(bucket);
+      const { targets, d1UpdatedAt, r2Etag, r2UpdatedMs } = await readExternalTargetsWithVersion(bucket);
       try {
-        return await fn(targets, d1UpdatedAt, r2Etag);
+        return await fn(targets, d1UpdatedAt, r2Etag, r2UpdatedMs);
       } catch (err) {
         if (err instanceof ExternalTargetsConflictError && attempt < EXTERNAL_TARGETS_MAX_CAS_RETRIES) {
           continue;
@@ -1692,7 +1708,7 @@ authRoutes.post("/external-targets", async c => {
   const syncScopes: ExternalSyncScope[] = scopes.length ? scopes : ["contents", "comments"];
 
   try {
-    return await runWithExternalTargetsCas(c.env.BUCKET, async (currentTargets, expectedUpdatedAt, expectedR2Etag) => {
+    return await runWithExternalTargetsCas(c.env.BUCKET, async (currentTargets, expectedUpdatedAt, expectedR2Etag, expectedR2UpdatedMs) => {
       const now = new Date().toISOString();
 
       let targetId = typeof body.id === "string" ? body.id.trim() : "";
@@ -1758,7 +1774,11 @@ authRoutes.post("/external-targets", async c => {
         currentTargets.push(savedTarget);
       }
 
-      await saveExternalTargetsRaw(c.env.BUCKET, currentTargets, { expectedUpdatedAt, expectedR2Etag });
+      await saveExternalTargetsRaw(c.env.BUCKET, currentTargets, {
+        expectedUpdatedAt,
+        expectedR2Etag,
+        expectedR2UpdatedMs
+      });
 
       return c.json({
         ok: true,
@@ -1789,9 +1809,13 @@ authRoutes.post("/external-targets/delete", async c => {
   }
 
   try {
-    return await runWithExternalTargetsCas(c.env.BUCKET, async (currentTargets, expectedUpdatedAt, expectedR2Etag) => {
+    return await runWithExternalTargetsCas(c.env.BUCKET, async (currentTargets, expectedUpdatedAt, expectedR2Etag, expectedR2UpdatedMs) => {
       const remaining = currentTargets.filter(t => t.id !== id);
-      await saveExternalTargetsRaw(c.env.BUCKET, remaining, { expectedUpdatedAt, expectedR2Etag });
+      await saveExternalTargetsRaw(c.env.BUCKET, remaining, {
+        expectedUpdatedAt,
+        expectedR2Etag,
+        expectedR2UpdatedMs
+      });
 
       return c.json({
         ok: true,
@@ -2006,7 +2030,7 @@ authRoutes.post("/external-targets/test", async c => {
     // 目标服务的错误响应可能回显 Authorization；落库前抹掉 token，避免 GET 列表二次泄漏
     const safeMsg = authToken ? testMsg.split(authToken).join("***") : testMsg;
     try {
-      updatedTarget = await runWithExternalTargetsCas(c.env.BUCKET, async (latestTargets, expectedUpdatedAt, expectedR2Etag) => {
+      updatedTarget = await runWithExternalTargetsCas(c.env.BUCKET, async (latestTargets, expectedUpdatedAt, expectedR2Etag, expectedR2UpdatedMs) => {
         const latestExisting = latestTargets.find(t => t.id === targetId);
         // 若探测期间该目标已被删除，跳过写回、不复活已删目标
         if (!latestExisting) return undefined;
@@ -2024,7 +2048,11 @@ authRoutes.post("/external-targets/test", async c => {
         latestExisting.lastTestAt = now;
         latestExisting.lastTestOk = testOk;
         latestExisting.lastTestMsg = `${safeMsg} (${latencyMs}ms)`;
-        await saveExternalTargetsRaw(c.env.BUCKET, latestTargets, { expectedUpdatedAt, expectedR2Etag });
+        await saveExternalTargetsRaw(c.env.BUCKET, latestTargets, {
+          expectedUpdatedAt,
+          expectedR2Etag,
+          expectedR2UpdatedMs
+        });
         return latestExisting;
       });
     } catch (err) {

@@ -68,6 +68,13 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function resolveRepairTimeoutMs(envName, fallbackMs, minMs = 1) {
+  const raw = Number(process.env[envName]);
+  return Number.isFinite(raw) && raw >= minMs ? Math.trunc(raw) : fallbackMs;
+}
+const CRAWLER_STOP_TIMEOUT_MS = resolveRepairTimeoutMs("REPAIR_COMMENTS_CRAWLER_STOP_TIMEOUT_MS", 5_000);
+const CRAWLER_FORCE_KILL_WAIT_MS = resolveRepairTimeoutMs("REPAIR_COMMENTS_FORCE_KILL_WAIT_MS", 1_000);
+
 function discoverSqlite(dir) {
   if (!fs.existsSync(dir)) return "";
   const files = fs
@@ -308,6 +315,38 @@ function stopLocalWorker(proc) {
   } catch {}
 }
 
+function stopCrawlerChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let done = false;
+    let forceKillTimer = null;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(stopTimer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      child.off?.("close", finish);
+      resolve();
+    };
+    const stopTimer = setTimeout(() => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        finish();
+        return;
+      }
+      try { child.kill("SIGKILL"); } catch {}
+      forceKillTimer = setTimeout(finish, CRAWLER_FORCE_KILL_WAIT_MS);
+    }, CRAWLER_STOP_TIMEOUT_MS);
+    child.once?.("close", finish);
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      finish();
+    }
+  });
+}
+
 async function resolveWorkerSecret(baseUrl, candidates) {
   for (const s of candidates) {
     try {
@@ -360,7 +399,7 @@ async function verifyCookieValid(cookie) {
   }
 }
 
-function runCrawlerBatch(batchPks, { baseUrl, secret, username, cookie, onItemDone }) {
+function runCrawlerBatch(batchPks, { baseUrl, secret, username, cookie, onItemDone, onSpawn }) {
   fs.mkdirSync(KV_DEFAULT_DIR, { recursive: true });
   const payload = {
     runType: "repair-comments",
@@ -387,6 +426,7 @@ function runCrawlerBatch(batchPks, { baseUrl, secret, username, cookie, onItemDo
       },
       stdio: ["pipe", "pipe", "pipe"]
     });
+    if (typeof onSpawn === "function") onSpawn(child);
 
     let allText = "";
     const warnedPks = new Set();
@@ -593,21 +633,30 @@ async function main() {
 
   let progressDirty = false;
   let unsavedCount = 0;
+  let activeCrawlerChild = null;
+  let signalCleanupPromise = null;
 
   let cleaningUp = false;
   const handleSignal = (signal) => {
     if (cleaningUp) return;
     cleaningUp = true;
-    log(`[signal] 收到 ${signal}，正在保存断点并清理 INPUT.json、Worker 与锁...`);
-    try {
-      if (progressDirty) saveProgress(progress);
-    } catch {}
-    try {
-      fs.rmSync(INPUT_JSON_PATH, { force: true });
-    } catch {}
-    cleanupWorker();
-    releaseLock();
-    process.exit(130);
+    signalCleanupPromise = (async () => {
+      log(`[signal] 收到 ${signal}，正在停止活动爬虫并保存断点、清理 INPUT.json、Worker 与锁...`);
+      const childToStop = activeCrawlerChild;
+      if (childToStop) {
+        await stopCrawlerChild(childToStop);
+        if (activeCrawlerChild === childToStop) activeCrawlerChild = null;
+      }
+      try {
+        if (progressDirty) saveProgress(progress);
+      } catch {}
+      try {
+        fs.rmSync(INPUT_JSON_PATH, { force: true });
+      } catch {}
+      cleanupWorker();
+      releaseLock();
+      process.exit(130);
+    })();
   };
   process.once("SIGINT", handleSignal);
   process.once("SIGTERM", handleSignal);
@@ -639,7 +688,7 @@ async function main() {
     let consecutiveZeroProgressRisks = 0;
     let batchNo = 0;
 
-    while (true) {
+    while (!cleaningUp) {
       const pending = targetSlice.filter(
         (x) =>
           !completedSet.has(x.pk) &&
@@ -650,6 +699,7 @@ async function main() {
       if (pending.length === 0) break;
 
       await ensureWorker();
+      if (cleaningUp) break;
 
       const batchObjs = pending.slice(0, opts.batchSize);
       const batchPks = batchObjs.map((x) => x.pk);
@@ -667,10 +717,18 @@ async function main() {
         secret,
         username: creds.username,
         cookie: creds.cookie,
+        onSpawn: (child) => {
+          activeCrawlerChild = child;
+          child.once?.("close", () => {
+            if (activeCrawlerChild === child) activeCrawlerChild = null;
+          });
+        },
         onItemDone: (kind, pk) => {
           markItemDone(kind, pk);
         }
       });
+      activeCrawlerChild = null;
+      if (cleaningUp) break;
 
       for (const pk of result.completedOrder) markItemDone("completed", pk);
       for (const pk of result.closedOrder) markItemDone("closed", pk);
@@ -744,6 +802,9 @@ async function main() {
       );
     }
 
+    if (cleaningUp && signalCleanupPromise) {
+      await signalCleanupPromise;
+    }
     log(`🎉 第 4 步评论补采队列执行完成！累计已核销断点 ${completedSet.size} 条，跳过 ${skippedSet.size} 条。`);
   } finally {
     try {

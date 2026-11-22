@@ -57,6 +57,8 @@ const PROXY_SHUTDOWN_TIMEOUT_MS = resolveTimeoutMs(
   "LOCAL_SYNC_SHUTDOWN_TIMEOUT_MS",
   DEFAULT_PROXY_SHUTDOWN_TIMEOUT_MS
 );
+const CRAWLER_LOCK_RETAINED_EXIT_CODE = 131;
+let retainCloudLockOnExit = false;
 const SUPPORTS_USE_ENV_PROXY = Boolean(process.allowedNodeEnvironmentFlags?.has("--use-env-proxy"));
 
 function disconnectIpcSafely() {
@@ -214,6 +216,9 @@ async function runMain() {
 
   let activeChild = null;
   let signalHandled = false;
+  let forceKilledChild = false;
+  retainCloudLockOnExit = false;
+  const shouldRetainCloudLock = () => forceKilledChild || retainCloudLockOnExit;
   const handleSignal = async signal => {
     if (signalHandled) return;
     signalHandled = true;
@@ -221,26 +226,30 @@ async function runMain() {
     if (activeChild && activeChild.exitCode === null && activeChild.signalCode === null) {
       const childToStop = activeChild;
       const isProxyParent = !emergencyReleaseCloudLock;
-      await new Promise(resolve => {
+      const childOutcome = await new Promise(resolve => {
         let done = false;
         let forceKillTimer = null;
-        const finish = () => {
+        let killedByForce = false;
+        const finish = (exitCode = null) => {
           if (done) return;
           done = true;
           clearTimeout(timer);
           if (forceKillTimer) clearTimeout(forceKillTimer);
           childToStop.off("close", finish);
-          resolve();
+          resolve({ killedByForce, exitCode });
         };
         const timer = setTimeout(() => {
           if (childToStop.exitCode !== null || childToStop.signalCode !== null) {
-            finish();
+            finish(childToStop.exitCode);
             return;
           }
           // 无论代理父进程还是直接子进程，超时后均先强杀并等待 close（带保底）再清理锁
+          killedByForce = true;
+          forceKilledChild = true;
+          retainCloudLockOnExit = true;
           try { childToStop.kill("SIGKILL"); } catch { /* ignore */ }
           forceKillTimer = setTimeout(() => {
-            finish();
+            finish(null);
           }, FORCE_KILL_CLOSE_WAIT_MS);
         }, isProxyParent ? PROXY_SHUTDOWN_TIMEOUT_MS : CRAWLER_STOP_TIMEOUT_MS);
         childToStop.once("close", finish);
@@ -248,7 +257,7 @@ async function runMain() {
           try {
             childToStop.kill("SIGTERM");
           } catch {
-            finish();
+            finish(null);
           }
         } else {
           // 代理父进程发 IPC 软退出消息前先检 childToStop.connected；若已断开仅非 Windows 回退 SIGTERM
@@ -263,14 +272,19 @@ async function runMain() {
             try {
               childToStop.kill("SIGTERM");
             } catch {
-              finish();
+              finish(null);
             }
           }
         }
       });
+      if (childOutcome?.killedByForce || childOutcome?.exitCode === CRAWLER_LOCK_RETAINED_EXIT_CODE) {
+        retainCloudLockOnExit = true;
+      }
     }
     try { fs.rmSync(INPUT_JSON_PATH, { force: true }); } catch { /* ignore */ }
-    if (emergencyReleaseCloudLock) {
+    if (shouldRetainCloudLock()) {
+      console.warn("⚠️ 子进程曾被强杀或保留云端锁退出（131），跳过释放云端锁（交由 15 分钟租约过期）");
+    } else if (emergencyReleaseCloudLock) {
       try { await emergencyReleaseCloudLock(); } catch { /* ignore */ }
     }
     if (ownsLocalLock) releaseLocalLock();
@@ -315,6 +329,9 @@ async function runMain() {
           activeChild = child;
           child.on("close", (exitCode, sig) => {
             activeChild = null;
+            if (exitCode === CRAWLER_LOCK_RETAINED_EXIT_CODE) {
+              retainCloudLockOnExit = true;
+            }
             resolve(exitCode !== null ? exitCode : (sig ? 130 : 1));
           });
         });
@@ -373,6 +390,10 @@ async function runMain() {
 
   const releaseCloudLock = () => {
     if (!cloudLockAcquired) return cloudLockReleasePromise ?? Promise.resolve();
+    if (shouldRetainCloudLock()) {
+      console.warn("⚠️ 检测到子进程强杀或保留云端锁退出（131），跳过释放云端锁（交由 15 分钟租约过期）");
+      return Promise.resolve();
+    }
     if (!cloudLockReleasePromise) {
       cloudLockAcquired = false;
       cloudLockReleasePromise = fetch(`${apiUrl}/ingest/sync-lock/release`, {
@@ -563,26 +584,39 @@ async function runMain() {
         activeChild = runProc;
         runProc.on("close", (c, sig) => {
           activeChild = null;
+          if (c === CRAWLER_LOCK_RETAINED_EXIT_CODE) {
+            retainCloudLockOnExit = true;
+          }
           resolve(c !== null ? c : (sig ? 130 : 1));
         });
       });
-
-      if (code === 0) {
-        console.log("\n🎉 本地同步执行完毕！");
-      } else if (code === 2) {
-        console.warn("\n⏸️ 本地同步触达 D1 每日写入限额断路器，当前页断点已自动保留，明日北京时间 08:05 将自动继续。");
-      } else {
-        console.error(`\n⚠️ 本地同步异常退出（状态码 ${code}）。当前断点已保留，下次定时任务将自动继续。`);
+      if (!signalHandled) {
+        if (code === 0) {
+          console.log("\n🎉 本地同步执行完毕！");
+        } else if (code === 2) {
+          console.warn("\n⏸️ 本地同步触达 D1 每日写入限额断路器，当前页断点已自动保留，明日北京时间 08:05 将自动继续。");
+        } else if (code === CRAWLER_LOCK_RETAINED_EXIT_CODE) {
+          console.warn("\n⚠️ 本地同步保留云端同步锁退出（131，在途写入未确认排空），交由 15 分钟租约过期。");
+        } else {
+          console.error(`\n⚠️ 本地同步异常退出（状态码 ${code}）。当前断点已保留，下次定时任务将自动继续。`);
+        }
+        process.exitCode = code;
       }
-      process.exitCode = code;
     } finally {
       // 明文凭据清理放在 finally：任何 return / throw 都会走到
       fs.rmSync(INPUT_JSON_PATH, { force: true });
     }
   } finally {
     // 主动释放云端租约：不释放就要等 15 分钟自然过期，期间所有同步都会被 409 拒绝。
-    // 放在最外层 finally，保证 sync-state 网络错误 / JSON 解析异常也一定会释放。
-    await releaseCloudLock();
+    // 放在最外层 finally，保证 sync-state 网络错误 / JSON 解析异常也一定会释放；
+    // 若信号已接管退出或曾强杀子进程/子进程以 131 退出保留锁，则跳过释放。
+    if (!signalHandled) {
+      if (shouldRetainCloudLock()) {
+        console.warn("⚠️ 检测到子进程强杀或保留云端锁退出（131），跳过释放云端锁（交由 15 分钟租约过期）");
+      } else {
+        await releaseCloudLock();
+      }
+    }
   }
   } finally {
     process.off("SIGINT", handleSignal);
@@ -611,7 +645,9 @@ async function main() {
 main().catch(async err => {
   // 兜底：外层 try 已覆盖抢锁后的全部流程，这里再兜一次
   // （如 releaseCloudLock 自身在 finally 内抛错）确保租约不会白占 15 分钟
-  if (emergencyReleaseCloudLock) {
+  if (retainCloudLockOnExit) {
+    console.warn("⚠️ 检测到子进程强杀或保留云端锁退出（131），跳过应急释放云端锁（交由 15 分钟租约过期）");
+  } else if (emergencyReleaseCloudLock) {
     try { await emergencyReleaseCloudLock(); } catch { /* ignore */ }
   }
   console.error("❌ 本地同步异常:", err);

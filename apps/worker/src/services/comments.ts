@@ -1052,8 +1052,8 @@ async function replaceCommentsByRootInner(
       } else {
         const prevChildren =
           stored.status === "ok"
-            ? (stored.children.length === 0 && !stored.complete
-                ? archiveMergeChildren(legacyList, stored.children, false)
+            ? (!stored.complete
+                ? mergeStoredChildrenLists(legacyList, stored.children)
                 : stored.children)
             : legacyList;
         archivedChildren = archiveMergeChildren(prevChildren, [], true);
@@ -1245,8 +1245,8 @@ async function replaceCommentsByRootInner(
         readFailed = true;
       } else if (stored.status === "ok") {
         const baseChildren =
-          stored.children.length === 0 && !stored.complete
-            ? archiveMergeChildren(legacyList, stored.children, false)
+          !stored.complete
+            ? mergeStoredChildrenLists(legacyList, stored.children)
             : stored.children;
         childrenToStore = archiveMergeChildren(baseChildren, children, root.isChildrenComplete);
       } else {
@@ -1254,9 +1254,6 @@ async function replaceCommentsByRootInner(
       }
     }
     const complete = root.isChildrenComplete;
-    const effectiveChildCount = complete
-      ? Math.max(childCount, childrenToStore.length, existingThread?.child_count ?? 0)
-      : Math.max(childCount, existingThread?.child_count ?? 0);
     const previewJson = JSON.stringify(buildPreviewReplies(childrenToStore));
     const nextThreadHash = await sha256(JSON.stringify({ children: childrenToStore, complete }));
     const targetIsComplete = complete
@@ -1268,10 +1265,11 @@ async function replaceCommentsByRootInner(
     let isComplete: number;
     let storedThreadHash: string;
     let storedIncomingHash = incomingHash;
+    let putFailed = false;
     if (readFailed) {
-      // 旧对象读取失败：跳过 PUT，保护 R2 里既有的完整楼中楼。
+      // 旧对象读取失败：跳过 PUT，保护 R2 里既有的完整楼中楼；若重开抓全则解除冻结状态 2。
       console.warn(`[comments] skip R2 put for ${key}: previous object unreadable`);
-      isComplete = existingThread?.is_complete === 2 ? 2 : 0;
+      isComplete = complete ? 0 : (existingThread?.is_complete === 2 ? 2 : 0);
       storedThreadHash = existingThread?.thread_hash ?? "";
       storedIncomingHash = "";
     } else if (
@@ -1297,11 +1295,15 @@ async function replaceCommentsByRootInner(
         // R2 与 D1 无法同一事务：PUT 失败不回滚已写的根评论，只把线程标记为不完整。
         // 重开并抓全（complete=true）时 R2 落盘失败必须置 0 可重试，不可沿用闭评冻结态 2。
         console.warn(`[comments] R2 put failed for ${key}:`, err);
+        putFailed = true;
         isComplete = complete ? 0 : (existingThread?.is_complete === 2 ? 2 : 0);
         storedThreadHash = existingThread?.thread_hash ?? "";
         storedIncomingHash = "";
       }
     }
+    const effectiveChildCount = !readFailed && !putFailed
+      ? Math.max(childCount, childrenToStore.length, existingThread?.child_count ?? 0)
+      : Math.max(childCount, existingThread?.child_count ?? 0);
 
     // 只有确实变化才写 comment_threads：重复同步热评不再产生 D1 行写入放大
     if (
@@ -2299,8 +2301,8 @@ async function replaceCommentsByRootOffloaded(
             prevChildren = parsed.children.filter(
               (c): c is ChildCommentRecord => !!c && typeof c === "object" && typeof (c as any).id === "string"
             );
-            if (prevChildren.length === 0 && parsed.complete !== true) {
-              prevChildren = mergeStoredChildrenLists(remoteLegacyChildrenByRoot.get(root.id) ?? []);
+            if (parsed.complete !== true) {
+              prevChildren = mergeStoredChildrenLists(remoteLegacyChildrenByRoot.get(root.id) ?? [], prevChildren);
             }
           }
         } catch {
@@ -2448,7 +2450,7 @@ async function replaceCommentsByRootOffloaded(
               (c): c is ChildCommentRecord => !!c && typeof c === "object" && typeof (c as any).id === "string"
             );
             const baseChildren =
-              existingChildren.length === 0 && parsed.complete !== true
+              parsed.complete !== true
                 ? mergeStoredChildrenLists(remoteLegacyList, existingChildren)
                 : existingChildren;
             childrenToStore = archiveMergeChildren(baseChildren, children, root.isChildrenComplete);
@@ -2462,7 +2464,7 @@ async function replaceCommentsByRootOffloaded(
     }
 
     const complete = root.isChildrenComplete;
-    const effectiveChildCount = complete
+    const effectiveChildCount = !readFailed
       ? Math.max(childCount, childrenToStore.length, existingThread?.child_count ?? 0)
       : Math.max(childCount, existingThread?.child_count ?? 0);
     const previewJson = JSON.stringify(buildPreviewReplies(childrenToStore));
@@ -2478,7 +2480,7 @@ async function replaceCommentsByRootOffloaded(
     let storedIncomingHash = incomingHash;
     if (readFailed) {
       console.warn(`[comments] 跳过外部库楼中楼写入 (${root.id}): 旧 JSON 不可读`);
-      isComplete = existingThread?.is_complete === 2 ? 2 : 0;
+      isComplete = complete ? 0 : (existingThread?.is_complete === 2 ? 2 : 0);
       storedThreadHash = existingThread?.thread_hash ?? "";
       storedIncomingHash = "";
     } else if (
@@ -2888,14 +2890,13 @@ export async function hasIncompleteLiveRoot(
   }
 
   // 分支 B：当前实际写入库是某个外部库。
-  // B1) 实际写入库存在未完成活根：立即触发重试。
-  let activeReachable = false;
+  // B1) 实际写入库存在未完成活根或探测不可达：立即触发重试。
   try {
     const result = await executeRemoteSql(activeOffloadTarget, hasAnySql, [contentPk]);
     if (result.rows.length > 0) return true;
-    activeReachable = true;
   } catch (err) {
     warnProbeFailure(activeOffloadTarget, err);
+    return true;
   }
 
   // B2) 收集所有非活跃库（主 D1 + 其余外部库）的未完成活根。
@@ -2922,10 +2923,7 @@ export async function hasIncompleteLiveRoot(
   });
   if (unresolved.size === 0) return false;
 
-  // B3) 实际写入库不可达时无法证明已收敛，保守触发重试。
-  if (!activeReachable) return true;
-
-  // B4) 仅用实际写入库的收敛证据剔除；失败时同样保守触发重试。
+  // B3) 仅用实际写入库的收敛证据剔除；失败时同样保守触发重试。
   const { sql, params } = buildSettledQuery(Array.from(unresolved.keys()));
   try {
     const result = await executeRemoteSql(activeOffloadTarget, sql, params);
