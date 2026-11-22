@@ -2756,11 +2756,30 @@ interface SettledRootRow {
  *   is_complete IN (1, 2) 的线程索引）且收敛时间不早于待重试副本时才算收敛。
  *   远端只有裸根行（partial 写入后线程/blob 尚未落盘）不算收敛。
  */
-export async function hasIncompleteLiveRoot(
+/** 活根探测三态结果：incomplete 确定未完成；complete 确定收敛；unknown 探测异常/状态未知 */
+export type IncompleteLiveRootProbeResult = "incomplete" | "complete" | "unknown";
+
+/**
+ * 探测指定内容是否存在未完成的活根评论（支持三态返回值）。
+ *
+ * 根评论列表按热度只取前 50 条（D1 绑定参数上限），第 50 根之后失败归档的线程
+ * 不会出现在任何一页里；爬虫仅凭当前页逐行状态会永久漏掉它们。这里用单条
+ * `SELECT 1 ... LIMIT 1` 在当前实际写入库探测，不拉整表、不占绑定参数、
+ * 不会因 join 放大重复计数。
+ *
+ * 启用外部分流后，任意外部库里可能残留历史副本，且 `resolveActiveOffloadTarget`
+ * 会随 storageRole / overflowThresholdRows / 主库评论行数变化。因此：
+ * - 先确定「当前实际写入库」（主 D1 或某个外部库）。实际写入库有未完成活根，
+ *   必须触发重试，非活跃库的旧副本无权屏蔽它；
+ * - 非活跃库里的待重试根，只有实际写入库存在「明确收敛证据」（软删根或
+ *   is_complete IN (1, 2) 的线程索引）且收敛时间不早于待重试副本时才算收敛。
+ *   远端只有裸根行（partial 写入后线程/blob 尚未落盘）不算收敛。
+ */
+export async function probeIncompleteLiveRoot(
   database: D1Database,
   contentPk: string,
   bucket?: any
-): Promise<boolean> {
+): Promise<IncompleteLiveRootProbeResult> {
   const hasAnySql = `SELECT 1 AS has_any ${INCOMPLETE_LIVE_ROOT_WHERE_SQL} LIMIT 1`;
   const rootRowsSql = `
     SELECT
@@ -2788,9 +2807,10 @@ export async function hasIncompleteLiveRoot(
   if (offloadTargets.length === 0) {
     try {
       const row = await database.prepare(hasAnySql).bind(contentPk).first<{ has_any?: number }>();
-      return Boolean(row);
-    } catch {
-      return false;
+      return row ? "incomplete" : "complete";
+    } catch (err) {
+      console.warn("[comments] hasIncompleteLiveRoot main probe failed:", err);
+      return "unknown";
     }
   }
 
@@ -2854,10 +2874,10 @@ export async function hasIncompleteLiveRoot(
     // A1) 主 D1 自己还有未完成活根：立即触发重试，非活跃外部库的旧副本无权屏蔽。
     try {
       const row = await database.prepare(hasAnySql).bind(contentPk).first<{ has_any?: number }>();
-      if (row) return true;
-    } catch {
-      // 主库探测失败不能让路由整体 500：调用方按 false 处理
-      return false;
+      if (row) return "incomplete";
+    } catch (err) {
+      console.warn("[comments] hasIncompleteLiveRoot main probe failed:", err);
+      return "unknown";
     }
 
     // A2) 再看非活跃外部库残留的未完成活根。
@@ -2875,7 +2895,7 @@ export async function hasIncompleteLiveRoot(
         warnProbeFailure(offloadTargets[index], outcome.reason);
       }
     });
-    if (unresolved.size === 0) return false;
+    if (unresolved.size === 0) return "complete";
 
     // A3) 只允许主 D1 的收敛证据剔除旧副本；收敛查询失败时保守触发重试。
     const { sql, params } = buildSettledQuery(Array.from(unresolved.keys()));
@@ -2884,19 +2904,19 @@ export async function hasIncompleteLiveRoot(
       applySettledRows(results ?? [], unresolved);
     } catch (err) {
       console.warn("[comments] hasIncompleteLiveRoot main convergence probe failed:", err);
-      return true;
+      return "incomplete";
     }
-    return unresolved.size > 0;
+    return unresolved.size > 0 ? "incomplete" : "complete";
   }
 
   // 分支 B：当前实际写入库是某个外部库。
   // B1) 实际写入库存在未完成活根或探测不可达：立即触发重试。
   try {
     const result = await executeRemoteSql(activeOffloadTarget, hasAnySql, [contentPk]);
-    if (result.rows.length > 0) return true;
+    if (result.rows.length > 0) return "incomplete";
   } catch (err) {
     warnProbeFailure(activeOffloadTarget, err);
-    return true;
+    return "incomplete";
   }
 
   // B2) 收集所有非活跃库（主 D1 + 其余外部库）的未完成活根。
@@ -2921,7 +2941,7 @@ export async function hasIncompleteLiveRoot(
       warnProbeFailure(inactiveTargets[index], outcome.reason);
     }
   });
-  if (unresolved.size === 0) return false;
+  if (unresolved.size === 0) return "complete";
 
   // B3) 仅用实际写入库的收敛证据剔除；失败时同样保守触发重试。
   const { sql, params } = buildSettledQuery(Array.from(unresolved.keys()));
@@ -2933,9 +2953,22 @@ export async function hasIncompleteLiveRoot(
       `[comments] hasIncompleteLiveRoot convergence probe failed (${activeOffloadTarget.name || activeOffloadTarget.id}):`,
       err
     );
-    return true;
+    return "incomplete";
   }
-  return unresolved.size > 0;
+  return unresolved.size > 0 ? "incomplete" : "complete";
+}
+
+/**
+ * 保持原有签名与布尔语义向后兼容的活根检查函数。
+ * 内部复用 probeIncompleteLiveRoot，仅当明确返回 incomplete 时为 true。
+ */
+export async function hasIncompleteLiveRoot(
+  database: D1Database,
+  contentPk: string,
+  bucket?: any
+): Promise<boolean> {
+  const result = await probeIncompleteLiveRoot(database, contentPk, bucket);
+  return result === "incomplete";
 }
 
 /**

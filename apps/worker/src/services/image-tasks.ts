@@ -3,8 +3,11 @@ import {
   IMAGE_FETCH_CONCURRENCY,
   getImageQualitySetting,
   localizeImage,
+  resetImageQualityCache,
   type PreparedImageTask
 } from "./images.js";
+
+export { resetImageQualityCache };
 
 /**
  * 正文图片下载任务队列（P1：图片处理从 ingest 请求剥离）。

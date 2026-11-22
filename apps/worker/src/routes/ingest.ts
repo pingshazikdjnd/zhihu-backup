@@ -346,12 +346,19 @@ ingestRoutes.post("/content", async c => {
   return c.json({ ...result, offloadedTo: htmlOffloadedTo ?? undefined });
 });
 
-const IMAGE_TASK_ROUTE_MAX_LIMIT = 12;
+/**
+ * 路由单次批量领取上限：下调为 8（为 IMAGE_FETCH_CONCURRENCY=4 的整数倍，2 组 db.batch）。
+ * Cloudflare Workers Free 子请求预算（上限 50）：
+ * - 可选续租 (1 D1) + 任务领取 (2 D1) + 冷启动设置读取 (1 R2 GET + 2 D1 = 3) + 2 组状态 batch (2 D1)
+ * - 原图模式 8 张新图：1 + 2 + 3 + 8*4 (2 R2 head + 1 fetch + 1 R2 put) + 2 = 40 <= 50
+ * - 尺寸变体 404 回退原图最坏情况：1 + 2 + 3 + 8*5 (2 R2 head + 2 fetch + 1 R2 put) + 2 = 48 <= 50
+ */
+const IMAGE_TASK_ROUTE_MAX_LIMIT = 8;
 
 /**
  * 图片任务批量消费（P1）：每次领取一批 pending 任务，下载并写入 R2。
  * ingest 响应后的 waitUntil 会自动触发一次；cron / 手动补采也可以直接调用。
- * body 可选 { limit }，缺省 IMAGE_TASK_BATCH_DEFAULT_LIMIT，路由上限钳制为 12。
+ * body 可选 { limit }，缺省 IMAGE_TASK_BATCH_DEFAULT_LIMIT，路由上限钳制为 8。
  */
 ingestRoutes.post("/image-batch", async c => {
   const bucket = c.env.BUCKET;

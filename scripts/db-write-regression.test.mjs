@@ -4458,7 +4458,7 @@ test("[P2-7][P2-8] SSRF 尾点/IPv6/NAT64 与 3xx 重定向文案；非知乎头
   );
 });
 
-test("[P1-8][P2-3] image-tasks 落库失败清零并重抛、路由 limit 钳制 <= 12、waitUntil 记日志不外抛、以及租约 Fencing", async () => {
+test("[P1-8][P2-3] image-tasks 落库失败清零并重抛、路由 limit 钳制 <= 8、waitUntil 记日志不外抛、以及租约 Fencing", async () => {
   const sharedIndexUrl = await moduleUrlFor(sharedIndexPath);
   const ingest = await loadTs(
     path.join(workerSrc, "routes", "ingest.ts"),
@@ -4548,7 +4548,7 @@ test("[P1-8][P2-3] image-tasks 落库失败清零并重抛、路由 limit 钳制
     await assert.doesNotReject(() => Promise.all(waitUntilPromises));
     assert.equal(drainHitError, true, "后台 drain 确实触发并捕获了 db.batch 失败");
 
-    // 3) POST /ingest/image-batch 对超大 limit 使用 Math.min 钳制 <= 12，不返回 400
+    // 3) POST /ingest/image-batch 对超大 limit 使用 Math.min 钳制 <= 8，不返回 400
     const { sqlite: s3, d1: d1_3 } = createMemoryDb();
     seedContent(s3);
     for (let i = 0; i < 15; i++) {
@@ -4567,8 +4567,8 @@ test("[P1-8][P2-3] image-tasks 落库失败清零并重抛、路由 limit 钳制
       }, { DB: d1_3, BUCKET: okBucket, API_SECRET: "img-secret" })
     );
     assert.equal(clampRes.status, 200);
-    assert.equal(clampRes.body.claimed, 12, "路由 limit=100 必须被钳制到 <= 12");
-    assert.equal(clampRes.body.limit, 12, "路由必须暴露服务端有效上限 limit <= 12");
+    assert.equal(clampRes.body.claimed, 8, "路由 limit=100 必须被钳制到 <= 8");
+    assert.equal(clampRes.body.limit, 8, "路由必须暴露服务端有效上限 limit <= 8");
 
     // 4) [P2-3] 租约 Fencing：慢 Worker 回写时任务已被新 Worker 接管并置 done（updated_at 已变），
     //    慢 Worker 的 markTaskFailed 绝不可覆盖 done 状态，且统计不得计入该行
@@ -9021,5 +9021,297 @@ test("[AUDIT-7] claimImageTasks 按 updated_at ASC, id ASC 优先领取旧任务
       "刚失败刷新 updated_at 的重试任务最后被领出");
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("[AUDIT-P2-1] 主库活根探测抛错不伪装成 false，保障本页 needs_thread_retry 重试信号不被吞", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.invalidateMainCommentCountCache();
+  auth.resetRemoteSchemaCache();
+
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+
+  // 配置未达阈值的 overflow 外库：实际写入仍为主 D1（activeOffloadTarget 为 null，但 offloadTargets.length > 0）
+  const target = {
+    ...makeTursoTarget("ext-overflow-unreached", "https://ext-overflow.example.com"),
+    storageRole: "overflow",
+    overflowThresholdRows: 1000000
+  };
+  const bucket = makeTargetBucket(target);
+
+  // 主 D1 插入一条未完成活根：child_count=1, is_complete=0（needs_thread_retry=1）
+  sqlite.prepare(`
+    INSERT INTO comments (id, content_pk, parent_comment_id, author_name, content_md, likes, comment_hash, first_seen_at, last_seen_at, is_deleted, child_count)
+    VALUES ('r_retry_1', ?, NULL, 'Author', 'retry root', 5, 'hash1', '2024-01-01T00:00:00.000Z', '2024-01-01T00:00:00.000Z', 0, 1)
+  `).run(CONTENT_PK);
+  sqlite.prepare(`
+    INSERT INTO comment_threads (root_id, content_pk, r2_key, child_count, is_complete, thread_hash, incoming_hash, preview_json, synced_at)
+    VALUES ('r_retry_1', ?, 'childcomments/r_retry_1.json', 1, 0, '', '', '[]', '2024-01-01T00:00:00.000Z')
+  `).run(CONTENT_PK);
+
+  // 包装 d1.prepare：让 listRootComments 正常返回该行，但模拟 probeIncompleteLiveRoot 中 hasAnySql 抛错
+  const originalPrepare = d1.prepare.bind(d1);
+  let failHasAny = false;
+  d1.prepare = (sql, ...rest) => {
+    if (failHasAny && /SELECT 1 AS has_any/i.test(sql)) {
+      return {
+        bind() {
+          return {
+            async first() { throw new Error("simulated D1 has_any probe failure"); },
+            async all() { throw new Error("simulated D1 has_any probe failure"); }
+          };
+        }
+      };
+    }
+    return originalPrepare(sql, ...rest);
+  };
+
+  try {
+    failHasAny = true;
+
+    // (1) probeIncompleteLiveRoot 返回 "unknown"；hasIncompleteLiveRoot 兼容返回 false
+    const probeRes = await runWithDb(d1, () =>
+      commentsModule.probeIncompleteLiveRoot(d1, CONTENT_PK, bucket)
+    );
+    assert.equal(probeRes, "unknown", "主 D1 探测抛错必须返回 unknown，绝不返回 complete 伪装成收敛");
+
+    const legacyRes = await runWithDb(d1, () =>
+      commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket)
+    );
+    assert.equal(legacyRes, false, "hasIncompleteLiveRoot 必须兼容返回 false");
+
+    // (2) GET /:pk/root-comments?limit=20&live_only=1：
+    // 当前页命中 pageHasIncomplete，probeResult 为 unknown，body.has_incomplete_roots 必须为 true（绝不能为 false）
+    const resWithIncomplete = await runWithDb(d1, () =>
+      contentsRouteModule.contentRoutes.__call(
+        "GET",
+        "/:pk/root-comments",
+        { params: { pk: CONTENT_PK }, url: `http://127.0.0.1/api/contents/${encodeURIComponent(CONTENT_PK)}/root-comments?limit=20&live_only=1` },
+        { DB: d1, BUCKET: bucket }
+      )
+    );
+    assert.equal(resWithIncomplete.status, 200);
+    assert.equal(resWithIncomplete.body.has_incomplete_roots, true,
+      "主库探测抛错时当前页存在未完成根，必须设为 true，绝不能吞掉本页重试信号");
+
+    // (3) 对照组：当前页无未完成行（将 r_retry_1 置为已完成 is_complete=1, child_count=0），主库探测仍抛错
+    sqlite.prepare(`UPDATE comments SET child_count = 0 WHERE id = 'r_retry_1'`).run();
+    sqlite.prepare(`UPDATE comment_threads SET is_complete = 1, child_count = 0 WHERE root_id = 'r_retry_1'`).run();
+
+    const resClean = await runWithDb(d1, () =>
+      contentsRouteModule.contentRoutes.__call(
+        "GET",
+        "/:pk/root-comments",
+        { params: { pk: CONTENT_PK }, url: `http://127.0.0.1/api/contents/${encodeURIComponent(CONTENT_PK)}/root-comments?limit=20&live_only=1` },
+        { DB: d1, BUCKET: bucket }
+      )
+    );
+    assert.equal(resClean.status, 200);
+    assert.equal(resClean.body.has_incomplete_roots, undefined,
+      "主库探测抛错且当前页无未完成根时，绝不可返回 false，必须保持 undefined 交由客户端逐行回退");
+    assert.equal("has_incomplete_roots" in resClean.body, false);
+  } finally {
+    d1.prepare = originalPrepare;
+    auth.invalidateExternalTargetsCache();
+    auth.invalidateMainCommentCountCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
+
+test("[AUDIT-P2-2] /ingest/image-batch 路由上限钳制为 8 且冷实例子请求总预算严格 <= 50", async () => {
+  const sharedIndexUrl = await moduleUrlFor(sharedIndexPath);
+  const ingest = await loadTs(
+    path.join(workerSrc, "routes", "ingest.ts"),
+    new Map([["hono", honoMockUrl], ["shared", sharedIndexUrl]])
+  );
+  const syncModule = await loadTs(
+    path.join(workerSrc, "routes", "sync.ts"),
+    new Map([["hono", honoMockUrl]])
+  );
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () =>
+      new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { "content-type": "image/jpeg", "content-length": "3" }
+      });
+
+    const { sqlite, d1 } = createMemoryDb();
+    seedContent(sqlite);
+
+    // 1) 钳制测试：向 POST /ingest/image-batch 传入超大 limit=50，响应 limit 必须被钳制到 8
+    for (let i = 0; i < 15; i++) {
+      seedImageTask(sqlite, {
+        imageUrl: `https://picx.zhimg.com/clamp-test-${i}.jpg`,
+        objectKey: `images/${String(i).padStart(64, "d")}.jpg`,
+        status: "pending",
+        attempts: 0,
+        updatedAt: NOW_ISO
+      });
+    }
+
+    const dummyBucket = {
+      async head() { return null; },
+      async get() { return null; },
+      async put() {},
+      async delete() {}
+    };
+
+    const clampRes = await runWithDb(d1, () =>
+      ingest.ingestRoutes.__call(
+        "POST",
+        "/image-batch",
+        {
+          headers: { authorization: "Bearer secret-test" },
+          body: { limit: 50 }
+        },
+        { DB: d1, BUCKET: dummyBucket, API_SECRET: "secret-test" }
+      )
+    );
+    assert.equal(clampRes.status, 200);
+    assert.equal(clampRes.body.limit, 8, "POST /image-batch limit=50 必须被钳制到 8");
+    assert.equal(clampRes.body.claimed, 8, "最多只能领取 8 条任务");
+
+    // 2) 子请求预算测试：构建全新冷隔离环境，精确追踪 D1 + R2 + fetch 子请求总数
+    // 原图模式：1 (续租) + 2 (claim) + 2~3 (cold config) + 8*4 (新图 2 head + 1 fetch + 1 put) + 2 (db.batch) = 39~40 <= 50
+    const runColdBudgetCheck = async (mode) => {
+      imageTasksModule.resetImageQualityCache();
+
+      const { sqlite: coldSqlite, d1: coldD1 } = createMemoryDb();
+      seedContent(coldSqlite);
+
+      // 设置 imageQuality：mode === "fallback" 时为 high，触发 applySizeVariant 生成 _1440w 后缀变体
+      if (mode === "fallback") {
+        coldSqlite.prepare(`
+          INSERT INTO app_settings (key, value, updated_at) VALUES ('sync_config', ?, ?)
+        `).run(JSON.stringify({ imageQuality: "high" }), NOW_ISO);
+      }
+
+      // 8 张全新知乎图片（不同 pathname，确保 legacyHash !== hash）
+      for (let i = 0; i < 8; i++) {
+        seedImageTask(coldSqlite, {
+          imageUrl: `https://picx.zhimg.com/v2-cold-${mode}-${i}.jpg`,
+          objectKey: `images/${String(i).padStart(64, "e")}.jpg`,
+          status: "pending",
+          attempts: 0,
+          updatedAt: NOW_ISO
+        });
+      }
+
+      let d1Subrequests = 0;
+      let r2Subrequests = 0;
+      let fetchSubrequests = 0;
+
+      // 跟踪 D1：包装现有 MemoryD1Statement 实例上的方法，不破坏 statement.sql 和 statement.execute()
+      const originalColdPrepare = coldD1.prepare.bind(coldD1);
+      coldD1.prepare = (sql) => {
+        const stmt = originalColdPrepare(sql);
+        const origBind = stmt.bind.bind(stmt);
+        stmt.bind = (...params) => {
+          const bound = origBind(...params);
+          const origFirst = bound.first.bind(bound);
+          const origAll = bound.all.bind(bound);
+          const origRun = bound.run.bind(bound);
+          bound.first = async () => { d1Subrequests++; return origFirst(); };
+          bound.all = async () => { d1Subrequests++; return origAll(); };
+          bound.run = async () => { d1Subrequests++; return origRun(); };
+          return bound;
+        };
+        const origFirst = stmt.first.bind(stmt);
+        const origAll = stmt.all.bind(stmt);
+        const origRun = stmt.run.bind(stmt);
+        stmt.first = async () => { d1Subrequests++; return origFirst(); };
+        stmt.all = async () => { d1Subrequests++; return origAll(); };
+        stmt.run = async () => { d1Subrequests++; return origRun(); };
+        return stmt;
+      };
+      const originalColdBatch = coldD1.batch.bind(coldD1);
+      coldD1.batch = async (statements) => {
+        d1Subrequests++;
+        return originalColdBatch(statements);
+      };
+
+      // 跟踪 R2
+      const coldR2Store = new Map();
+      const coldBucket = {
+        async head(key) {
+          r2Subrequests++;
+          return coldR2Store.has(key) ? { size: 100 } : null;
+        },
+        async get(key) {
+          r2Subrequests++;
+          const val = coldR2Store.get(key);
+          return val ? { async text() { return val; } } : null;
+        },
+        async put(key, body, options) {
+          r2Subrequests++;
+          coldR2Store.set(key, "data");
+          return {};
+        },
+        async delete(key) {
+          r2Subrequests++;
+          coldR2Store.delete(key);
+        }
+      };
+
+      // 跟踪 fetch
+      globalThis.fetch = async (input, init) => {
+        fetchSubrequests++;
+        const urlStr = String(input);
+        // 如果是变体 404 回退测试，_1440w 变体返回 404
+        if (mode === "fallback" && urlStr.includes("_1440w")) {
+          return new Response("Variant Not Found", { status: 404 });
+        }
+        return new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: { "content-type": "image/jpeg", "content-length": "3" }
+        });
+      };
+
+      // 执行可选续租（1 次 D1）
+      await runWithDb(coldD1, () => syncModule.renewSyncLock("crawler-test-owner"));
+
+      // 模拟 /ingest/image-batch 执行
+      const res = await runWithDb(coldD1, () =>
+        ingest.ingestRoutes.__call(
+          "POST",
+          "/image-batch",
+          {
+            headers: { authorization: "Bearer secret-test", "x-sync-owner": "crawler-test-owner" },
+            body: { limit: 8 }
+          },
+          { DB: coldD1, BUCKET: coldBucket, API_SECRET: "secret-test" }
+        )
+      );
+
+      assert.equal(res.status, 200);
+      assert.equal(res.body.done, 8);
+
+      const totalSubrequests = d1Subrequests + r2Subrequests + fetchSubrequests;
+      return { totalSubrequests, d1Subrequests, r2Subrequests, fetchSubrequests };
+    };
+
+    // A. 原图模式（每图 4 次）：<= 50
+    const originalBudget = await runColdBudgetCheck("original");
+    assert.ok(
+      originalBudget.totalSubrequests <= 50,
+      `冷实例原图模式总子请求数必须 <= 50，实际=${originalBudget.totalSubrequests} (D1=${originalBudget.d1Subrequests}, R2=${originalBudget.r2Subrequests}, fetch=${originalBudget.fetchSubrequests})`
+    );
+    assert.equal(originalBudget.r2Subrequests, 25);
+    assert.equal(originalBudget.fetchSubrequests, 8);
+
+    // B. 变体 404 回退原图最坏情况（每图 5 次）：<= 50
+    const fallbackBudget = await runColdBudgetCheck("fallback");
+    assert.ok(
+      fallbackBudget.totalSubrequests <= 50,
+      `冷实例变体 404 回退最坏情况总子请求数必须 <= 50，实际=${fallbackBudget.totalSubrequests} (D1=${fallbackBudget.d1Subrequests}, R2=${fallbackBudget.r2Subrequests}, fetch=${fallbackBudget.fetchSubrequests})`
+    );
+    assert.equal(fallbackBudget.fetchSubrequests, 16);
+  } finally {
+    globalThis.fetch = originalFetch;
+    imageTasksModule.resetImageQualityCache();
   }
 });

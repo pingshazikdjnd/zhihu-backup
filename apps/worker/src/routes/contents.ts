@@ -1,6 +1,11 @@
 import { Hono } from "hono";
 import { getContentDetail, listContents } from "../services/contents.js";
-import { getChildComments, hasIncompleteLiveRoot, listComments, listRootComments } from "../services/comments.js";
+import {
+  getChildComments,
+  probeIncompleteLiveRoot,
+  listComments,
+  listRootComments
+} from "../services/comments.js";
 import {
   listReadableCommentOffloadTargets,
   listReadableContentOffloadTargets,
@@ -128,22 +133,29 @@ contentRoutes.get("/:pk/root-comments", async c => {
     offset: Number.isFinite(offset) ? Math.max(offset, 0) : 0
   };
   // 爬虫只在 live_only 探测时需要知道「第 50 根之后是否还有待重试线程」。
-  // 仅当未启用外部可读评论库时允许当前页已命中短路；存在外部分流库时必须直接走 hasIncompleteLiveRoot，
+  // 仅当未启用外部可读评论库时允许当前页已命中短路；存在外部分流库时必须直接走 probeIncompleteLiveRoot，
   // 避免主库残留的旧未完成分页行遮蔽外部实际写入库的已收敛状态。
+  // 主库探测失败时返回 unknown，由客户端回退逐行统计，绝不伪装成 false 吞掉本页重试信号。
   if (liveOnly) {
+    const pageHasIncomplete = data.some(
+      row =>
+        Number(row.needs_thread_retry ?? 0) === 1 ||
+        (Number(row.child_count ?? 0) > 0 && Number(row.is_complete ?? 0) === 0)
+    );
     const offloadTargets = c.env.BUCKET
       ? await listReadableCommentOffloadTargets(c.env.BUCKET).catch(() => [])
       : [];
-    if (offloadTargets.length > 0) {
-      body.has_incomplete_roots = await hasIncompleteLiveRoot(c.env.DB, pk, c.env.BUCKET);
+    if (offloadTargets.length === 0 && pageHasIncomplete) {
+      body.has_incomplete_roots = true;
     } else {
-      const pageHasIncomplete = data.some(
-        row =>
-          Number(row.needs_thread_retry ?? 0) === 1 ||
-          (Number(row.child_count ?? 0) > 0 && Number(row.is_complete ?? 0) === 0)
-      );
-      body.has_incomplete_roots =
-        pageHasIncomplete || (await hasIncompleteLiveRoot(c.env.DB, pk, c.env.BUCKET));
+      const probeResult = await probeIncompleteLiveRoot(c.env.DB, pk, c.env.BUCKET);
+      if (probeResult === "incomplete") {
+        body.has_incomplete_roots = true;
+      } else if (probeResult === "complete") {
+        body.has_incomplete_roots = offloadTargets.length > 0 ? false : pageHasIncomplete;
+      } else if (pageHasIncomplete) {
+        body.has_incomplete_roots = true;
+      }
     }
   }
   return c.json(body);

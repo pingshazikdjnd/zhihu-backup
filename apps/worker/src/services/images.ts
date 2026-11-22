@@ -109,6 +109,11 @@ function releaseImageSlot(): void {
 const IMAGE_QUALITY_CACHE_TTL_MS = 60_000;
 let cachedImageQuality: { at: number; quality: ImageQuality } | null = null;
 
+/** 重置图片质量缓存（单测 / 冷隔离模拟用） */
+export function resetImageQualityCache(): void {
+  cachedImageQuality = null;
+}
+
 /** 读取设置页保存的图片备份质量；任何异常都退回原图，绝不阻塞正文入库 */
 export async function getImageQualitySetting(bucket: R2Bucket): Promise<ImageQuality> {
   if (cachedImageQuality && Date.now() - cachedImageQuality.at < IMAGE_QUALITY_CACHE_TTL_MS) {
