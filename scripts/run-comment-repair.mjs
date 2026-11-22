@@ -153,8 +153,10 @@ function scanCandidates(d1) {
       ) cm ON cm.content_pk = c.pk
       LEFT JOIN (
         SELECT ct.content_pk,
-               COALESCE(SUM(CASE WHEN ct.is_complete IN (1, 2) THEN ct.child_count ELSE 0 END), 0) AS children,
-               COALESCE(SUM(CASE WHEN ct.child_count > 0 AND COALESCE(ct.is_complete, 0) = 0 THEN 1 ELSE 0 END), 0) AS incompleteThreads
+               -- 完整性比较只用根行现网子评论数：ct.child_count 会保留已删除回复的归档历史，
+               -- 用它会把「现网漏采」误判成已抓全，导致补采脚本永久跳过残缺内容。
+               COALESCE(SUM(CASE WHEN ct.is_complete IN (1, 2) THEN COALESCE(r.child_count, 0) ELSE 0 END), 0) AS children,
+               COALESCE(SUM(CASE WHEN COALESCE(ct.is_complete, 0) = 0 THEN 1 ELSE 0 END), 0) AS incompleteThreads
         FROM comment_threads ct
         JOIN comments r ON r.id = ct.root_id
                        AND r.content_pk = ct.content_pk

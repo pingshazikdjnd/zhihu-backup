@@ -582,6 +582,13 @@ async function fetchStoredCommentState(contentPk: string): Promise<StoredComment
       const data = json.data;
       rows = Array.isArray(data) ? data.filter(isStoredRootCommentRow) : [];
     }
+    // 新版 Worker 会在 live_only 探测时额外返回 has_incomplete_roots：
+    // 当前页最多 50 根，第 50 根之后的失败归档线程不会出现在 rows 里，必须据此强制重抓。
+    // 旧版 Worker 不返回该字段，保持下面的逐行判断，向后兼容。
+    const hasIncompleteRoots =
+      Boolean(json) &&
+      typeof json === "object" &&
+      (json as { has_incomplete_roots?: unknown }).has_incomplete_roots === true;
     let liveRoots = 0;
     let incompleteRoots = 0;
     let storedComments = 0;
@@ -601,7 +608,11 @@ async function fetchStoredCommentState(contentPk: string): Promise<StoredComment
       }
       storedComments += 1 + (Number(row.child_count) || 0);
     }
-    return { roots: liveRoots, storedComments, incompleteRoots };
+    return {
+      roots: liveRoots,
+      storedComments,
+      incompleteRoots: hasIncompleteRoots ? Math.max(incompleteRoots, 1) : incompleteRoots
+    };
   } catch {
     return null;
   }

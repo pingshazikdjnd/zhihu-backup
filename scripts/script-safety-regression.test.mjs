@@ -1410,42 +1410,88 @@ test("[P1-7] run-comment-repair scanCandidates 不得因已软删根或未抓全
   try {
     db.exec(`
       CREATE TABLE contents (pk TEXT PRIMARY KEY, source_type TEXT NOT NULL, comment_count INTEGER NOT NULL, is_deleted INTEGER NOT NULL);
-      CREATE TABLE comments (id TEXT PRIMARY KEY, content_pk TEXT NOT NULL, parent_comment_id TEXT, is_deleted INTEGER NOT NULL);
+      CREATE TABLE comments (id TEXT PRIMARY KEY, content_pk TEXT NOT NULL, parent_comment_id TEXT, is_deleted INTEGER NOT NULL, child_count INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE comment_threads (root_id TEXT PRIMARY KEY, content_pk TEXT NOT NULL, child_count INTEGER NOT NULL, is_complete INTEGER NOT NULL);
     `);
 
     // 场景 A：comment_count=30, 仅 5 条有效根；另有 1 条已软删旧根对应的 thread child_count=30（旧 SQL 会误算 5+30>=30 并跳过）
     db.prepare("INSERT INTO contents VALUES ('answer:1', 'answer', 30, 0)").run();
     for (let i = 1; i <= 5; i++) {
-      db.prepare("INSERT INTO comments VALUES (?, 'answer:1', NULL, 0)").run(`r1-${i}`);
+      db.prepare("INSERT INTO comments (id, content_pk, parent_comment_id, is_deleted) VALUES (?, 'answer:1', NULL, 0)").run(`r1-${i}`);
     }
-    db.prepare("INSERT INTO comments VALUES ('r1-deleted', 'answer:1', NULL, 1)").run();
+    db.prepare("INSERT INTO comments (id, content_pk, parent_comment_id, is_deleted) VALUES ('r1-deleted', 'answer:1', NULL, 1)").run();
     db.prepare("INSERT INTO comment_threads VALUES ('r1-deleted', 'answer:1', 30, 1)").run();
 
     // 场景 B：comment_count=30, 5 条有效根，其中 1 条根 child_count=30 但 is_complete=0（旧 SQL 会误算 5+30>=30 并跳过）
     db.prepare("INSERT INTO contents VALUES ('answer:2', 'answer', 30, 0)").run();
     for (let i = 1; i <= 5; i++) {
-      db.prepare("INSERT INTO comments VALUES (?, 'answer:2', NULL, 0)").run(`r2-${i}`);
+      db.prepare("INSERT INTO comments (id, content_pk, parent_comment_id, is_deleted) VALUES (?, 'answer:2', NULL, 0)").run(`r2-${i}`);
     }
     db.prepare("INSERT INTO comment_threads VALUES ('r2-1', 'answer:2', 30, 0)").run();
 
-    // 场景 C：真正完整（5 条有效根 + is_complete=1 的 25 条子评论 >= 30，无未完成线程）→ 应正确跳过
+    // 场景 C：真正完整（5 条有效根 + is_complete=1 的 25 条现网子评论 >= 30，无未完成线程）→ 应正确跳过
     db.prepare("INSERT INTO contents VALUES ('answer:3', 'answer', 30, 0)").run();
     for (let i = 1; i <= 5; i++) {
-      db.prepare("INSERT INTO comments VALUES (?, 'answer:3', NULL, 0)").run(`r3-${i}`);
+      db.prepare("INSERT INTO comments (id, content_pk, parent_comment_id, is_deleted) VALUES (?, 'answer:3', NULL, 0)").run(`r3-${i}`);
     }
+    db.prepare("UPDATE comments SET child_count = 25 WHERE id = 'r3-1'").run();
     db.prepare("INSERT INTO comment_threads VALUES ('r3-1', 'answer:3', 25, 1)").run();
 
-    // 场景 D [P2-4]：闭评冻结（5 条有效根 + is_complete=2 的 25 条子评论 >= 30，无未完成线程）→ 应跳过不再重抓
+    // 场景 D [P2-4]：闭评冻结（5 条有效根 + is_complete=2 的 25 条现网子评论 >= 30，无未完成线程）→ 应跳过不再重抓
     db.prepare("INSERT INTO contents VALUES ('answer:4', 'answer', 30, 0)").run();
     for (let i = 1; i <= 5; i++) {
-      db.prepare("INSERT INTO comments VALUES (?, 'answer:4', NULL, 0)").run(`r4-${i}`);
+      db.prepare("INSERT INTO comments (id, content_pk, parent_comment_id, is_deleted) VALUES (?, 'answer:4', NULL, 0)").run(`r4-${i}`);
     }
+    db.prepare("UPDATE comments SET child_count = 25 WHERE id = 'r4-1'").run();
     db.prepare("INSERT INTO comment_threads VALUES ('r4-1', 'answer:4', 25, 2)").run();
 
     const scan = scanCandidates(db);
     assert.equal(scan.skippedAlreadyComplete, 2, "真正完整与闭评冻结(is_complete=2)的内容都应被跳过");
     assert.deepEqual(Array.from(scan.targets, t => t.pk), ["answer:1", "answer:2"]);
+  } finally {
+    db.close();
+  }
+});
+
+test("[P1-8] run-comment-repair 完整性比较必须使用现网 r.child_count，不得被已删归档历史掩盖", () => {
+  const repairCommentsSrc = readScript("scripts/run-comment-repair.mjs");
+  const { scanCandidates } = loadPureFunctions(repairCommentsSrc, ["scanCandidates"]);
+  const db = new Database(":memory:");
+  try {
+    db.exec(`
+      CREATE TABLE contents (pk TEXT PRIMARY KEY, source_type TEXT NOT NULL, comment_count INTEGER NOT NULL, is_deleted INTEGER NOT NULL);
+      CREATE TABLE comments (id TEXT PRIMARY KEY, content_pk TEXT NOT NULL, parent_comment_id TEXT, is_deleted INTEGER NOT NULL, child_count INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE comment_threads (root_id TEXT PRIMARY KEY, content_pk TEXT NOT NULL, child_count INTEGER NOT NULL, is_complete INTEGER NOT NULL);
+    `);
+
+    // 场景 E：comment_count=30，5 条存活根 + 1 条现网回复（r.child_count=1），
+    // 但 comment_threads.child_count=100 保留了已删归档历史（is_complete=1）。
+    // 旧 SQL 会按 5+100>=30 跳过；新 SQL 必须用现网 1 条回复判断为残缺并继续补采。
+    db.prepare("INSERT INTO contents VALUES ('answer:5', 'answer', 30, 0)").run();
+    for (let i = 1; i <= 5; i++) {
+      db.prepare("INSERT INTO comments (id, content_pk, parent_comment_id, is_deleted) VALUES (?, 'answer:5', NULL, 0)").run(`r5-${i}`);
+    }
+    db.prepare("UPDATE comments SET child_count = 1 WHERE id = 'r5-1'").run();
+    db.prepare("INSERT INTO comment_threads VALUES ('r5-1', 'answer:5', 100, 1)").run();
+
+    // 场景 F：comment_count=30，5 条存活根；1 条根有 25 条现网回复且归档完成，
+    // 另 1 条根 r.child_count=0 但归档失败（ct.is_complete=0）。
+    // 旧 SQL 会按 5+25>=30 跳过；新 SQL 必须因 incompleteThreads=1 保留待补采。
+    db.prepare("INSERT INTO contents VALUES ('answer:6', 'answer', 30, 0)").run();
+    for (let i = 1; i <= 5; i++) {
+      db.prepare("INSERT INTO comments (id, content_pk, parent_comment_id, is_deleted) VALUES (?, 'answer:6', NULL, 0)").run(`r6-${i}`);
+    }
+    db.prepare("UPDATE comments SET child_count = 25 WHERE id = 'r6-1'").run();
+    db.prepare("INSERT INTO comment_threads VALUES ('r6-1', 'answer:6', 25, 1)").run();
+    db.prepare("INSERT INTO comment_threads VALUES ('r6-2', 'answer:6', 0, 0)").run();
+
+    const scan = scanCandidates(db);
+    assert.equal(scan.skippedAlreadyComplete, 0, "归档历史或 0 活回复失败都不得被判定为已完整");
+    assert.deepEqual(
+      Array.from(scan.targets, t => t.pk),
+      ["answer:5", "answer:6"],
+      "现网子评论不足或存在未完成线程的内容必须保留在待补采 targets 中"
+    );
   } finally {
     db.close();
   }
@@ -1472,39 +1518,58 @@ test("[P2-4] crawler fetchStoredCommentState / shouldSyncCommentsDeep 对 is_com
     "async " + extractFunction(crawlerJs, "shouldSyncCommentsDeep")
   ].join("\n");
 
-  let returnedRows = [];
+  let returnedJson = { data: [] };
   const ctx = vm.createContext({
     apiUrl: "https://worker.example",
     apiSecret: "sec",
     commentSyncIncomplete: new Set(),
     fetch: async () => ({
       ok: true,
-      json: async () => ({ data: returnedRows })
+      json: async () => returnedJson
     })
   });
   vm.runInContext(`${fnBlock}\nglobalThis.__state = fetchStoredCommentState;\nglobalThis.__deep = shouldSyncCommentsDeep;`, ctx);
 
   // 1) is_complete = 2 视为已冻结：incompleteRoots = 0，且 storedComments 包含已知子评数
-  returnedRows = [
+  returnedJson = { data: [
     { child_count: 10, is_complete: 2 },
     { child_count: 5, is_complete: 1 }
-  ];
+  ] };
   const frozenState = await ctx.__state("answer:p24");
   assert.equal(frozenState.incompleteRoots, 0, "is_complete=2 不得计入 incompleteRoots");
   assert.equal(frozenState.storedComments, 17);
   assert.equal(await ctx.__deep("answer:p24", 17, 17, "full"), false, "闭评冻结后不应再重复触发补抓");
 
   // 2) is_complete = 0 仍计入 incompleteRoots 并触发补抓
-  returnedRows = [{ child_count: 10, is_complete: 0 }];
+  returnedJson = { data: [{ child_count: 10, is_complete: 0 }] };
   const retryState = await ctx.__state("answer:p24-retry");
   assert.equal(retryState.incompleteRoots, 1);
   assert.equal(await ctx.__deep("answer:p24-retry", 11, 11, "full"), true);
 
+  // 2.1) 第 50 根之后的失败归档：当前页 50 条全 complete，但 Worker 返回 has_incomplete_roots=true，
+  //      必须强制 incompleteRoots>=1 并触发重抓（否则低赞根永远不在前 50 条里被发现）
+  const fiftyCompleteRows = Array.from({ length: 50 }, (_, i) => ({
+    child_count: 0,
+    is_complete: 1,
+    needs_thread_retry: 0
+  }));
+  returnedJson = { data: fiftyCompleteRows, has_incomplete_roots: true };
+  const beyondPageRetryState = await ctx.__state("answer:beyond-page");
+  assert.equal(beyondPageRetryState.roots, 50);
+  assert.equal(beyondPageRetryState.incompleteRoots, 1, "has_incomplete_roots=true 必须保证 incompleteRoots>=1");
+  assert.equal(await ctx.__deep("answer:beyond-page", 50, 50, "full"), true, "第 50 根之后的待重试线程必须触发重抓");
+
+  // 2.2) 同一批 50 条根归档完成后 has_incomplete_roots=false：不触发重抓
+  returnedJson = { data: fiftyCompleteRows, has_incomplete_roots: false };
+  const beyondPageDoneState = await ctx.__state("answer:beyond-page-done");
+  assert.equal(beyondPageDoneState.incompleteRoots, 0);
+  assert.equal(await ctx.__deep("answer:beyond-page-done", 50, 50, "full"), false);
+
   // 3) [防删归档] is_deleted = 1 的已删除归档根评论必须被爬虫忽略，不计入 liveRoots / storedComments / incompleteRoots
-  returnedRows = [
+  returnedJson = { data: [
     { child_count: 10, is_complete: 0, is_deleted: 1 },
     { child_count: 3, is_complete: 1, is_deleted: 0 }
-  ];
+  ] };
   const archivedState = await ctx.__state("answer:archived-roots");
   assert.equal(archivedState.roots, 1);
   assert.equal(archivedState.storedComments, 4);

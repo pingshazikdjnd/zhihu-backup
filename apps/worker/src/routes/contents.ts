@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { getContentDetail, listContents } from "../services/contents.js";
-import { getChildComments, listComments, listRootComments } from "../services/comments.js";
+import { getChildComments, hasIncompleteLiveRoot, listComments, listRootComments } from "../services/comments.js";
 import {
   listReadableContentOffloadTargets,
   readOffloadedContentHtml,
@@ -121,11 +121,23 @@ contentRoutes.get("/:pk/root-comments", async c => {
   const liveOnlyParam = (c.req.query("live_only") || "").trim().toLowerCase();
   const liveOnly = liveOnlyParam === "1" || liveOnlyParam === "true";
   const data = await listRootComments(c.env.DB, pk, { limit, offset, liveOnly }, c.env.BUCKET);
-  return c.json({
+  const body: Record<string, unknown> = {
     data,
     limit: Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 20,
     offset: Number.isFinite(offset) ? Math.max(offset, 0) : 0
-  });
+  };
+  // 爬虫只在 live_only 探测时需要知道「第 50 根之后是否还有待重试线程」。
+  // 当前页已命中直接短路，不额外查库；普通前端列表请求（不带 live_only）保持原响应与 0 额外查询。
+  if (liveOnly) {
+    const pageHasIncomplete = data.some(
+      row =>
+        Number(row.needs_thread_retry ?? 0) === 1 ||
+        (Number(row.child_count ?? 0) > 0 && Number(row.is_complete ?? 0) === 0)
+    );
+    body.has_incomplete_roots =
+      pageHasIncomplete || (await hasIncompleteLiveRoot(c.env.DB, pk, c.env.BUCKET));
+  }
+  return c.json(body);
 });
 
 // 点「展开 N 条回复」时读取某个根评论下的子评论。

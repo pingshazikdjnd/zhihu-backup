@@ -1917,7 +1917,9 @@ async function replaceCommentsByRootOffloaded(
       mainLegacyList.length,
       remoteLegacyList.length
     );
-    const legacyPreviewList = [...mainLegacyList, ...remoteLegacyList];
+    // 同一条子评论可能同时存在于主库与外部库（迁移/双写过渡期）：按 id 合并去重，
+    // 外部库版本覆盖主库版本，保证 retryPreviewJson 里每个子评论 ID 只出现一次。
+    const legacyPreviewList = archiveMergeChildren(mainLegacyList, remoteLegacyList, false);
     const retryPreviewJson = existingThread
       ? (existingThread.preview_json ?? "[]")
       : (legacyPreviewList.length > 0 ? JSON.stringify(buildPreviewReplies(legacyPreviewList)) : "[]");
@@ -2326,6 +2328,61 @@ export async function hasOffloadedComments(
       if (result.rows.length > 0) return true;
     } catch {
       // 单个外部库不可用时继续探测下一个目标
+    }
+  }
+  return false;
+}
+
+/**
+ * 判断某篇内容是否还有「需要重试归档」的存活根评论。
+ *
+ * 根评论列表按热度只取前 50 条（D1 绑定参数上限），第 50 根之后失败归档的线程
+ * 不会出现在任何一页里；爬虫仅凭当前页逐行状态会永久漏掉它们。这里用单条
+ * `SELECT 1 ... LIMIT 1` 在主 D1 与外部扩容库各探测一次，不拉整表、不占绑定参数、
+ * 不会因 join 放大重复计数。
+ */
+export async function hasIncompleteLiveRoot(
+  database: D1Database,
+  contentPk: string,
+  bucket?: any
+): Promise<boolean> {
+  const sql = `
+    SELECT 1 AS has_any
+    FROM comments c
+    LEFT JOIN comment_threads t ON t.root_id = c.id
+    WHERE c.content_pk = ? AND c.parent_comment_id IS NULL AND c.is_deleted = 0
+      AND (
+        (t.root_id IS NOT NULL AND COALESCE(t.is_complete, 0) = 0)
+        OR (
+          t.root_id IS NULL AND (
+            COALESCE(c.child_count, 0) > 0
+            OR EXISTS (
+              SELECT 1 FROM comments ch
+              WHERE ch.parent_comment_id = c.id AND ch.is_deleted = 0
+            )
+          )
+        )
+      )
+    LIMIT 1
+  `;
+  try {
+    const row = await database.prepare(sql).bind(contentPk).first<{ has_any?: number }>();
+    if (row) return true;
+  } catch {
+    // 主库探测失败不能让路由整体 500：继续尝试外部库，最终由调用方按 false 处理
+  }
+  if (!bucket) return false;
+  const targets = await listReadableCommentOffloadTargets(bucket).catch(() => []);
+  for (const target of targets) {
+    try {
+      const result = await executeRemoteSql(target, sql, [contentPk]);
+      if (result.rows.length > 0) return true;
+    } catch (err) {
+      // 单个外部库不可用时记 warn 并继续探测下一个目标
+      console.warn(
+        `[comments] hasIncompleteLiveRoot probe failed (${target.name || target.id}):`,
+        err
+      );
     }
   }
   return false;

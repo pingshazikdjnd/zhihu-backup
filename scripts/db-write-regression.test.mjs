@@ -225,11 +225,15 @@ const workerModules = await (async () => {
     path.join(workerSrc, "services", "contents.ts"),
     new Map([["shared", sharedIndexUrl]])
   );
+  const contentsRoute = await loadTs(
+    path.join(workerSrc, "routes", "contents.ts"),
+    new Map([["hono", honoMockUrl], ["shared", sharedIndexUrl]])
+  );
   const schemas = await loadTs(sharedSchemasPath);
-  return { db, hash, changes, comments, imageTasks, auth, statsRoute, collections, contents, schemas };
+  return { db, hash, changes, comments, imageTasks, auth, statsRoute, collections, contents, contentsRoute, schemas };
 })();
 
-const { db: dbModule, hash: hashModule, changes: changesModule, comments: commentsModule, imageTasks: imageTasksModule, collections: collectionsModule, contents: contentsModule, statsRoute: statsRouteModule } = workerModules;
+const { db: dbModule, hash: hashModule, changes: changesModule, comments: commentsModule, imageTasks: imageTasksModule, collections: collectionsModule, contents: contentsModule, contentsRoute: contentsRouteModule, statsRoute: statsRouteModule } = workerModules;
 
 const CONTENT_PK = "answer:1";
 const NOW_ISO = "2024-01-01T00:00:00.000Z";
@@ -7216,5 +7220,283 @@ test("[PR2-11][PR2-12.1] image-tasks 按并发分组及时落库；/ingest/image
   } finally {
     globalThis.fetch = originalFetch;
     workerModules.auth.invalidateExternalTargetsCache();
+  }
+});
+
+// ---------- PR #2 剩余 3 条审查项 ----------
+
+/** 通用 Turso /v2/pipeline mock：在真实内存 SQLite 上执行 Worker 发来的 SQL */
+function installTursoPipelineMock(remoteSqlite, options = {}) {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const target = String(url);
+    if (!target.endsWith("/v2/pipeline")) {
+      throw new Error(`unexpected fetch in turso mock: ${target}`);
+    }
+    const body = JSON.parse(String(init.body));
+    const results = [];
+    for (const request of body.requests) {
+      if (request.type === "close") {
+        results.push({ type: "ok", response: { type: "close" } });
+        continue;
+      }
+      const sql = request.stmt.sql;
+      calls.push(sql.replace(/\s+/g, " ").trim());
+      if (options.failSql && options.failSql.test(sql)) {
+        results.push({ type: "error", error: { message: "injected remote SQL failure" } });
+        continue;
+      }
+      const args = (request.stmt.args || []).map(arg => {
+        if (!arg || arg.type === "null") return null;
+        if (arg.type === "integer" || arg.type === "float") return Number(arg.value);
+        return String(arg.value);
+      });
+      const statement = remoteSqlite.prepare(sql);
+      if (statement.reader) {
+        const cols = statement.columns().map(column => ({ name: column.name }));
+        const rows = statement.all(...args).map(row => cols.map(column => tursoCell(row[column.name])));
+        results.push({
+          type: "ok",
+          response: { type: "execute", result: { cols, rows, affected_row_count: 0, last_insert_rowid: null } }
+        });
+      } else {
+        const info = statement.run(...args);
+        results.push({
+          type: "ok",
+          response: { type: "execute", result: { cols: [], rows: [], affected_row_count: info.changes, last_insert_rowid: null } }
+        });
+      }
+    }
+    return { ok: true, status: 200, json: async () => ({ results }), text: async () => "" };
+  };
+  return {
+    calls,
+    restore() {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
+function makeTursoTarget(id, endpointUrl) {
+  return {
+    id,
+    name: id,
+    provider: "turso",
+    enabled: true,
+    syncScopes: ["comments"],
+    storageRole: "offload",
+    overflowThresholdRows: 1500000,
+    endpointUrl,
+    authToken: "tok",
+    createdAt: NOW_ISO,
+    updatedAt: NOW_ISO
+  };
+}
+
+function makeTargetBucket(targetConfig) {
+  const r2Store = new Map([[workerModules.auth.R2_EXTERNAL_TARGETS_KEY, JSON.stringify([targetConfig])]]);
+  return {
+    async get(key) {
+      const value = r2Store.get(key);
+      return value === undefined ? null : { async text() { return value; } };
+    },
+    async put(key, value) { r2Store.set(key, String(value)); },
+    async head() { return null; },
+    async delete(key) { r2Store.delete(key); }
+  };
+}
+
+test("[PR2-3] offload 失败归档重试预览按子评论 ID 去重（主库与外部库同一回复只出现一次）", async () => {
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+
+  // 主 D1 迁移前旧扁平子评论：与外部库中的同一条回复 ID 相同，但内容较旧
+  insertLegacyChild(sqlite, { id: "dup_child", rootId: "r1", content: "main version" });
+
+  const remoteSqlite = new Database(":memory:");
+  const target = makeTursoTarget("ext-pr2-preview-dedupe", "https://ext-pr2-preview.example.com");
+  const bucket = makeTargetBucket(target);
+
+  // 故意让「零回复归档候选」的前置 child_comment_blobs 探测失败，强制走失败归档重试行分支
+  const mock = installTursoPipelineMock(remoteSqlite, {
+    failSql: /SELECT root_id FROM child_comment_blobs WHERE content_pk = \?/
+  });
+
+  try {
+    await runWithDb(d1, () => auth.ensureRemoteCommentSchema(target));
+    // 外部库已有同一条子评论（内容更新），且现有根评论 child_count=0
+    remoteSqlite.prepare(`
+      INSERT INTO comments (
+        id, content_pk, parent_comment_id, author_name, content_md, likes,
+        comment_hash, first_seen_at, last_seen_at, is_deleted, child_count
+      ) VALUES ('r1', ?, NULL, 'Root', 'root', 10, 'hr', ?, ?, 0, 0)
+    `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+    remoteSqlite.prepare(`
+      INSERT INTO comments (
+        id, content_pk, parent_comment_id, author_name, content_md, likes,
+        comment_hash, first_seen_at, last_seen_at, is_deleted, child_count
+      ) VALUES ('dup_child', ?, 'r1', 'A', 'remote version', 1, 'hc', ?, ?, 0, 0)
+    `).run(CONTENT_PK, NOW_ISO, NOW_ISO);
+
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: false,
+        allRootIds: ["r1"],
+        roots: [{
+          id: "r1",
+          author: "Root",
+          authorAvatar: "",
+          content: "root",
+          img: "",
+          time: NOW_ISO,
+          location: "",
+          likes: 10,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 0,
+          isChildrenComplete: true,
+          children: []
+        }]
+      }, { DB: d1, BUCKET: bucket })
+    );
+
+    const thread = remoteSqlite.prepare(
+      `SELECT child_count, is_complete, incoming_hash, preview_json FROM comment_threads WHERE root_id = 'r1'`
+    ).get();
+    assert.ok(thread, "0 回复归档迁移失败必须写回待重试 comment_threads 行");
+    assert.equal(thread.is_complete, 0);
+    assert.equal(thread.incoming_hash, "");
+    const preview = JSON.parse(thread.preview_json);
+    assert.deepEqual(
+      preview.map(item => item.id),
+      ["dup_child"],
+      "同一条子评论同时存在于主 D1 与外部库时，preview_json 中该 ID 只能出现一次"
+    );
+    assert.equal(preview[0].content, "remote version", "同 ID 冲突时外部库版本应覆盖主库旧版本");
+  } finally {
+    mock.restore();
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
+
+test("[PR2-3] /root-comments?live_only=1 能发现第 50 根之后的待重试线程（主 D1 与 offload）", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+
+  const insertRoot = (sqlite, id, likes, childCount = 0) => {
+    sqlite.prepare(`
+      INSERT INTO comments (
+        id, content_pk, parent_comment_id, author_name, content_md, likes,
+        comment_hash, child_count, first_seen_at, last_seen_at, is_deleted
+      ) VALUES (?, ?, NULL, 'U', 'root', ?, 'h', ?, ?, ?, 0)
+    `).run(id, CONTENT_PK, likes, childCount, NOW_ISO, NOW_ISO);
+  };
+  const insertThread = (sqlite, rootId, childCount, isComplete) => {
+    sqlite.prepare(`
+      INSERT INTO comment_threads (
+        root_id, content_pk, r2_key, child_count, is_complete,
+        thread_hash, incoming_hash, preview_json, synced_at
+      ) VALUES (?, ?, ?, ?, ?, '', '', '[]', ?)
+    `).run(rootId, CONTENT_PK, `childcomments/${rootId}.json`, childCount, isComplete, NOW_ISO);
+  };
+  const countIncompleteProbes = d1 => {
+    let count = 0;
+    const wrapped = {
+      prepare(sql) {
+        if (/SELECT 1 AS has_any/.test(sql)) count++;
+        return d1.prepare(sql);
+      },
+      batch(statements) { return d1.batch(statements); }
+    };
+    return { wrapped, get count() { return count; } };
+  };
+  const callRootComments = (db, bucket, extraQuery = "") =>
+    runWithDb(db, () =>
+      contentsRouteModule.contentRoutes.__call("GET", "/:pk/root-comments", {
+        params: { pk: CONTENT_PK },
+        url: `http://127.0.0.1/api/contents/${encodeURIComponent(CONTENT_PK)}/root-comments?limit=50${extraQuery}`
+      }, { DB: db, ...(bucket ? { BUCKET: bucket } : {}) })
+    );
+
+  // 1) 主 D1：55 条存活根，前 50 条高赞根归档完成，第 55 条低赞根 0 活回复归档失败
+  {
+    const { sqlite, d1 } = createMemoryDb();
+    seedContent(sqlite);
+    for (let i = 1; i <= 55; i++) insertRoot(sqlite, `root-${i}`, 1000 - i);
+    for (let i = 1; i <= 50; i++) insertThread(sqlite, `root-${i}`, 0, 1);
+    insertThread(sqlite, "root-55", 0, 0);
+
+    const counter = countIncompleteProbes(d1);
+    const liveRes = await callRootComments(counter.wrapped, null, "&live_only=1");
+    assert.equal(liveRes.status, 200);
+    assert.equal(liveRes.body.data.length, 50);
+    assert.equal(liveRes.body.has_incomplete_roots, true, "第 50 根之后的待重试线程必须被探测到");
+    assert.ok(counter.count >= 1, "当前页未命中时 live_only 探测必须额外查询一次");
+
+    // 归档完成后 has_incomplete_roots 变为 false，不再触发重抓
+    sqlite.prepare(`UPDATE comment_threads SET is_complete = 1 WHERE root_id = 'root-55'`).run();
+    const doneRes = await callRootComments(counter.wrapped, null, "&live_only=1");
+    assert.equal(doneRes.body.has_incomplete_roots, false);
+
+    // 前端不传 live_only：响应字段保持原样，且不产生额外查询
+    const before = counter.count;
+    const frontendRes = await callRootComments(counter.wrapped, null);
+    assert.equal(frontendRes.status, 200);
+    assert.equal(Object.prototype.hasOwnProperty.call(frontendRes.body, "has_incomplete_roots"), false);
+    assert.equal(counter.count, before, "前端不传 live_only 时不得产生 has_incomplete_roots 探测查询");
+  }
+
+  // 2) offload：主 D1 无根评论，55 条根与线程都在外部库；路由必须回源外部库并探测到第 55 条
+  {
+    const { sqlite, d1 } = createMemoryDb();
+    seedContent(sqlite);
+    const remoteSqlite = new Database(":memory:");
+    const target = makeTursoTarget("ext-pr2-incomplete-probe", "https://ext-pr2-probe.example.com");
+    const bucket = makeTargetBucket(target);
+    const mock = installTursoPipelineMock(remoteSqlite);
+    try {
+      await runWithDb(d1, () => auth.ensureRemoteCommentSchema(target));
+      const insertRemoteRoot = remoteSqlite.prepare(`
+        INSERT INTO comments (
+          id, content_pk, parent_comment_id, author_name, content_md, likes,
+          comment_hash, child_count, first_seen_at, last_seen_at, is_deleted
+        ) VALUES (?, ?, NULL, 'U', 'root', ?, 'h', 0, ?, ?, 0)
+      `);
+      for (let i = 1; i <= 55; i++) insertRemoteRoot.run(`root-${i}`, CONTENT_PK, 1000 - i, NOW_ISO, NOW_ISO);
+      const insertRemoteThread = remoteSqlite.prepare(`
+        INSERT INTO comment_threads (
+          root_id, content_pk, r2_key, child_count, is_complete,
+          thread_hash, incoming_hash, preview_json, synced_at
+        ) VALUES (?, ?, ?, ?, ?, '', '', '[]', ?)
+      `);
+      for (let i = 1; i <= 50; i++) {
+        insertRemoteThread.run(`root-${i}`, CONTENT_PK, `childcomments/root-${i}.json`, 0, 1, NOW_ISO);
+      }
+      insertRemoteThread.run("root-55", CONTENT_PK, "childcomments/root-55.json", 0, 0, NOW_ISO);
+
+      const probeCount = () => mock.calls.filter(sql => /SELECT 1 AS has_any/.test(sql)).length;
+      const before = probeCount();
+      const liveRes = await callRootComments(d1, bucket, "&live_only=1");
+      assert.equal(liveRes.status, 200);
+      assert.equal(liveRes.body.data.length, 50, "主 D1 为空时必须透明回源外部库根评论");
+      assert.equal(liveRes.body.has_incomplete_roots, true, "外部库第 50 根之后的待重试线程也必须被探测到");
+      assert.ok(probeCount() > before, "主库未命中后必须探测外部库");
+
+      remoteSqlite.prepare(`UPDATE comment_threads SET is_complete = 1 WHERE root_id = 'root-55'`).run();
+      const doneRes = await callRootComments(d1, bucket, "&live_only=1");
+      assert.equal(doneRes.body.has_incomplete_roots, false);
+    } finally {
+      mock.restore();
+      auth.invalidateExternalTargetsCache();
+      auth.resetRemoteSchemaCache();
+    }
   }
 });
