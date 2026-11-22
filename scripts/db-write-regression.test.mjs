@@ -7712,3 +7712,256 @@ test("[PR2-3] live_only=1 外部分流下用外部库收敛状态过滤主库旧
     assert.equal(actual, scenario.expect, scenario.label);
   }
 });
+
+// ---------- PR #2 P1 审查项：hasIncompleteLiveRoot 收敛证据与当前写入目标 ----------
+
+const PR24_T1 = "2024-01-01T00:00:00.000Z";
+const PR24_T2 = "2024-02-01T00:00:00.000Z";
+const PR24_T3 = "2024-03-01T00:00:00.000Z";
+
+/** 只在内存 SQLite 的 comments 表插入根评论（显式时间戳便于验证收敛新鲜度） */
+function seedPr24Root(sqlite, { id, likes, lastSeenAt = PR24_T1, childCount = 0, isDeleted = 0, deletedAt = null }) {
+  sqlite.prepare(`
+    INSERT INTO comments (
+      id, content_pk, parent_comment_id, author_name, content_md, likes,
+      comment_hash, child_count, first_seen_at, last_seen_at, is_deleted, deleted_at
+    ) VALUES (?, ?, NULL, 'U', 'root', ?, 'h', ?, ?, ?, ?, ?)
+  `).run(id, CONTENT_PK, likes, childCount, lastSeenAt, lastSeenAt, isDeleted, deletedAt);
+}
+
+function seedPr24Thread(sqlite, { rootId, isComplete, syncedAt = PR24_T1, childCount = 0 }) {
+  sqlite.prepare(`
+    INSERT INTO comment_threads (
+      root_id, content_pk, r2_key, child_count, is_complete,
+      thread_hash, incoming_hash, preview_json, synced_at
+    ) VALUES (?, ?, ?, ?, ?, '', '', '[]', ?)
+  `).run(rootId, CONTENT_PK, `childcomments/${rootId}.json`, childCount, isComplete, syncedAt);
+}
+
+function callPr24LiveRootComments(d1, bucket) {
+  return runWithDb(d1, () =>
+    contentsRouteModule.contentRoutes.__call("GET", "/:pk/root-comments", {
+      params: { pk: CONTENT_PK },
+      url: `http://127.0.0.1/api/contents/${encodeURIComponent(CONTENT_PK)}/root-comments?limit=50&live_only=1`
+    }, { DB: d1, BUCKET: bucket })
+  );
+}
+
+test("[PR2-5] 远端 partial 裸根行不得屏蔽主库第 50 根之后的待重试根（cubic P1）", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+  auth.invalidateMainCommentCountCache();
+
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+  for (let i = 1; i <= 55; i++) seedPr24Root(sqlite, { id: `root-${i}`, likes: 1000 - i });
+  for (let i = 1; i <= 50; i++) seedPr24Thread(sqlite, { rootId: `root-${i}`, isComplete: 1 });
+  // 第 55 根（不在前 50 页）在主库是待重试归档
+  seedPr24Thread(sqlite, { rootId: "root-55", isComplete: 0 });
+
+  const remoteSqlite = new Database(":memory:");
+  const target = makeTursoTarget("ext-pr2-partial-bare-root", "https://ext-pr2-bare-root.example.com");
+  const bucket = makeTargetBucket(target);
+  const mock = installTursoPipelineMock(remoteSqlite);
+  try {
+    await runWithDb(d1, () => auth.ensureRemoteCommentSchema(target));
+
+    // 对 offload 外部库执行 partial 写入：远端只有根行，comment_threads 无行、blob 未落盘
+    await runWithDb(d1, () =>
+      commentsModule.replaceCommentsByRoot({
+        contentPk: CONTENT_PK,
+        partial: true,
+        allRootIds: ["root-55"],
+        roots: [{
+          id: "root-55",
+          author: "U",
+          authorAvatar: "",
+          content: "root",
+          img: "",
+          time: NOW_ISO,
+          location: "",
+          likes: 945,
+          isAuthor: false,
+          isTop: false,
+          isFeatured: false,
+          childCount: 0,
+          isChildrenComplete: false,
+          children: []
+        }]
+      }, { DB: d1, BUCKET: bucket })
+    );
+
+    assert.ok(
+      remoteSqlite.prepare(`SELECT 1 AS found FROM comments WHERE id = 'root-55' AND content_pk = ?`).get(CONTENT_PK),
+      "partial 写入后外部库必须存在该裸根行"
+    );
+    assert.equal(
+      remoteSqlite.prepare(`SELECT 1 AS found FROM comment_threads WHERE root_id = 'root-55'`).get(),
+      undefined,
+      "partial 线程未落盘时外部库不得有 comment_threads 行"
+    );
+
+    // 直接单测调用（不预先进入 dbContext.run）验证内部配置读取已绑定入参 database
+    assert.equal(
+      await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+      true,
+      "远端裸根行不构成收敛证据，主库待重试根必须继续触发重试"
+    );
+    const liveRes = await callPr24LiveRootComments(d1, bucket);
+    assert.equal(liveRes.status, 200);
+    assert.equal(liveRes.body.has_incomplete_roots, true, "路由也必须探测到主库第 50 根之后的待重试根");
+
+    // 外部库完成全量归档后才算收敛
+    seedPr24Thread(remoteSqlite, { rootId: "root-55", isComplete: 1, syncedAt: PR24_T3 });
+    assert.equal(await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket), false);
+    const doneRes = await callPr24LiveRootComments(d1, bucket);
+    assert.equal(doneRes.body.has_incomplete_roots, false);
+  } finally {
+    mock.restore();
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
+
+test("[PR2-5] 目标切为未达阈值 overflow 后远端旧完成副本不得吞掉主库新失败（greptile P1）", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+  auth.invalidateMainCommentCountCache();
+
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+
+  const remoteSqlite = new Database(":memory:");
+  const offloadTarget = makeTursoTarget("ext-pr2-overflow-switch", "https://ext-pr2-overflow-switch.example.com");
+  const mock = installTursoPipelineMock(remoteSqlite);
+  try {
+    await runWithDb(d1, () => auth.ensureRemoteCommentSchema(offloadTarget));
+
+    // 外部库先在 offload 角色下留有第 55 根的完整副本
+    seedPr24Root(remoteSqlite, { id: "root-55", likes: 945, lastSeenAt: PR24_T1 });
+    seedPr24Thread(remoteSqlite, { rootId: "root-55", isComplete: 1, syncedAt: PR24_T1 });
+
+    // 新同步写回主 D1：前 50 根完整，第 55 根 R2 保存失败留下 is_complete = 0
+    for (let i = 1; i <= 55; i++) seedPr24Root(sqlite, { id: `root-${i}`, likes: 1000 - i, lastSeenAt: PR24_T2 });
+    for (let i = 1; i <= 50; i++) seedPr24Thread(sqlite, { rootId: `root-${i}`, isComplete: 1, syncedAt: PR24_T2 });
+    seedPr24Thread(sqlite, { rootId: "root-55", isComplete: 0, syncedAt: PR24_T2 });
+
+    // 目标改为未达阈值的 overflow：实际写入库切回主 D1
+    const overflowTarget = {
+      ...offloadTarget,
+      storageRole: "overflow",
+      overflowThresholdRows: 1_500_000
+    };
+    const bucket = makeTargetBucket(overflowTarget);
+    auth.invalidateExternalTargetsCache();
+    auth.invalidateMainCommentCountCache();
+
+    assert.equal(
+      await runWithDb(d1, () => auth.resolveActiveOffloadTarget(bucket, "comments")),
+      null,
+      "阈值高于主库评论行数时该 overflow 目标不得成为实际写入库"
+    );
+    assert.equal(
+      await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+      true,
+      "非活跃外部库的旧 is_complete = 1 副本不得屏蔽主库新 is_complete = 0"
+    );
+    const liveRes = await callPr24LiveRootComments(d1, bucket);
+    assert.equal(liveRes.status, 200);
+    assert.equal(liveRes.body.has_incomplete_roots, true);
+  } finally {
+    mock.restore();
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
+
+test("[PR2-5] 实际写入 offload 的旧完成副本时间戳早于主库失败记录时不得判定收敛", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+  auth.invalidateMainCommentCountCache();
+
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+
+  // 主库：第 55 根同步失败（T2）；外部库仍残留故障前 T1 的完成副本
+  for (let i = 1; i <= 55; i++) seedPr24Root(sqlite, { id: `root-${i}`, likes: 1000 - i, lastSeenAt: PR24_T2 });
+  for (let i = 1; i <= 50; i++) seedPr24Thread(sqlite, { rootId: `root-${i}`, isComplete: 1, syncedAt: PR24_T2 });
+  seedPr24Thread(sqlite, { rootId: "root-55", isComplete: 0, syncedAt: PR24_T2 });
+
+  const remoteSqlite = new Database(":memory:");
+  const target = makeTursoTarget("ext-pr2-stale-settled", "https://ext-pr2-stale-settled.example.com");
+  const bucket = makeTargetBucket(target);
+  const mock = installTursoPipelineMock(remoteSqlite);
+  try {
+    await runWithDb(d1, () => auth.ensureRemoteCommentSchema(target));
+    seedPr24Root(remoteSqlite, { id: "root-55", likes: 945, lastSeenAt: PR24_T1 });
+    seedPr24Thread(remoteSqlite, { rootId: "root-55", isComplete: 1, syncedAt: PR24_T1 });
+
+    assert.equal(
+      await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+      true,
+      "T1 < T2 的旧完成副本不能证明主库 T2 失败记录已收敛"
+    );
+
+    // 外部库在实际写入目标上以不旧于 T2 的新时间完成归档
+    remoteSqlite.prepare(`
+      UPDATE comment_threads SET is_complete = 1, synced_at = ? WHERE root_id = 'root-55'
+    `).run(PR24_T3);
+    assert.equal(
+      await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+      false,
+      "实际写入库在 T3 >= T2 完成归档后才允许收敛"
+    );
+  } finally {
+    mock.restore();
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+  }
+});
+
+test("[PR2-5] 非活跃 overflow 旧 is_complete = 0 在新主库完成归档后不再反复重抓", async () => {
+  const auth = workerModules.auth;
+  auth.invalidateExternalTargetsCache();
+  auth.resetRemoteSchemaCache();
+  auth.invalidateMainCommentCountCache();
+
+  const { sqlite, d1 } = createMemoryDb();
+  seedContent(sqlite);
+
+  const remoteSqlite = new Database(":memory:");
+  const target = {
+    ...makeTursoTarget("ext-pr2-reverse-overflow", "https://ext-pr2-reverse-overflow.example.com"),
+    storageRole: "overflow",
+    overflowThresholdRows: 1_500_000
+  };
+  const bucket = makeTargetBucket(target);
+  const mock = installTursoPipelineMock(remoteSqlite);
+  try {
+    await runWithDb(d1, () => auth.ensureRemoteCommentSchema(target));
+    seedPr24Root(remoteSqlite, { id: "root-55", likes: 945, lastSeenAt: PR24_T1 });
+    seedPr24Thread(remoteSqlite, { rootId: "root-55", isComplete: 0, syncedAt: PR24_T1 });
+
+    assert.equal(
+      await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+      true,
+      "主库尚不包含该根时，非活跃 overflow 的待重试副本仍必须触发重试"
+    );
+
+    // 主库写入该根且 T2 >= T1 完成归档：不得再被非活跃库旧副本反复触发
+    seedPr24Root(sqlite, { id: "root-55", likes: 945, lastSeenAt: PR24_T2 });
+    seedPr24Thread(sqlite, { rootId: "root-55", isComplete: 1, syncedAt: PR24_T2 });
+    assert.equal(
+      await commentsModule.hasIncompleteLiveRoot(d1, CONTENT_PK, bucket),
+      false,
+      "主库不旧于旧副本的收敛状态必须剔除非活跃库历史待重试项"
+    );
+  } finally {
+    mock.restore();
+    auth.invalidateExternalTargetsCache();
+    auth.resetRemoteSchemaCache();
+  }
+});

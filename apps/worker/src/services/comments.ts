@@ -1,4 +1,4 @@
-import { db } from "../db.js";
+import { db, dbContext } from "../db.js";
 import { buildChangeStatement } from "./changes.js";
 import { isAvatarUrlChanged, normalizeForHash, sha256 } from "../utils/hash.js";
 import { withKeyLock } from "./lock.js";
@@ -2352,18 +2352,59 @@ export async function hasOffloadedComments(
   return false;
 }
 
+/** 解析 DB / API 返回的时间戳；支持 ISO 与 SQLite `YYYY-MM-DD HH:MM:SS`，空值或非法值返回 null */
+function parseTimestampMs(value: unknown): number | null {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  let text = String(value).trim();
+  if (!text) return null;
+  text = text.replace(" ", "T");
+  // SQLite 的 datetime('now') 不带时区，按 UTC 解释；带 Z/偏移的 ISO 原样解析
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(text)) text = `${text}Z`;
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** 多个时间戳中取最新值；全部缺失/非法时返回 null */
+function maxTimestampMs(...values: unknown[]): number | null {
+  let latest: number | null = null;
+  for (const value of values) {
+    const ms = parseTimestampMs(value);
+    if (ms !== null && (latest === null || ms > latest)) latest = ms;
+  }
+  return latest;
+}
+
+interface IncompleteRootRow {
+  id?: string | null;
+  root_last_seen_at?: string | null;
+  thread_synced_at?: string | null;
+  latest_child_seen_at?: string | null;
+}
+
+interface SettledRootRow {
+  id?: string | null;
+  is_deleted?: number | null;
+  deleted_at?: string | null;
+  root_last_seen_at?: string | null;
+  is_complete?: number | null;
+  thread_synced_at?: string | null;
+}
+
 /**
  * 判断某篇内容是否还有「需要重试归档」的存活根评论。
  *
  * 根评论列表按热度只取前 50 条（D1 绑定参数上限），第 50 根之后失败归档的线程
  * 不会出现在任何一页里；爬虫仅凭当前页逐行状态会永久漏掉它们。这里用单条
- * `SELECT 1 ... LIMIT 1` 在外部扩容库与主 D1 探测，不拉整表、不占绑定参数、
+ * `SELECT 1 ... LIMIT 1` 在当前实际写入库探测，不拉整表、不占绑定参数、
  * 不会因 join 放大重复计数。
  *
- * 启用外部分流后，主 D1 会残留迁移前的旧线程（is_complete=0），而成功归档只写外部库。
- * 因此外部扩容库是「当前写入库」：先确认所有可达外部库都没有未完成活根，再把主 D1
- * 残留的未完成根 ID 与外部库已接管的根（含软删归档，说明该根已在外部库收敛）对账，
- * 只对真正未迁移的主库旧根返回 true，避免爬虫每轮全量重抓。
+ * 启用外部分流后，任意外部库里可能残留历史副本，且 `resolveActiveOffloadTarget`
+ * 会随 storageRole / overflowThresholdRows / 主库评论行数变化。因此：
+ * - 先确定「当前实际写入库」（主 D1 或某个外部库）。实际写入库有未完成活根，
+ *   必须触发重试，非活跃库的旧副本无权屏蔽它；
+ * - 非活跃库里的待重试根，只有实际写入库存在「明确收敛证据」（软删根或
+ *   is_complete IN (1, 2) 的线程索引）且收敛时间不早于待重试副本时才算收敛。
+ *   远端只有裸根行（partial 写入后线程/blob 尚未落盘）不算收敛。
  */
 export async function hasIncompleteLiveRoot(
   database: D1Database,
@@ -2388,9 +2429,27 @@ export async function hasIncompleteLiveRoot(
       )
   `;
   const hasAnySql = `SELECT 1 AS has_any ${incompleteWhereSql} LIMIT 1`;
-  const rootIdsSql = `SELECT c.id AS id ${incompleteWhereSql}`;
+  const rootRowsSql = `
+    SELECT
+      c.id AS id,
+      c.last_seen_at AS root_last_seen_at,
+      t.synced_at AS thread_synced_at,
+      (
+        SELECT MAX(ch.last_seen_at)
+        FROM comments ch
+        WHERE ch.parent_comment_id = c.id AND ch.is_deleted = 0
+      ) AS latest_child_seen_at
+    ${incompleteWhereSql}
+  `;
 
-  const offloadTargets = bucket ? await listReadableCommentOffloadTargets(bucket).catch(() => []) : [];
+  // 配置读取走 db 代理，必须与入参 database 绑定同一 AsyncLocalStorage 上下文：
+  // HTTP 路由里二者一致，直接单测调用时则可能尚未进入 run(database)。
+  const withDatabaseContext = <T>(fn: () => Promise<T>): Promise<T> =>
+    dbContext.getStore() === database ? fn() : dbContext.run(database, fn);
+
+  const offloadTargets = bucket
+    ? await withDatabaseContext(() => listReadableCommentOffloadTargets(bucket)).catch(() => [])
+    : [];
 
   // 未启用外部扩容库：保持原有单条探测，零额外开销。
   if (offloadTargets.length === 0) {
@@ -2402,70 +2461,154 @@ export async function hasIncompleteLiveRoot(
     }
   }
 
-  // 1) 外部扩容库是当前写入库：任意外部库存在未完成活根即需要重试。
-  //    单库报错只记 warn 且不计入可达目标，避免不可达外部库误屏蔽主库真实重试。
-  const reachableTargets: ExternalStorageTarget[] = [];
-  for (const target of offloadTargets) {
-    try {
-      const result = await executeRemoteSql(target, hasAnySql, [contentPk]);
-      if (result.rows.length > 0) return true;
-      reachableTargets.push(target);
-    } catch (err) {
-      console.warn(
-        `[comments] hasIncompleteLiveRoot probe failed (${target.name || target.id}):`,
-        err
-      );
-    }
-  }
+  const activeOffloadTarget = bucket
+    ? await withDatabaseContext(() => resolveActiveOffloadTarget(bucket, "comments")).catch(() => null)
+    : null;
 
-  // 2) 所有可达外部库都没有未完成活根：再取出主 D1 残留的未完成活根 ID 集合。
-  let unresolvedIds: Set<string>;
-  try {
-    const { results } = await database.prepare(rootIdsSql).bind(contentPk).all<{ id?: string }>();
-    unresolvedIds = new Set(
-      (results ?? [])
-        .map(row => (row.id == null ? "" : String(row.id)))
-        .filter(id => id !== "")
-    );
-  } catch {
-    // 主库探测失败不能让路由整体 500：调用方按 false 处理
-    return false;
-  }
-  if (unresolvedIds.size === 0) return false;
-  // 外部库全部不可达时无法证明主库旧副本已收敛，仍按主库结论触发重试。
-  if (reachableTargets.length === 0) return true;
-
-  // 3) 步骤 1 已证明可达外部库中没有任何未完成活根，因此凡是在外部库 comments 表
-  //    存在的根 ID 都已在当前写入库收敛（已软删的根同样算收敛，故不加 is_deleted 过滤）。
-  //    将其从主库未完成集合中剔除；每个外部库最多只追加 1 次子请求。
-  for (const target of reachableTargets) {
-    const ids = Array.from(unresolvedIds);
-    try {
-      const rows = ids.length <= D1_MAX_SQL_PARAMS - 1
-        ? (await executeRemoteSql(
-            target,
-            `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL AND id IN (${ids.map(() => "?").join(", ")})`,
-            [contentPk, ...ids]
-          )).rows
-        : (await executeRemoteSql(
-            target,
-            `SELECT id FROM comments WHERE content_pk = ? AND parent_comment_id IS NULL`,
-            [contentPk]
-          )).rows;
-      for (const row of rows) {
-        const id = row.id == null ? "" : String(row.id);
-        if (id) unresolvedIds.delete(id);
+  /** 汇总未完成活根；同一根出现在多个非活跃库时取最新状态，任一库时间未知则保持 null */
+  const mergeIncompleteRows = (rows: IncompleteRootRow[], unresolved: Map<string, number | null>) => {
+    for (const row of rows) {
+      const id = row.id == null ? "" : String(row.id);
+      if (!id) continue;
+      const ts = maxTimestampMs(row.root_last_seen_at, row.thread_synced_at, row.latest_child_seen_at);
+      if (!unresolved.has(id)) {
+        unresolved.set(id, ts);
+        continue;
       }
-      if (unresolvedIds.size === 0) return false;
+      const prev = unresolved.get(id) ?? null;
+      unresolved.set(id, prev === null || ts === null ? null : Math.max(prev, ts));
+    }
+  };
+
+  /** 只剔除实际写入库里有明确收敛证据、且不旧于待重试副本的根 */
+  const applySettledRows = (rows: SettledRootRow[], unresolved: Map<string, number | null>) => {
+    for (const row of rows) {
+      const id = row.id == null ? "" : String(row.id);
+      if (!id || !unresolved.has(id)) continue;
+      const isDeleted = Number(row.is_deleted ?? 0) === 1;
+      const isComplete = Number(row.is_complete ?? 0);
+      const settledTs = isDeleted
+        ? maxTimestampMs(row.deleted_at, row.root_last_seen_at)
+        : isComplete === 1 || isComplete === 2
+          ? parseTimestampMs(row.thread_synced_at)
+          : null;
+      if (settledTs === null) continue;
+      const incompleteTs = unresolved.get(id) ?? null;
+      if (incompleteTs === null || settledTs >= incompleteTs) unresolved.delete(id);
+    }
+  };
+
+  /** 收敛查询：只有软删根或已完成线程索引才算收敛，裸根行不参与判定 */
+  const buildSettledQuery = (ids: string[]) => {
+    const useIdFilter = ids.length > 0 && ids.length <= D1_MAX_SQL_PARAMS - 1;
+    return {
+      sql: `
+        SELECT
+          c.id AS id,
+          c.is_deleted AS is_deleted,
+          c.deleted_at AS deleted_at,
+          c.last_seen_at AS root_last_seen_at,
+          t.is_complete AS is_complete,
+          t.synced_at AS thread_synced_at
+        FROM comments c
+        LEFT JOIN comment_threads t ON t.root_id = c.id
+        WHERE c.content_pk = ?
+          AND c.parent_comment_id IS NULL
+          AND (
+            c.is_deleted = 1
+            OR (t.root_id IS NOT NULL AND t.is_complete IN (1, 2))
+          )
+          ${useIdFilter ? `AND c.id IN (${ids.map(() => "?").join(", ")})` : ""}
+      `,
+      params: useIdFilter ? [contentPk, ...ids] : [contentPk]
+    };
+  };
+
+  const warnProbeFailure = (target: ExternalStorageTarget, err: unknown) => {
+    console.warn(`[comments] hasIncompleteLiveRoot probe failed (${target.name || target.id}):`, err);
+  };
+
+  // 分支 A：当前实际写入库是主 D1（例如所有外部库都是未达阈值的 overflow）。
+  if (!activeOffloadTarget) {
+    // A1) 主 D1 自己还有未完成活根：立即触发重试，非活跃外部库的旧副本无权屏蔽。
+    try {
+      const row = await database.prepare(hasAnySql).bind(contentPk).first<{ has_any?: number }>();
+      if (row) return true;
+    } catch {
+      // 主库探测失败不能让路由整体 500：调用方按 false 处理
+      return false;
+    }
+
+    // A2) 再看非活跃外部库残留的未完成活根。
+    const unresolved = new Map<string, number | null>();
+    for (const target of offloadTargets) {
+      try {
+        const result = await executeRemoteSql(target, rootRowsSql, [contentPk]);
+        mergeIncompleteRows(result.rows as IncompleteRootRow[], unresolved);
+      } catch (err) {
+        warnProbeFailure(target, err);
+      }
+    }
+    if (unresolved.size === 0) return false;
+
+    // A3) 只允许主 D1 的收敛证据剔除旧副本；收敛查询失败时保守触发重试。
+    const { sql, params } = buildSettledQuery(Array.from(unresolved.keys()));
+    try {
+      const { results } = await database.prepare(sql).bind(...params).all<SettledRootRow>();
+      applySettledRows(results ?? [], unresolved);
     } catch (err) {
-      // 收敛状态查不到时不能当作已收敛：保留主库未完成结论，继续探测下一个目标
-      console.warn(
-        `[comments] hasIncompleteLiveRoot convergence probe failed (${target.name || target.id}):`,
-        err
-      );
+      console.warn("[comments] hasIncompleteLiveRoot main convergence probe failed:", err);
+      return true;
+    }
+    return unresolved.size > 0;
+  }
+
+  // 分支 B：当前实际写入库是某个外部库。
+  // B1) 实际写入库存在未完成活根：立即触发重试。
+  let activeReachable = false;
+  try {
+    const result = await executeRemoteSql(activeOffloadTarget, hasAnySql, [contentPk]);
+    if (result.rows.length > 0) return true;
+    activeReachable = true;
+  } catch (err) {
+    warnProbeFailure(activeOffloadTarget, err);
+  }
+
+  // B2) 收集所有非活跃库（主 D1 + 其余外部库）的未完成活根。
+  const unresolved = new Map<string, number | null>();
+  try {
+    const { results } = await database.prepare(rootRowsSql).bind(contentPk).all<IncompleteRootRow>();
+    mergeIncompleteRows(results ?? [], unresolved);
+  } catch (err) {
+    console.warn("[comments] hasIncompleteLiveRoot main probe failed:", err);
+  }
+  for (const target of offloadTargets) {
+    if (target.id === activeOffloadTarget.id) continue;
+    try {
+      const result = await executeRemoteSql(target, rootRowsSql, [contentPk]);
+      mergeIncompleteRows(result.rows as IncompleteRootRow[], unresolved);
+    } catch (err) {
+      warnProbeFailure(target, err);
     }
   }
-  return unresolvedIds.size > 0;
+  if (unresolved.size === 0) return false;
+
+  // B3) 实际写入库不可达时无法证明已收敛，保守触发重试。
+  if (!activeReachable) return true;
+
+  // B4) 仅用实际写入库的收敛证据剔除；失败时同样保守触发重试。
+  const { sql, params } = buildSettledQuery(Array.from(unresolved.keys()));
+  try {
+    const result = await executeRemoteSql(activeOffloadTarget, sql, params);
+    applySettledRows(result.rows as SettledRootRow[], unresolved);
+  } catch (err) {
+    console.warn(
+      `[comments] hasIncompleteLiveRoot convergence probe failed (${activeOffloadTarget.name || activeOffloadTarget.id}):`,
+      err
+    );
+    return true;
+  }
+  return unresolved.size > 0;
 }
 
 /**

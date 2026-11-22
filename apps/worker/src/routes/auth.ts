@@ -363,6 +363,10 @@ export async function saveExternalTargetsRaw(
     throw d1Err instanceof Error ? d1Err : (r2Err instanceof Error ? r2Err : new Error("保存外部存储目标失败"));
   }
   // 写入成功后刷新本 isolate 缓存（若本次是 D1 不可用降级写 R2，不伪造 d1UpdatedAt）
+  // 配置切换会改变「当前实际写入库」（offload ↔ overflow / 阈值调整），
+  // 主库评论行数缓存必须一起失效，否则 resolveActiveOffloadTarget 会在 5 分钟 TTL 内
+  // 继续用旧行数判断，导致 hasIncompleteLiveRoot 认错实际写入目标。
+  invalidateMainCommentCountCache();
   cachedExternalTargets = {
     at: Date.now(),
     list: cloneTargets(saved),
