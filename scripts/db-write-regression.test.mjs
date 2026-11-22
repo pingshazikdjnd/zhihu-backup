@@ -9004,15 +9004,21 @@ test("[AUDIT-7] claimImageTasks 按 updated_at ASC, id ASC 优先领取旧任务
     assert.deepEqual(claimedUrls, ["https://pic1.zhimg.com/retry-old.jpg"],
       "limit=1 时必须优先领取 updated_at 最早的历史重试任务（不饿死）");
 
-    // (2) limit=2 时继续，应按 updated_at 排序领取 id=2（新任务 nowIso）先于 id=1（刚重试 newerIso）
+    // (2) 继续 limit=1，应按 updated_at 排序领取 id=2（新任务 nowIso）
     claimedUrls.length = 0;
-    const res2 = await runWithDb(d1, () => imageTasksModule.processImageBatch(bucket, 2));
-    assert.equal(res2.claimed, 2);
-    assert.equal(res2.done, 2);
-    assert.deepEqual(claimedUrls, [
-      "https://pic1.zhimg.com/brand-new.jpg",
-      "https://pic1.zhimg.com/retry-fresh.jpg"
-    ], "刚失败刷新 updated_at 的重试任务必须排在同期新任务之后");
+    const res2 = await runWithDb(d1, () => imageTasksModule.processImageBatch(bucket, 1));
+    assert.equal(res2.claimed, 1);
+    assert.equal(res2.done, 1);
+    assert.deepEqual(claimedUrls, ["https://pic1.zhimg.com/brand-new.jpg"],
+      "新任务（nowIso）排在刚重试任务（newerIso）之前被领出");
+
+    // (3) 继续 limit=1，领取最后一条 id=1（刚重试 newerIso）
+    claimedUrls.length = 0;
+    const res3 = await runWithDb(d1, () => imageTasksModule.processImageBatch(bucket, 1));
+    assert.equal(res3.claimed, 1);
+    assert.equal(res3.done, 1);
+    assert.deepEqual(claimedUrls, ["https://pic1.zhimg.com/retry-fresh.jpg"],
+      "刚失败刷新 updated_at 的重试任务最后被领出");
   } finally {
     globalThis.fetch = originalFetch;
   }
