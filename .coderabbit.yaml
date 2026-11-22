@@ -4,7 +4,7 @@ early_access: false
 
 reviews:
   # chill: 只抓重点缺陷 | assertive: 更严格，会提更多重构和风格建议
-  profile: "assertive"
+  profile: "chill"
   # 设为 false 避免机器人在 PR 里直接打回（Request Changes）阻塞合并
   request_changes_workflow: false
   # 保留高阶改动摘要，关掉打油诗、流程图等刷屏项
