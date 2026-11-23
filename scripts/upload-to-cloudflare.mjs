@@ -1200,7 +1200,7 @@ if (shouldWipe) {
   console.log("  A1. wrangler d1 migrations apply --remote ...");
   const mig = await withRetry(
     async () => {
-      const r = await runWrangler(["d1", "migrations", "apply", DB_NAME, "--remote", "--yes"], {
+      const r = await runWrangler(["d1", "migrations", "apply", DB_NAME, "--remote"], {
         timeoutMs: 10 * 60 * 1000
       });
       if (r.code !== 0) throw new Error(`wrangler 退出码 ${r.code}：${(r.stderr || r.stdout).slice(-800)}`);
@@ -1360,6 +1360,7 @@ async function uploadOne(rec) {
       { body, contentType: rec.contentType || "application/octet-stream", timeoutMs: 180000 }
     );
   } else {
+    // Wrangler 3 的 `r2 object put` 仅提供 `--local` 选项，省略 `--local` 时默认即写入远端 Cloudflare R2（且不支持 `--remote` 参数）。
     const r = await runWrangler(
       [
         "r2",

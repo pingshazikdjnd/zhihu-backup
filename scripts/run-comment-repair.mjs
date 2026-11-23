@@ -68,6 +68,15 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
+
+function resolveRepairTimeoutMs(envName, fallbackMs, minMs = 1) {
+  const raw = Number(process.env[envName]);
+  return Number.isFinite(raw) && raw >= minMs && raw <= MAX_NODE_TIMEOUT_MS ? Math.trunc(raw) : fallbackMs;
+}
+const CRAWLER_STOP_TIMEOUT_MS = resolveRepairTimeoutMs("REPAIR_COMMENTS_CRAWLER_STOP_TIMEOUT_MS", 5_000);
+const CRAWLER_FORCE_KILL_WAIT_MS = resolveRepairTimeoutMs("REPAIR_COMMENTS_FORCE_KILL_WAIT_MS", 1_000);
+
 function discoverSqlite(dir) {
   if (!fs.existsSync(dir)) return "";
   const files = fs
@@ -142,7 +151,8 @@ function scanCandidates(d1) {
         c.pk,
         c.comment_count AS commentCount,
         COALESCE(cm.roots, 0) AS roots,
-        COALESCE(ct.children, 0) AS children
+        COALESCE(ct.children, 0) AS children,
+        COALESCE(ct.incompleteThreads, 0) AS incompleteThreads
       FROM contents c
       LEFT JOIN (
         SELECT content_pk,
@@ -151,9 +161,17 @@ function scanCandidates(d1) {
         GROUP BY content_pk
       ) cm ON cm.content_pk = c.pk
       LEFT JOIN (
-        SELECT content_pk, COALESCE(SUM(child_count), 0) AS children
-        FROM comment_threads
-        GROUP BY content_pk
+        SELECT ct.content_pk,
+               -- 完整性比较只用根行现网子评论数：ct.child_count 会保留已删除回复的归档历史，
+               -- 用它会把「现网漏采」误判成已抓全，导致补采脚本永久跳过残缺内容。
+               COALESCE(SUM(CASE WHEN ct.is_complete IN (1, 2) THEN COALESCE(r.child_count, 0) ELSE 0 END), 0) AS children,
+               COALESCE(SUM(CASE WHEN COALESCE(ct.is_complete, 0) = 0 THEN 1 ELSE 0 END), 0) AS incompleteThreads
+        FROM comment_threads ct
+        JOIN comments r ON r.id = ct.root_id
+                       AND r.content_pk = ct.content_pk
+                       AND r.parent_comment_id IS NULL
+                       AND r.is_deleted = 0
+        GROUP BY ct.content_pk
       ) ct ON ct.content_pk = c.pk
       WHERE c.is_deleted = 0
         AND c.source_type IN ('answer', 'article')
@@ -176,7 +194,7 @@ function scanCandidates(d1) {
   let skippedAlreadyComplete = 0;
   const targets = [];
   for (const r of rows) {
-    if (Number(r.roots) + Number(r.children) >= Number(r.commentCount)) {
+    if (Number(r.incompleteThreads || 0) === 0 && Number(r.roots) + Number(r.children) >= Number(r.commentCount)) {
       skippedAlreadyComplete += 1;
       continue;
     }
@@ -242,11 +260,13 @@ async function pickWorkerPort(startPort) {
   throw new Error(`端口 ${startPort}..${startPort + 19} 均不可用`);
 }
 
-async function startLocalWorker(port) {
+async function startLocalWorker(port, onSpawn) {
   const proc = spawn(process.execPath, [WRANGLER_BIN, "dev", "--local", "--port", String(port)], {
     cwd: WORKER_DIR,
-    stdio: ["pipe", "pipe", "pipe"]
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: process.platform !== "win32"
   });
+  if (typeof onSpawn === "function") onSpawn(proc);
   let dead = false;
   let exitCode = null;
   let errTail = "";
@@ -258,31 +278,75 @@ async function startLocalWorker(port) {
     errTail = (errTail + d.toString()).slice(-3000);
   });
 
-  const baseUrl = `http://127.0.0.1:${port}`;
-  const deadline = Date.now() + 60_000;
-  let ready = false;
-  while (Date.now() < deadline && !dead) {
-    try {
-      const res = await fetch(`${baseUrl}/api/health`);
-      if (res.ok) {
-        ready = true;
-        break;
-      }
-    } catch {}
-    await sleep(500);
-  }
-  if (!ready) {
+  try {
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const deadline = Date.now() + 60_000;
+    let ready = false;
+    while (Date.now() < deadline && !dead) {
+      try {
+        const res = await fetch(`${baseUrl}/api/health`);
+        if (res.ok) {
+          ready = true;
+          break;
+        }
+      } catch {}
+      await sleep(500);
+    }
+    if (!ready) {
+      throw new Error(`本地 Worker (${baseUrl}) 启动失败 (exit=${exitCode}): ${errTail}`);
+    }
+    return { proc, baseUrl, isDead: () => dead };
+  } catch (err) {
     stopLocalWorker(proc);
-    throw new Error(`本地 Worker (${baseUrl}) 启动失败 (exit=${exitCode}): ${errTail}`);
+    throw err;
   }
-  return { proc, baseUrl, isDead: () => dead };
 }
 
 function stopLocalWorker(proc) {
   if (!proc?.pid) return;
   try {
-    execFileSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], { stdio: "ignore" });
+    if (process.platform === "win32") {
+      execFileSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      try {
+        process.kill(-proc.pid, "SIGTERM");
+      } catch {
+        proc.kill("SIGTERM");
+      }
+    }
   } catch {}
+}
+
+function stopCrawlerChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let done = false;
+    let forceKillTimer = null;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(stopTimer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      child.off?.("close", finish);
+      resolve();
+    };
+    const stopTimer = setTimeout(() => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        finish();
+        return;
+      }
+      try { child.kill("SIGKILL"); } catch {}
+      forceKillTimer = setTimeout(finish, CRAWLER_FORCE_KILL_WAIT_MS);
+    }, CRAWLER_STOP_TIMEOUT_MS);
+    child.once?.("close", finish);
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      finish();
+    }
+  });
 }
 
 async function resolveWorkerSecret(baseUrl, candidates) {
@@ -337,7 +401,7 @@ async function verifyCookieValid(cookie) {
   }
 }
 
-function runCrawlerBatch(batchPks, { baseUrl, secret, username, cookie, onItemDone }) {
+function runCrawlerBatch(batchPks, { baseUrl, secret, username, cookie, onItemDone, onSpawn }) {
   fs.mkdirSync(KV_DEFAULT_DIR, { recursive: true });
   const payload = {
     runType: "repair-comments",
@@ -364,6 +428,7 @@ function runCrawlerBatch(batchPks, { baseUrl, secret, username, cookie, onItemDo
       },
       stdio: ["pipe", "pipe", "pipe"]
     });
+    if (typeof onSpawn === "function") onSpawn(child);
 
     let allText = "";
     const warnedPks = new Set();
@@ -537,18 +602,30 @@ async function main() {
 
   acquireLock();
   let worker = null;
+  let startingWorkerProc = null;
   let secret = "";
 
   const ensureWorker = async () => {
     if (worker && !worker.isDead()) return;
     const port = await pickWorkerPort(opts.preferredPort);
     log(`[worker] 正在端口 ${port} 启动单实例本地 Worker...`);
-    worker = await startLocalWorker(port);
+    try {
+      worker = await startLocalWorker(port, (proc) => {
+        startingWorkerProc = proc;
+      });
+    } finally {
+      startingWorkerProc = null;
+    }
     secret = await resolveWorkerSecret(worker.baseUrl, creds.secrets);
     log(`[worker] 本地 Worker 就绪 (${worker.baseUrl})，账号=${creds.username}`);
   };
 
   const cleanupWorker = () => {
+    if (startingWorkerProc) {
+      stopLocalWorker(startingWorkerProc);
+      startingWorkerProc = null;
+      log("[worker] 本地 Worker 已停止。");
+    }
     if (worker) {
       stopLocalWorker(worker.proc);
       worker = null;
@@ -558,24 +635,34 @@ async function main() {
 
   let progressDirty = false;
   let unsavedCount = 0;
+  let activeCrawlerChild = null;
+  let signalCleanupPromise = null;
 
   let cleaningUp = false;
   const handleSignal = (signal) => {
     if (cleaningUp) return;
     cleaningUp = true;
-    log(`[signal] 收到 ${signal}，正在保存断点并清理 INPUT.json、Worker 与锁...`);
-    try {
-      if (progressDirty) saveProgress(progress);
-    } catch {}
-    try {
-      fs.rmSync(INPUT_JSON_PATH, { force: true });
-    } catch {}
-    cleanupWorker();
-    releaseLock();
-    process.exit(130);
+    signalCleanupPromise = (async () => {
+      log(`[signal] 收到 ${signal}，正在停止活动爬虫并保存断点、清理 INPUT.json、Worker 与锁...`);
+      const childToStop = activeCrawlerChild;
+      if (childToStop) {
+        await stopCrawlerChild(childToStop);
+        if (activeCrawlerChild === childToStop) activeCrawlerChild = null;
+      }
+      try {
+        if (progressDirty) saveProgress(progress);
+      } catch {}
+      try {
+        fs.rmSync(INPUT_JSON_PATH, { force: true });
+      } catch {}
+      cleanupWorker();
+      releaseLock();
+      process.exit(130);
+    })();
   };
   process.once("SIGINT", handleSignal);
   process.once("SIGTERM", handleSignal);
+  if (process.platform !== "win32") process.once("SIGHUP", handleSignal);
 
   const markItemDone = (kind, pk) => {
     if (kind === "closed") {
@@ -603,7 +690,7 @@ async function main() {
     let consecutiveZeroProgressRisks = 0;
     let batchNo = 0;
 
-    while (true) {
+    while (!cleaningUp) {
       const pending = targetSlice.filter(
         (x) =>
           !completedSet.has(x.pk) &&
@@ -614,6 +701,7 @@ async function main() {
       if (pending.length === 0) break;
 
       await ensureWorker();
+      if (cleaningUp) break;
 
       const batchObjs = pending.slice(0, opts.batchSize);
       const batchPks = batchObjs.map((x) => x.pk);
@@ -631,10 +719,18 @@ async function main() {
         secret,
         username: creds.username,
         cookie: creds.cookie,
+        onSpawn: (child) => {
+          activeCrawlerChild = child;
+          child.once?.("close", () => {
+            if (activeCrawlerChild === child) activeCrawlerChild = null;
+          });
+        },
         onItemDone: (kind, pk) => {
           markItemDone(kind, pk);
         }
       });
+      activeCrawlerChild = null;
+      if (cleaningUp) break;
 
       for (const pk of result.completedOrder) markItemDone("completed", pk);
       for (const pk of result.closedOrder) markItemDone("closed", pk);
@@ -708,11 +804,38 @@ async function main() {
       );
     }
 
+    if (cleaningUp && signalCleanupPromise) {
+      await signalCleanupPromise;
+    }
     log(`🎉 第 4 步评论补采队列执行完成！累计已核销断点 ${completedSet.size} 条，跳过 ${skippedSet.size} 条。`);
   } finally {
-    if (progressDirty) saveProgress(progress);
-    cleanupWorker();
-    releaseLock();
+    try {
+      if (progressDirty) saveProgress(progress);
+    } catch (err) {
+      log(`[cleanup] 保存进度失败，继续执行清理: ${err?.message || err}`);
+    } finally {
+      try {
+        try {
+          cleanupWorker();
+        } catch (err) {
+          log(`[cleanup] 停止 Worker 失败: ${err?.message || err}`);
+        }
+        try {
+          fs.rmSync(INPUT_JSON_PATH, { force: true });
+        } catch (err) {
+          log(`[cleanup] 清理 INPUT.json 失败: ${err?.message || err}`);
+        }
+        try {
+          releaseLock();
+        } catch (err) {
+          log(`[cleanup] 释放锁失败: ${err?.message || err}`);
+        }
+      } finally {
+        process.off("SIGINT", handleSignal);
+        process.off("SIGTERM", handleSignal);
+        if (process.platform !== "win32") process.off("SIGHUP", handleSignal);
+      }
+    }
   }
 }
 

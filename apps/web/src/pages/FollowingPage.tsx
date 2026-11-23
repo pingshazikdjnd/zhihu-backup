@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../lib/api.js";
+import { assessContentRisk, safeSetWriteToken } from "../lib/ai-assess.js";
 import { followingStore, recommendStore } from "../lib/store.js";
 
 const fmtNum = (n: any) => {
@@ -62,10 +63,9 @@ export default function FollowingPage() {
 }
 
 async function postUserModeWithAuth(urlToken: string, syncMode: "default" | "full") {
-  let pwd = localStorage.getItem("cookie_write_token") || "";
-  const doCall = (tokenStr: string) => {
+  const doCall = (tokenStr?: string) => {
     const headers: Record<string, string> = { "content-type": "application/json" };
-    if (tokenStr.trim()) headers.authorization = `Bearer ${tokenStr.trim()}`;
+    if (tokenStr && tokenStr.trim()) headers.authorization = `Bearer ${tokenStr.trim()}`;
     return api(`/api/following/users/${encodeURIComponent(urlToken)}/mode`, {
       method: "POST",
       headers,
@@ -73,13 +73,14 @@ async function postUserModeWithAuth(urlToken: string, syncMode: "default" | "ful
     });
   };
   try {
-    return await doCall(pwd);
+    return await doCall();
   } catch (e: any) {
     if (String(e?.message || "").startsWith("401")) {
       const input = window.prompt("切换全量/精选备份模式需验证操作密码（验证后本浏览器自动记住）：", "");
-      if (!input) throw new Error("已取消密码验证");
-      const res = await doCall(input.trim());
-      localStorage.setItem("cookie_write_token", input.trim());
+      const trimmed = input?.trim() || "";
+      if (!trimmed) throw new Error("已取消密码验证");
+      const res = await doCall(trimmed);
+      safeSetWriteToken(trimmed);
       return res;
     }
     throw e;
@@ -98,10 +99,15 @@ function FollowingHome() {
   const [error, setError] = useState("");
   const [togglingToken, setTogglingToken] = useState<string | null>(null);
   const [aiResults, setAiResults] = useState<Record<string, any>>(recommendStore.aiCache);
-  const [aiLoadingPk, setAiLoadingPk] = useState<string | null>(null);
+  const [aiLoadingPks, setAiLoadingPks] = useState<Record<string, boolean>>({});
+  const aiLoadingSetRef = useRef<Set<string>>(new Set());
   // 关注列表与动态流共用 loading/error，因此共用一个请求序号：
   // 切 tab/搜索/切换 onlyRisk 时旧回包不得再覆盖新列表或清掉新请求的 loading
   const listReqRef = useRef(0);
+  // 记录最后一次成功写回列表的筛选条件，切回已缓存 Tab 时若条件已变则自动重拉
+  const lastLoadedUsersKeyRef = useRef<string | null>(
+    followingStore.users.length > 0 ? `${followingStore.userQ}\0${followingStore.userModeFilter}` : null
+  );
 
   useEffect(() => {
     window.scrollTo(0, followingStore.scrollPosition);
@@ -126,6 +132,7 @@ function FollowingHome() {
       setSummary(res.summary || null);
       followingStore.users = res.users || [];
       followingStore.summary = res.summary || null;
+      lastLoadedUsersKeyRef.current = `${q}\0${mode}`;
     } catch (e: any) {
       if (seq !== listReqRef.current) return;
       setError(e?.message || "加载关注列表失败");
@@ -159,9 +166,26 @@ function FollowingHome() {
   };
 
   useEffect(() => {
-    if (activeTab === "users" && users.length === 0) loadUsers();
-    if (activeTab === "feed" && feed.length === 0) loadFeed(false);
-    if (activeTab === "risk" && riskFeed.length === 0) loadFeed(true);
+    if (activeTab === "users") {
+      if (users.length === 0 || lastLoadedUsersKeyRef.current !== `${userQ}\0${modeFilter}`) {
+        loadUsers();
+        return;
+      }
+    } else if (activeTab === "feed") {
+      if (feed.length === 0) {
+        loadFeed(false);
+        return;
+      }
+    } else if (activeTab === "risk") {
+      if (riskFeed.length === 0) {
+        loadFeed(true);
+        return;
+      }
+    }
+    // 切回已缓存 Tab 时作废前 Tab 在途请求并清空残留 loading/error
+    listReqRef.current++;
+    setLoading(false);
+    setError("");
   }, [activeTab]);
 
   const handleToggleMode = async (u: any) => {
@@ -193,26 +217,14 @@ function FollowingHome() {
   const handleAiAssess = async (e: React.MouseEvent, pk: string) => {
     e.preventDefault();
     e.stopPropagation();
-    if (aiResults[pk]) return;
-    setAiLoadingPk(pk);
-    try {
-      const res = await api<any>(`/api/recommend/ai-assess`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ pk })
-      });
-      if (res?.ai) {
-        setAiResults(prev => {
-          const next = { ...prev, [pk]: res.ai };
-          recommendStore.aiCache = next;
-          return next;
-        });
-      }
-    } catch (err: any) {
-      alert(`AI 评估失败: ${err?.message || err}`);
-    } finally {
-      setAiLoadingPk(prev => (prev === pk ? null : prev));
-    }
+    await assessContentRisk({
+      pk,
+      aiResults,
+      aiLoadingSetRef,
+      setAiLoadingPks,
+      setAiResults,
+      errorPrefix: "AI 评估失败"
+    });
   };
 
   return (
@@ -447,7 +459,7 @@ function FollowingHome() {
                 <button
                   type="button"
                   onClick={e => handleAiAssess(e, item.pk)}
-                  disabled={aiLoadingPk === item.pk}
+                  disabled={Boolean(aiLoadingPks[item.pk])}
                   style={{
                     padding: "2px 10px",
                     borderRadius: 4,
@@ -458,7 +470,7 @@ function FollowingHome() {
                     cursor: "pointer"
                   }}
                 >
-                  {aiLoadingPk === item.pk ? "AI 鉴定中…" : aiResults[item.pk] ? "✅ 已鉴定" : "🛡️ AI 风险鉴定"}
+                  {aiLoadingPks[item.pk] ? "AI 鉴定中…" : aiResults[item.pk] ? "✅ 已鉴定" : "🛡️ AI 风险鉴定"}
                 </button>
                 <span className="footer-right">
                   {fmtDate(item.updated_time || item.created_time || item.last_seen_at)}

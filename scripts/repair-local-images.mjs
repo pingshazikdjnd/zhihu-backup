@@ -249,7 +249,8 @@ function normalizeBatchResult(json) {
     claimed: num(json?.claimed),
     done: num(json?.done),
     failed: num(json?.failed),
-    retry: num(json?.retry)
+    retry: num(json?.retry),
+    limit: num(json?.limit)
   };
 }
 
@@ -847,7 +848,8 @@ async function consumeImageBatches(secret) {
 
     // 终止条件（缺一不可地避免死循环）：
     // 1) 队列已空；2) 本批一张都没成功（失败/重试）→ 立即停，避免连续打图床；
-    // 3) 本批不足 batch-size → 队列已处理完。
+    // 3) 达到 --image-max-batches 上限（循环开头判断）。
+    // 不按 one.claimed < opts.imageBatchSize 早停，避免服务端钳制上限或并发领取短批时误退出。
     if (one.claimed === 0) {
       log("[consume] 队列已空，停止消费");
       break;
@@ -856,9 +858,14 @@ async function consumeImageBatches(secret) {
       log("[consume] 本批无成功下载（全部失败/重试），停止消费，避免连续打图床");
       break;
     }
-    if (one.claimed < opts.imageBatchSize) {
-      log("[consume] 本批不足 batch-size，队列已处理完，停止消费");
-      break;
+    if (one.retry > 0 && (opts.imageMaxBatches === 0 || batches < opts.imageMaxBatches)) {
+      const rawBackoff = typeof process !== "undefined" ? process.env?.REPAIR_IMAGE_RETRY_BACKOFF_MS : undefined;
+      const envBackoff = rawBackoff?.trim() ? Number(rawBackoff) : NaN;
+      const backoffMs = Number.isFinite(envBackoff) && envBackoff >= 0 ? Math.trunc(envBackoff) : 1500;
+      if (backoffMs > 0 && typeof setTimeout === "function") {
+        log(`[consume] 本批有 ${one.retry} 张图待重试，等待 ${backoffMs}ms 后继续下一批...`);
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      }
     }
   }
 

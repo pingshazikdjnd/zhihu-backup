@@ -61,6 +61,7 @@ function loadFunctions(src, names, sandbox, prelude = "") {
 }
 
 const apiSrc = read("apps/web/src/lib/api.ts");
+const aiAssessSrc = read("apps/web/src/lib/ai-assess.ts");
 const contentsSrc = read("apps/web/src/pages/ContentsPage.tsx");
 const questionsSrc = read("apps/web/src/pages/QuestionsPage.tsx");
 const followingSrc = read("apps/web/src/pages/FollowingPage.tsx");
@@ -395,24 +396,60 @@ test("_worker.js：API JSON 不追加 CSP，仍正常转发 /api/*", async () =>
   assert.equal(calls.assets, 0);
 });
 
-test("_worker.js：/ingest/* 返回 404 且不转发 Service Binding", async () => {
+test("_worker.js：/ingest/* 仅对携带非空 Bearer 的请求转发到 Service Binding，其余返回 404", async () => {
   const { env, calls } = makeEnv(
     async () => htmlResponse(),
-    async () => {
-      throw new Error("ingest must not be proxied");
+    async request => {
+      assert.equal(request.headers.get("authorization"), "Bearer secret-123");
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
     }
   );
-  const res = await worker.fetch(
+
+  // 1) 无 Authorization 头：直接 404 且不转发 Service Binding
+  const noAuthRes = await worker.fetch(
+    new Request("https://pages.example/ingest/sync-state", { method: "GET" }),
+    env
+  );
+  assert.equal(noAuthRes.status, 404);
+  assert.equal(calls.api, 0);
+  assert.equal(calls.assets, 0);
+
+  // 2) 空 Bearer：同样返回 404
+  const emptyBearerRes = await worker.fetch(
     new Request("https://pages.example/ingest/abc", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization: "Bearer   " },
       body: "{}"
     }),
     env
   );
-  assert.equal(res.status, 404);
+  assert.equal(emptyBearerRes.status, 404);
   assert.equal(calls.api, 0);
+
+  // 3) 携带有效 Bearer 头：透传至 env.API 并返回 200
+  const okRes = await worker.fetch(
+    new Request("https://pages.example/ingest/sync-state", {
+      method: "GET",
+      headers: { authorization: "Bearer secret-123" }
+    }),
+    env
+  );
+  assert.equal(okRes.status, 200);
+  assert.deepEqual(await okRes.json(), { ok: true });
+  assert.equal(calls.api, 1);
   assert.equal(calls.assets, 0);
+
+  // 4) env.API 缺失时 fail-closed 返回 404
+  const noBindingRes = await worker.fetch(
+    new Request("https://pages.example/ingest/sync-state", {
+      headers: { authorization: "Bearer secret-123" }
+    }),
+    { ASSETS: env.ASSETS }
+  );
+  assert.equal(noBindingRes.status, 404);
 });
 
 test("_worker.js：SPA fallback 返回 index.html 并补安全头，非 HTML 404 不强制 CSP", async () => {
@@ -446,12 +483,14 @@ test("_worker.js：SPA fallback 返回 index.html 并补安全头，非 HTML 404
   assert.equal(res2.headers.get("content-security-policy"), null);
 });
 
-test("_worker.js：源码只允许 HTML 分支设置 CSP", () => {
+test("_worker.js：源码只允许 HTML 分支设置 CSP，/ingest/* 校验 Bearer", () => {
   assert.match(workerSrc, /contentType\.toLowerCase\(\)\.includes\("text\/html"\)/);
   assert.match(workerSrc, /new Response\(res\.body, \{/);
   assert.match(workerSrc, /headers\.set\("content-security-policy", HTML_CSP\)/);
   assert.doesNotMatch(workerSrc, /text\(\)|textContent|String\(res\.body\)/, "不得把二进制 body 转成字符串");
-  assert.match(workerSrc, /url\.pathname\.startsWith\("\/ingest\/"\)[\s\S]{0,120}status: 404/);
+  assert.match(workerSrc, /url\.pathname\.startsWith\("\/ingest\/"\)[\s\S]{0,220}status: 404/);
+  assert.match(workerSrc, /if \(!\/\^Bearer\\s\+\\S\+\/i\.test\(auth\) \|\| !env\.API\)/);
+  assert.match(workerSrc, /return env\.API\.fetch\(request\);/);
 });
 
 test("前端边界与安全增强：ErrorBoundary 路由复位、sanitize 防御大小写与 //、存储/标签页/查询原子更新", () => {
@@ -485,4 +524,308 @@ test("前端边界与安全增强：ErrorBoundary 路由复位、sanitize 防御
   assert.match(questionsSrc, /questionsStore\.list = nextRows;/);
   assert.match(questionsSrc, /setActiveQ\(committedQ\);\s*questionsStore\.page = p;\s*questionsStore\.q = committedQ;/);
   assert.doesNotMatch(questionsSrc, /const handleSearch[\s\S]{0,160}questionsStore\.q = trimmed;/);
+});
+
+test("前端 P2-1 / P2-6 / P1-1 / P2-5 回归：跨源不外泄口令、同页去重、筛选切 Tab 重拉与空格/双击防护", async () => {
+  const commentTreeSrc = read("apps/web/src/components/CommentTree.tsx");
+
+  // 1) FollowingPage & RecommendPage & ai-assess.ts：首次请求不主动读 localStorage 传 Authorization，
+  //    交由 api() 同源策略控制；仅 401/403 弹窗输入非空/非纯空格口令重试后，才传入 Authorization 并 safeSetWriteToken（保留 try/catch 保护）
+  for (const [label, src] of [["FollowingPage", followingSrc], ["RecommendPage", recommendSrc]]) {
+    assert.doesNotMatch(src, /safeGetWriteToken/, `${label} 首次请求不得自行读取 localStorage 口令`);
+    const directLsCalls = src.match(/\blocalStorage\.(getItem|setItem)/g) || [];
+    assert.equal(directLsCalls.length, 0, `${label} 不得直接调用 localStorage，应复用 ai-assess.ts 的 safeSetWriteToken`);
+    assert.match(src, /from ["']\.\.\/lib\/ai-assess\.js["']/, `${label} 必须复用共享 ai-assess.ts 模块`);
+    assert.match(src, /await assessContentRisk\(/, `${label} handleAiAssess 必须调用共享 assessContentRisk`);
+  }
+  assert.doesNotMatch(aiAssessSrc, /safeGetWriteToken/, "ai-assess.ts 首次请求不得自行读取 localStorage 口令");
+  assert.match(aiAssessSrc, /export function safeSetWriteToken\(/, "ai-assess.ts 必须导出 safeSetWriteToken");
+  const aiLsCalls = aiAssessSrc.match(/\blocalStorage\.(getItem|setItem)/g) || [];
+  assert.equal(aiLsCalls.length, 1, "ai-assess.ts 只允许在 safeSetWriteToken 中调用 localStorage.setItem");
+  assert.match(aiAssessSrc, /if \(tokenStr && tokenStr\.trim\(\)\) headers\.authorization = `Bearer \$\{tokenStr\.trim\(\)\}`/);
+  assert.match(aiAssessSrc, /window\.prompt\("AI 风险鉴定需验证操作密码/);
+  assert.match(aiAssessSrc, /if \(aiResults\[pk\] \|\| aiLoadingSetRef\.current\.has\(pk\)\) return;/, "assessContentRisk 必须拦截正在加载中的双击");
+  assert.match(aiAssessSrc, /const trimmed = input\?\.trim\(\) \|\| "";\s*if \(!trimmed\)/, "ai-assess.ts prompt 必须拦截纯空格输入");
+  assert.match(aiAssessSrc, /await callAssess\(\);/, "assessContentRisk 首次请求必须无参调用 callAssess()");
+  assert.match(followingSrc, /await doCall\(\);/, "postUserModeWithAuth 首次请求必须无参调用 doCall()");
+
+  // 1b) 行为验证 [P1-1]：跨源 VITE_API_BASE + 预置 localStorage.cookie_write_token 时，
+  //     postUserModeWithAuth 首次请求不携带 Authorization；prompt 纯空格取消不发请求；输入口令重试才携带
+  const { createRequire } = await import("node:module");
+  const webRequire = createRequire(path.join(ROOT, "apps", "web", "package.json"));
+  const tsMod = await import(pathToFileURL(webRequire.resolve("typescript")).href);
+  const ts = tsMod.default ?? tsMod;
+  const transpile = src =>
+    ts.transpileModule(src, {
+      compilerOptions: {
+        target: ts.ScriptTarget.ES2022,
+        module: ts.ModuleKind.ESNext,
+        jsx: ts.JsxEmit.ReactJSX
+      }
+    }).outputText;
+
+  const apiJs = transpile(apiSrc);
+  const aiAssessJs = transpile(aiAssessSrc)
+    .replace(/^\s*import\s+[^;]+;\s*$/gm, "")
+    .replace(/\bexport\s+/g, "");
+  const followingJs = transpile(followingSrc);
+
+  const localStore = new Map([["cookie_write_token", "local-secret-token"]]);
+  const fetchCalls = [];
+  let promptQueue = [];
+  const lsMock = {
+    getItem: k => localStore.get(k) ?? null,
+    setItem: (k, v) => { localStore.set(k, String(v)); }
+  };
+  const sharedSandbox = {
+    URL,
+    Headers,
+    AbortController,
+    AbortSignal,
+    setTimeout,
+    clearTimeout,
+    Response,
+    window: {
+      location: { origin: "https://pages.example" },
+      localStorage: lsMock,
+      prompt: () => promptQueue.shift() ?? null
+    },
+    localStorage: lsMock,
+    fetch: async (url, init) => {
+      const headersObj = Object.fromEntries(new Headers(init?.headers).entries());
+      fetchCalls.push({ url: String(url), headers: headersObj });
+      if (!headersObj.authorization) {
+        return { ok: false, status: 401, text: async () => "Unauthorized" };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    }
+  };
+  const syncDecls = [
+    ...["joinApiBase", "resolveRequestUrl", "isSameOriginRequest", "createTimeoutAbort", "createRequestAbort", "resolveWriteToken"].map(name => {
+      const { params, body } = extractFunctionBody(apiJs, name);
+      return `function ${name}(${params.join(", ")}) {${body}}`;
+    }),
+    (() => {
+      const { params, body } = extractFunctionBody(aiAssessJs, "safeSetWriteToken");
+      return `function safeSetWriteToken(${params.join(", ")}) {${body}}`;
+    })(),
+    (() => {
+      const { params, body } = extractFunctionBody(apiJs, "api");
+      return `async function api(${params.join(", ")}) {${body}}`;
+    })(),
+    (() => {
+      const { params, body } = extractFunctionBody(followingJs, "postUserModeWithAuth");
+      return `async function postUserModeWithAuth(${params.join(", ")}) {${body}}`;
+    })()
+  ];
+  const modeCtx = vm.createContext(sharedSandbox);
+  vm.runInContext(
+    [
+      `const API_BASE = "https://third-party-api.example";`,
+      `const REQUEST_TIMEOUT_MS = 30000;`,
+      `const ABORT_SIGNAL_STATICS = AbortSignal;`,
+      ...syncDecls,
+      `globalThis.__postUserModeWithAuth = postUserModeWithAuth;`
+    ].join("\n"),
+    modeCtx
+  );
+
+  // 纯空格 prompt：首次跨源请求无 authorization，收到 401 后纯空格输入被拦截且不覆盖 localStorage
+  promptQueue = ["   "];
+  await assert.rejects(
+    () => modeCtx.__postUserModeWithAuth("alice", "full"),
+    /已取消密码验证/
+  );
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0].headers.authorization, undefined, "跨源首次请求绝不可外发本地 cookie_write_token");
+  assert.equal(localStore.get("cookie_write_token"), "local-secret-token");
+
+  // 输入有效口令重试：首次仍无 authorization，第二次携带输入口令并保存 trimmed
+  fetchCalls.length = 0;
+  promptQueue = ["  new-token-123  "];
+  const modeRes = await modeCtx.__postUserModeWithAuth("alice", "full");
+  assert.deepEqual(Array.from([modeRes.ok]), [true]);
+  assert.equal(fetchCalls.length, 2);
+  assert.equal(fetchCalls[0].headers.authorization, undefined);
+  assert.equal(fetchCalls[1].headers.authorization, "Bearer new-token-123");
+  assert.equal(localStore.get("cookie_write_token"), "new-token-123");
+
+  // 1c) 行为验证 [P1-1][P2-6]：共享 assessContentRisk 跨源首次请求不外泄口令，
+  //     401 后 prompt 输入才带 Bearer 重试；双击正在加载中的 pk 直接忽略
+  localStore.set("cookie_write_token", "local-secret-token");
+  fetchCalls.length = 0;
+  promptQueue = ["  rec-secret  "];
+  let aiLoadingPksVal = {};
+  const aiLoadingSet = new Set();
+  let aiResultsVal = {};
+  const alertMsgs = [];
+  let apiHandler = async (p, opts) => {
+    const headersObj = Object.fromEntries(new Headers(opts?.headers).entries());
+    fetchCalls.push({ url: p, headers: headersObj });
+    if (!headersObj.authorization) throw new Error("401 Unauthorized");
+    return { ai: { model: "m", analysis: "ok" } };
+  };
+  const recCtx = vm.createContext({
+    api: (p, opts) => apiHandler(p, opts),
+    window: { prompt: () => promptQueue.shift() ?? null },
+    localStorage: lsMock,
+    alert: msg => { alertMsgs.push(String(msg)); },
+    recommendStore: { aiCache: {} }
+  });
+  vm.runInContext(
+    `${aiAssessJs}\nglobalThis.__assessContentRisk = assessContentRisk;`,
+    recCtx
+  );
+  const callSharedAssess = (pk, errorPrefix = "AI 风险鉴定失败") =>
+    recCtx.__assessContentRisk({
+      pk,
+      aiResults: aiResultsVal,
+      aiLoadingSetRef: { current: aiLoadingSet },
+      setAiLoadingPks: fn => { aiLoadingPksVal = typeof fn === "function" ? fn(aiLoadingPksVal) : fn; },
+      setAiResults: fn => { aiResultsVal = typeof fn === "function" ? fn(aiResultsVal) : fn; },
+      errorPrefix
+    });
+  // 模拟加载中双击：aiLoadingSet 已含 answer:1 时必须直接返回
+  aiLoadingSet.add("answer:1");
+  await callSharedAssess("answer:1");
+  assert.equal(fetchCalls.length, 0, "加载中重复点击不得发起请求");
+  aiLoadingSet.delete("answer:1");
+  await callSharedAssess("answer:1");
+  assert.equal(fetchCalls.length, 2);
+  assert.equal(fetchCalls[0].headers.authorization, undefined, "assessContentRisk 首次请求不得带本地口令");
+  assert.equal(fetchCalls[1].headers.authorization, "Bearer rec-secret");
+  assert.equal(localStore.get("cookie_write_token"), "rec-secret");
+  assert.equal(alertMsgs.length, 0);
+
+  // 1d) 并发点击 A、B：重复点 A 被拦截，B 结束后 A 仍保持锁定直到 A 完成
+  fetchCalls.length = 0;
+  aiResultsVal = {};
+  aiLoadingPksVal = {};
+  aiLoadingSet.clear();
+  const deferredByPk = new Map();
+  apiHandler = (p, opts) => {
+    const body = JSON.parse(opts.body);
+    fetchCalls.push({ url: p, pk: body.pk });
+    return new Promise(resolve => { deferredByPk.set(body.pk, resolve); });
+  };
+  const pA = callSharedAssess("answer:A");
+  const pB = callSharedAssess("answer:B");
+  assert.equal(fetchCalls.length, 2);
+  assert.equal(aiLoadingSet.has("answer:A"), true);
+  assert.equal(aiLoadingSet.has("answer:B"), true);
+  assert.equal(aiLoadingPksVal["answer:A"], true);
+  assert.equal(aiLoadingPksVal["answer:B"], true);
+  await callSharedAssess("answer:A");
+  assert.equal(fetchCalls.length, 2, "A 加载中再次点击 A 必须被拦截");
+  deferredByPk.get("answer:B")({ ai: { model: "m", analysis: "B ok" } });
+  await pB;
+  assert.equal(aiLoadingSet.has("answer:B"), false);
+  assert.equal(aiLoadingPksVal["answer:B"], undefined);
+  assert.equal(aiLoadingSet.has("answer:A"), true, "B 结束后不得清除 A 的锁定状态");
+  assert.equal(aiLoadingPksVal["answer:A"], true);
+  deferredByPk.get("answer:A")({ ai: { model: "m", analysis: "A ok" } });
+  await pA;
+  assert.equal(aiLoadingSet.size, 0);
+  assert.equal(Object.keys(aiLoadingPksVal).length, 0);
+
+  // 1e) 行为验证：RecommendPage 与 FollowingPage 各自 handleAiAssess 包装函数均调用 preventDefault/stopPropagation，
+  //     并把全部 state/ref 与各自 errorPrefix 透传给 assessContentRisk
+  for (const [label, pageSrc, expectedErrPrefix] of [
+    ["RecommendPage", recommendSrc, "AI 风险鉴定失败"],
+    ["FollowingPage", followingSrc, "AI 评估失败"]
+  ]) {
+    const pageJs = transpile(pageSrc);
+    const assessIdx = pageJs.indexOf("const handleAiAssess = async (e, pk) => {");
+    assert.ok(assessIdx >= 0, `${label} transpiled 源码缺少 handleAiAssess`);
+    const openIdx = pageJs.indexOf("{", assessIdx);
+    let depth = 0;
+    let closeIdx = -1;
+    for (let i = openIdx; i < pageJs.length; i++) {
+      if (pageJs[i] === "{") depth++;
+      else if (pageJs[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          closeIdx = i;
+          break;
+        }
+      }
+    }
+    assert.ok(closeIdx > openIdx, `${label} handleAiAssess 花括号未闭合`);
+    const body = pageJs.slice(openIdx + 1, closeIdx);
+    const sentinelResults = { existing: true };
+    const sentinelLoadingRef = { current: new Set() };
+    const sentinelSetLoading = () => {};
+    const sentinelSetResults = () => {};
+    let capturedArgs = null;
+    const pageCtx = vm.createContext({
+      aiResults: sentinelResults,
+      aiLoadingSetRef: sentinelLoadingRef,
+      setAiLoadingPks: sentinelSetLoading,
+      setAiResults: sentinelSetResults,
+      assessContentRisk: async arg => {
+        capturedArgs = arg;
+      }
+    });
+    vm.runInContext(
+      `async function handleAiAssess(e, pk) {${body}}\nglobalThis.__handleAiAssess = handleAiAssess;`,
+      pageCtx
+    );
+    let prevented = 0;
+    let stopped = 0;
+    await pageCtx.__handleAiAssess(
+      { preventDefault() { prevented++; }, stopPropagation() { stopped++; } },
+      "answer:42"
+    );
+    assert.equal(prevented, 1, `${label} handleAiAssess 必须调用 preventDefault`);
+    assert.equal(stopped, 1, `${label} handleAiAssess 必须调用 stopPropagation`);
+    assert.ok(capturedArgs, `${label} handleAiAssess 必须调用 assessContentRisk`);
+    assert.equal(capturedArgs.pk, "answer:42");
+    assert.equal(capturedArgs.aiResults, sentinelResults);
+    assert.equal(capturedArgs.aiLoadingSetRef, sentinelLoadingRef);
+    assert.equal(capturedArgs.setAiLoadingPks, sentinelSetLoading);
+    assert.equal(capturedArgs.setAiResults, sentinelSetResults);
+    assert.equal(capturedArgs.errorPrefix, expectedErrPrefix);
+  }
+
+  // 2) FollowingPage 切回已缓存 Tab 时递增 listReqRef 并清零 loading/error，且按筛选条件变更重拉
+  assert.match(
+    followingSrc,
+    /const lastLoadedUsersKeyRef = useRef<string \| null>\(/
+  );
+  assert.match(
+    followingSrc,
+    /lastLoadedUsersKeyRef\.current = `\$\{q\}\\0\$\{mode\}`;/
+  );
+  assert.match(
+    followingSrc,
+    /if \(users\.length === 0 \|\| lastLoadedUsersKeyRef\.current !== `\$\{userQ\}\\0\$\{modeFilter\}`\)/
+  );
+  assert.match(
+    followingSrc,
+    /\/\/ 切回已缓存 Tab 时作废前 Tab 在途请求并清空残留 loading\/error\s*listReqRef\.current\+\+;\s*setLoading\(false\);\s*setError\(""\);/
+  );
+
+  // 3) CommentTree RootCommentList 同 pk 翻页序号作废与同页+跨页 id 去重
+  assert.match(commentTreeSrc, /const loadMoreSeqRef = useRef\(0\);/);
+  assert.match(commentTreeSrc, /loadMoreSeqRef\.current\+\+;\s*setRootComments\(initialComments\);/);
+  assert.match(commentTreeSrc, /const reqSeq = \+\+loadMoreSeqRef\.current;/);
+  assert.match(commentTreeSrc, /reqPk !== resolvedPkRef\.current \|\| reqSeq !== loadMoreSeqRef\.current/);
+  const dedupMatch = commentTreeSrc.match(
+    /setRootComments\(prev => \{([\s\S]*?)\}\);/
+  );
+  assert.ok(dedupMatch, "CommentTree 必须包含 setRootComments 去重更新");
+  assert.match(dedupMatch[1], /seen\.add\(item\.id\)/, "同页内接受的元素也必须立即写入 seen");
+  const dedupReducer = vm.runInNewContext(
+    `(function(prev, newItems) { let next; const setRootComments = fn => { next = fn(prev); }; ${dedupMatch[0]} return next; })`
+  );
+  const deduped = dedupReducer(
+    [{ id: "c1" }],
+    [{ id: "c1" }, { id: "c2" }, { id: "c2" }, { id: "c3" }]
+  );
+  assert.deepEqual(Array.from(deduped, x => x.id), ["c1", "c2", "c3"], "同页与跨页重复 id 均只保留一条");
+
+  // 4) [防删归档] CommentTree 为已删除根评论、预览回复、展开子评论渲染「已删除」徽标
+  assert.match(commentTreeSrc, /comment\.is_deleted === 1[\s\S]{0,200}已删除/);
+  assert.match(commentTreeSrc, /\{reply\.isDeleted\s*&&\s*<span[^>]*>已删除<\/span>\}/);
+  assert.match(commentTreeSrc, /child\.isDeleted[\s\S]{0,200}已删除/);
 });

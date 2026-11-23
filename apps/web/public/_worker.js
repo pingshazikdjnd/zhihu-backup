@@ -27,16 +27,20 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Pages 只承载只读用户界面，公开的 /ingest/* 写入口一律 404，
-    // 不向 Service Binding 转发（Worker 自身原路径不受影响）。
+    // /ingest/* 仅对携带 Bearer 凭据的合法请求转发到 Worker Service Binding，
+    // 由 Worker 侧 requireSecret 做严格校验（fail-closed）；无凭据直接返回 404。
     if (url.pathname.startsWith("/ingest/")) {
-      return new Response("Not Found", {
-        status: 404,
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-          "x-content-type-options": "nosniff"
-        }
-      });
+      const auth = request.headers.get("authorization") || "";
+      if (!/^Bearer\s+\S+/i.test(auth) || !env.API) {
+        return new Response("Not Found", {
+          status: 404,
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            "x-content-type-options": "nosniff"
+          }
+        });
+      }
+      return env.API.fetch(request);
     }
 
     const isBackendRoute = url.pathname.startsWith("/api/");

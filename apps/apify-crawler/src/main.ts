@@ -41,6 +41,154 @@ const followedProgMap = followedProgress && typeof followedProgress === "object"
 // 同步租约：云端 Apify 由 Worker 注入 input.syncOwnerId，本地同步由 local-sync.mjs
 // 通过环境变量 SYNC_OWNER_ID 传入；每批 /ingest 请求带 x-sync-owner 自动续租 15 分钟。
 const syncOwnerId = String(input.syncOwnerId || process.env.SYNC_OWNER_ID || "").trim();
+
+// 幂等释放云端同步锁：共享同一进行中 Promise，确保 Actor.on("aborting") 与信号钩子并发触发时
+// 只发一次释放请求并等待在途请求完成再退出。
+let syncLockSkippedOnAbort = false;
+let syncLockReleasePromise: Promise<void> | null = null;
+async function releaseSyncLockBeforeExit(): Promise<void> {
+  if (!syncOwnerId || syncLockSkippedOnAbort) return;
+  if (!syncLockReleasePromise) {
+    syncLockReleasePromise = (async () => {
+      const base = apiUrl.endsWith("/") ? apiUrl.slice(0, -1) : apiUrl;
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (apiSecret) headers["authorization"] = `Bearer ${apiSecret}`;
+      try {
+        await fetch(`${base}/ingest/sync-lock/release`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ownerId: syncOwnerId }),
+          signal: AbortSignal.timeout(10_000)
+        });
+      } catch {
+        // 释放失败不阻塞退出，租约 15 分钟后自然过期
+      }
+    })();
+  }
+  await syncLockReleasePromise;
+}
+
+let abortRequested = false;
+const ingestAbortController = new AbortController();
+const inFlightIngestWrites = new Set<Promise<unknown>>();
+const INGEST_ABORT_DRAIN_TIMEOUT_MS = 3_000;
+const INGEST_ABORT_CANCEL_GRACE_MS = 1_500;
+let stopAndReleasePromise: Promise<void> | null = null;
+
+type PlaywrightBrowser = Awaited<ReturnType<typeof chromium.launch>>;
+const BROWSER_CLOSE_TIMEOUT_MS = 1_500;
+const activeBrowsers = new Set<PlaywrightBrowser>();
+const pendingBrowserLaunches = new Set<Promise<PlaywrightBrowser>>();
+
+async function closeActiveBrowsers(timeoutMs: number = BROWSER_CLOSE_TIMEOUT_MS): Promise<void> {
+  const closePromises: Promise<unknown>[] = [];
+  for (const b of Array.from(activeBrowsers)) {
+    closePromises.push(
+      Promise.resolve()
+        .then(() => b.close())
+        .catch(() => {})
+    );
+  }
+  for (const p of Array.from(pendingBrowserLaunches)) {
+    closePromises.push(
+      p.then(b => b.close().catch(() => {})).catch(() => {})
+    );
+  }
+  if (closePromises.length === 0) return;
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    await Promise.race([
+      Promise.allSettled(closePromises),
+      new Promise<void>(resolve => {
+        timer = setTimeout(resolve, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function waitForInFlightIngestWrites(timeoutMs: number): Promise<void> {
+  if (inFlightIngestWrites.size === 0) return Promise.resolve();
+  return new Promise<void>(resolve => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    const drain = () => {
+      if (inFlightIngestWrites.size === 0) {
+        finish();
+        return;
+      }
+      void Promise.allSettled(Array.from(inFlightIngestWrites)).then(() => {
+        if (inFlightIngestWrites.size === 0) finish();
+        else if (!done) drain();
+      });
+    };
+    drain();
+  });
+}
+
+async function stopWorkAndReleaseSyncLock(): Promise<void> {
+  if (!stopAndReleasePromise) {
+    stopAndReleasePromise = (async () => {
+      abortRequested = true;
+      stats.circuitBroken = true;
+      const browserClosePromise = closeActiveBrowsers(BROWSER_CLOSE_TIMEOUT_MS);
+      let forcedAbort = false;
+      if (inFlightIngestWrites.size > 0) {
+        await waitForInFlightIngestWrites(INGEST_ABORT_DRAIN_TIMEOUT_MS);
+      }
+      if (inFlightIngestWrites.size > 0) {
+        forcedAbort = true;
+        syncLockSkippedOnAbort = true;
+        ingestAbortController.abort();
+        await waitForInFlightIngestWrites(INGEST_ABORT_CANCEL_GRACE_MS);
+      }
+      if (!forcedAbort && inFlightIngestWrites.size === 0) {
+        await releaseSyncLockBeforeExit();
+      } else {
+        syncLockSkippedOnAbort = true;
+        console.warn(
+          `⚠️ 中止超时后已强制中止或仍有 ${inFlightIngestWrites.size} 个在途写入未确认结束，跳过提前释放云端锁（交由 15 分钟租约过期）`
+        );
+      }
+      await browserClosePromise;
+    })();
+  }
+  await stopAndReleasePromise;
+}
+
+if (typeof Actor.on === "function") {
+  Actor.on("aborting", async () => {
+    await stopWorkAndReleaseSyncLock();
+  });
+}
+let abortSignalHandled = false;
+const handleCrawlerSignal = () => {
+  if (abortSignalHandled) return;
+  abortSignalHandled = true;
+  void stopWorkAndReleaseSyncLock().finally(() => {
+    process.exit(syncLockSkippedOnAbort ? 131 : 130);
+  });
+};
+process.on("SIGINT", handleCrawlerSignal);
+process.on("SIGTERM", handleCrawlerSignal);
+
+async function handleAbortExitBeforeExit(): Promise<void> {
+  if (!abortRequested) return;
+  await stopWorkAndReleaseSyncLock();
+  if (abortSignalHandled) {
+    await new Promise(() => {});
+  } else {
+    await Actor.exit({ exitCode: syncLockSkippedOnAbort ? 131 : 0 });
+    process.exit(syncLockSkippedOnAbort ? 131 : 0);
+  }
+}
 const cfg = {
   commentsMyAnswers: syncConfig?.commentsMyAnswers || "full",
   commentsCollections: syncConfig?.commentsCollections || "hot",
@@ -141,87 +289,110 @@ async function post(path: string, body: unknown, opts?: { countStats?: boolean }
   // 长抓取期间只要还在回传数据，锁就不会被其他实例抢走；爬虫崩溃后停止发请求，锁自然过期。
   if (syncOwnerId) headers["x-sync-owner"] = syncOwnerId;
 
+  if (abortRequested) {
+    stats.circuitBroken = true;
+    throw new Error("abort_requested: 进程正在中止，跳过后续写入请求");
+  }
+
   // 熔断后立即拒绝：只置位不拦截的话，评论分块/热评发送等路径仍会继续
   // 打出成百上千行写入，直接撞穿 D1 当日硬顶
   if (stats.circuitBroken) {
     throw new Error("circuit_open: 已达当日写入预算，跳过后续请求");
   }
 
-  let res: Response;
-  try {
-    res = await fetch(`${base}${path}`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body)
+  const isIngestWrite = path.startsWith("/ingest/");
+  let releaseWriteTrack: (() => void) | undefined;
+  let trackedWrite: Promise<void> | undefined;
+  if (isIngestWrite) {
+    trackedWrite = new Promise<void>(resolve => {
+      releaseWriteTrack = resolve;
     });
-  } catch (e: any) {
-    if (countStats) {
-      stats.failed++;
-      stats.consecutiveFailures++;
-      if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
-    }
-    throw new Error(sanitizeErrorForLog(e));
+    inFlightIngestWrites.add(trackedWrite);
   }
-  if (!res.ok) {
-    if (countStats) {
-      stats.failed++;
-      stats.consecutiveFailures++;
-      if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
-    }
-    throw new Error(sanitizeErrorForLog(`${path} -> ${res.status} ${await res.text()}`));
-  }
-  // 成功计数放在 JSON 解析之后：200+非 JSON 体时避免 saved/failed 双计
-  let json: any;
+
   try {
-    json = await res.json();
-  } catch (e: any) {
+    let res: Response;
+    try {
+      res = await fetch(`${base}${path}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: ingestAbortController.signal
+      });
+    } catch (e: any) {
+      if (countStats && !abortRequested) {
+        stats.failed++;
+        stats.consecutiveFailures++;
+        if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
+      }
+      throw new Error(sanitizeErrorForLog(e));
+    }
+    if (!res.ok) {
+      if (countStats && !abortRequested) {
+        stats.failed++;
+        stats.consecutiveFailures++;
+        if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
+      }
+      throw new Error(sanitizeErrorForLog(`${path} -> ${res.status} ${await res.text()}`));
+    }
+    // 成功计数放在 JSON 解析之后：200+非 JSON 体时避免 saved/failed 双计
+    let json: any;
+    try {
+      json = await res.json();
+    } catch (e: any) {
+      if (countStats && !abortRequested) {
+        stats.failed++;
+        stats.consecutiveFailures++;
+        if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
+      }
+      throw e;
+    }
+
+    // 旁路请求（countStats=false）不计入入库统计，也不重置连续失败计数——
+    // 否则一次 AI 复核成功就能把真实的入库失败序列清零，掩盖熔断信号
     if (countStats) {
-      stats.failed++;
-      stats.consecutiveFailures++;
-      if (stats.consecutiveFailures >= 5) stats.circuitBroken = true;
-    }
-    throw e;
-  }
+      stats.saved++;
+      stats.consecutiveFailures = 0;
 
-  // 旁路请求（countStats=false）不计入入库统计，也不重置连续失败计数——
-  // 否则一次 AI 复核成功就能把真实的入库失败序列清零，掩盖熔断信号
-  if (countStats) {
-    stats.saved++;
-    stats.consecutiveFailures = 0;
+      let cost = 1;
+      if (path === "/ingest/content") cost = 3;
+      else if (path === "/ingest/comments") cost = Math.max(1, ((body as any)?.comments?.length || 1) * 2);
+      else if (path === "/ingest/comments-by-root") {
+        if (
+          json &&
+          typeof json === "object" &&
+          (typeof json.added === "number" || typeof json.updated === "number" || typeof json.deleted === "number")
+        ) {
+          const rootWrites = ((Number(json.added) || 0) + (Number(json.updated) || 0) + (Number(json.deleted) || 0)) * 2;
+          const threadWrites = typeof json.threadUpserts === "number" ? json.threadUpserts : (Number(json.r2Puts) || 0);
+          cost = rootWrites + threadWrites;
+        } else {
+          const roots: any[] = Array.isArray((body as any)?.roots) ? (body as any).roots : [];
+          cost = roots.length * 2;
+        }
+      }
+      else if (path === "/ingest/upvote") cost = 2;
+      else if (path === "/ingest/collection-snapshot") cost = Math.max(1, (body as any)?.items?.length || 1);
+      else if (path === "/ingest/followed-users") cost = Math.max(1, (body as any)?.users?.length || 1);
 
-    let cost = 1;
-    if (path === "/ingest/content") cost = 3;
-    else if (path === "/ingest/comments") cost = Math.max(1, ((body as any)?.comments?.length || 1) * 2);
-    else if (path === "/ingest/comments-by-root") {
-      if (
-        json &&
-        typeof json === "object" &&
-        (typeof json.added === "number" || typeof json.updated === "number" || typeof json.deleted === "number")
-      ) {
-        const rootWrites = ((Number(json.added) || 0) + (Number(json.updated) || 0) + (Number(json.deleted) || 0)) * 2;
-        const threadWrites = typeof json.threadUpserts === "number" ? json.threadUpserts : (Number(json.r2Puts) || 0);
-        cost = rootWrites + threadWrites;
-      } else {
-        const roots: any[] = Array.isArray((body as any)?.roots) ? (body as any).roots : [];
-        cost = roots.length * 2;
+      stats.estimatedWrites += cost;
+      // 本地无限写模式：不按云端 D1 每日行数判定熔断（本地 SQLite 无硬顶），
+      // 仅保留「连续 5 次入库失败」的故障熔断
+      if (!UNLIMITED_LOCAL_WRITES && stats.estimatedWrites >= MAX_DAILY_ESTIMATED_WRITES) {
+        if (!stats.circuitBroken) {
+          stats.circuitBroken = true;
+          console.warn(`\n🛑 [D1每日限额保护] 今日预估写入已达 ${stats.estimatedWrites} 行（已充分吃满 CF 官方 100k 额度并适度利用缓冲）。主动安全挂起，已保存断点，等待明日 08:05 额度刷新后自动续跑！`);
+        }
       }
     }
-    else if (path === "/ingest/upvote") cost = 2;
-    else if (path === "/ingest/collection-snapshot") cost = Math.max(1, (body as any)?.items?.length || 1);
-    else if (path === "/ingest/followed-users") cost = Math.max(1, (body as any)?.users?.length || 1);
 
-    stats.estimatedWrites += cost;
-    // 本地无限写模式：不按云端 D1 每日行数判定熔断（本地 SQLite 无硬顶），
-    // 仅保留「连续 5 次入库失败」的故障熔断
-    if (!UNLIMITED_LOCAL_WRITES && stats.estimatedWrites >= MAX_DAILY_ESTIMATED_WRITES) {
-      if (!stats.circuitBroken) {
-        stats.circuitBroken = true;
-        console.warn(`\n🛑 [D1每日限额保护] 今日预估写入已达 ${stats.estimatedWrites} 行（已充分吃满 CF 官方 100k 额度并适度利用缓冲）。主动安全挂起，已保存断点，等待明日 08:05 额度刷新后自动续跑！`);
-      }
+    return json;
+  } finally {
+    if (trackedWrite) {
+      inFlightIngestWrites.delete(trackedWrite);
+      releaseWriteTrack?.();
     }
   }
-
-  return json;
 }
 
 // 评论按根分组提交的结构：服务端按根 upsert，并据 isChildrenComplete 决定是否对账子评论。
@@ -258,6 +429,7 @@ type RootCommentGroup = {
   childCount: number;
   children: ChildComment[];
   isChildrenComplete: boolean;
+  isChildrenClosed?: boolean;
 };
 
 function toChildComment(child: any, rootId: string): ChildComment {
@@ -286,7 +458,8 @@ function toChildComment(child: any, rootId: string): ChildComment {
 function toRootCommentGroup(
   root: any,
   children: ChildComment[],
-  isChildrenComplete: boolean
+  isChildrenComplete: boolean,
+  isChildrenClosed = false
 ): RootCommentGroup {
   const normalizedImage = normalizeCommentImage(root.content, root);
   return {
@@ -307,7 +480,8 @@ function toRootCommentGroup(
     isFeatured: root.featured === true || root.featured === 1,
     childCount: Number(root.child_comment_count) || 0,
     children,
-    isChildrenComplete
+    isChildrenComplete,
+    ...(isChildrenClosed ? { isChildrenClosed: true } : {})
   };
 }
 
@@ -338,6 +512,10 @@ async function postCommentsByRoot(
       if (stats.circuitBroken) {
         return { batches, roots, children, aborted: true };
       }
+      if (abortRequested) {
+        stats.circuitBroken = true;
+        return { batches, roots, children, aborted: true };
+      }
       const payload = {
         contentPk,
         roots: [] as RootCommentGroup[],
@@ -347,6 +525,9 @@ async function postCommentsByRoot(
       try {
         await post("/ingest/comments-by-root", payload);
       } catch (e: any) {
+        if (abortRequested || stats.circuitBroken) {
+          return { batches, roots, children, aborted: true };
+        }
         console.warn(`⚠️ 评论清零对账失败，重试一次 (${contentPk}): ${sanitizeErrorForLog(e)}`);
         await post("/ingest/comments-by-root", payload);
       }
@@ -357,6 +538,11 @@ async function postCommentsByRoot(
 
   for (let i = 0; i < rootComments.length; i += BATCH) {
     if (stats.circuitBroken) {
+      aborted = true;
+      break;
+    }
+    if (abortRequested) {
+      stats.circuitBroken = true;
       aborted = true;
       break;
     }
@@ -378,6 +564,10 @@ async function postCommentsByRoot(
     try {
       await post("/ingest/comments-by-root", payload);
     } catch (e: any) {
+      if (abortRequested || stats.circuitBroken) {
+        aborted = true;
+        break;
+      }
       // 瞬时失败重试一次：接口按根幂等 upsert，整批重发安全
       console.warn(`⚠️ 评论根批次失败，重试一次 (第 ${batches + 1} 批): ${sanitizeErrorForLog(e)}`);
       await post("/ingest/comments-by-root", payload);
@@ -396,6 +586,10 @@ async function postCommentsByRoot(
  * - 被删（now < prev，含删光为 0）也要抓，否则本地会永久残留已删评论；
  * - prev === now === 0 时不发无意义请求。
  */
+function explicitCommentCount(raw: unknown): number | undefined {
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : undefined;
+}
+
 function shouldSyncComments(commentCount: number, prevCommentCount: number | null | undefined): boolean {
   const now = Number(commentCount) || 0;
   const prev = Number(prevCommentCount) || 0;
@@ -407,7 +601,13 @@ function shouldSyncComments(commentCount: number, prevCommentCount: number | nul
 const commentSyncIncomplete = new Set<string>();
 
 type StoredCommentState = { roots: number; storedComments: number; incompleteRoots: number };
-type StoredRootCommentRow = { is_complete?: unknown; child_count?: unknown };
+type StoredRootCommentRow = {
+  is_complete?: unknown;
+  child_count?: unknown;
+  is_deleted?: unknown;
+  needs_thread_retry?: unknown;
+  thread_synced_at?: unknown;
+};
 
 function isStoredRootCommentRow(value: unknown): value is StoredRootCommentRow {
   return Boolean(value) && typeof value === "object";
@@ -423,7 +623,7 @@ async function fetchStoredCommentState(contentPk: string): Promise<StoredComment
   if (apiSecret) headers.authorization = `Bearer ${apiSecret}`;
   try {
     const res = await fetch(
-      `${base}/api/contents/${encodeURIComponent(contentPk)}/root-comments?limit=50`,
+      `${base}/api/contents/${encodeURIComponent(contentPk)}/root-comments?limit=50&live_only=1`,
       { headers }
     );
     if (!res.ok) return null;
@@ -433,15 +633,42 @@ async function fetchStoredCommentState(contentPk: string): Promise<StoredComment
       const data = json.data;
       rows = Array.isArray(data) ? data.filter(isStoredRootCommentRow) : [];
     }
+    // 新版 Worker 会在 live_only 探测时额外返回 has_incomplete_roots：
+    // 当前页最多 50 根，第 50 根之后的失败归档线程不会出现在 rows 里，必须据此强制重抓。
+    // 若服务端显式返回布尔类型，以服务端跨库权威判定为准（false 权威清零，true 保证 >=1）；
+    // 旧版 Worker 不返回该字段（undefined），保持下面的逐行统计向后兼容。
+    const rawHasIncomplete =
+      json !== null && typeof json === "object" && "has_incomplete_roots" in json
+        ? (json as { has_incomplete_roots?: unknown }).has_incomplete_roots
+        : undefined;
+    let liveRoots = 0;
     let incompleteRoots = 0;
-    let storedComments = rows.length;
+    let storedComments = 0;
     for (const row of rows) {
+      // 防删归档保留的已删除根评论（is_deleted=1）已不在现网，不计入现网有效数与待补抓状态
+      if (Number(row.is_deleted ?? 0) === 1) continue;
+      liveRoots++;
       // 0 子评论且走 partial 批入库的根不会写 comment_threads，此时 listRootComments 固定返回 is_complete=0；
-      // 只有真正存在子评论（child_count > 0）且尚未完整落盘时，才判定楼中楼不完整
-      if (Number(row.child_count) > 0 && Number(row.is_complete ?? 0) !== 1) incompleteRoots++;
-      storedComments += Number(row.child_count) || 0;
+      // 显式重试信号 needs_thread_retry=1（0 活回复归档/迁移失败遗留）、或已有线程索引但未完成
+      // （thread_synced_at 存在且 is_complete=0），必须触发重抓，即使 child_count=0 也不能漏；
+      // 全新 0 回复根（无 comment_threads 行）与闭评冻结（is_complete=2）都不触发。
+      const needsThreadRetry =
+        Number(row.needs_thread_retry ?? 0) === 1 ||
+        (Boolean(row.thread_synced_at) && Number(row.is_complete ?? 0) === 0);
+      if (needsThreadRetry || (Number(row.child_count) > 0 && Number(row.is_complete ?? 0) === 0)) {
+        incompleteRoots++;
+      }
+      storedComments += 1 + (Number(row.child_count) || 0);
     }
-    return { roots: rows.length, storedComments, incompleteRoots };
+    const finalIncompleteRoots =
+      typeof rawHasIncomplete === "boolean"
+        ? (rawHasIncomplete ? Math.max(incompleteRoots, 1) : 0)
+        : incompleteRoots;
+    return {
+      roots: liveRoots,
+      storedComments,
+      incompleteRoots: finalIncompleteRoots
+    };
   } catch {
     return null;
   }
@@ -541,10 +768,36 @@ const BROWSER_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 
 async function setupBrowser() {
-  return chromium.launch({
+  if (abortRequested) {
+    throw new Error("browser_launch_aborted: crawler is shutting down");
+  }
+  const launchPromise = chromium.launch({
     headless: true,
     args: ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
   });
+  pendingBrowserLaunches.add(launchPromise);
+  let browser: PlaywrightBrowser;
+  try {
+    browser = await launchPromise;
+  } finally {
+    pendingBrowserLaunches.delete(launchPromise);
+  }
+  if (abortRequested) {
+    await browser.close().catch(() => {});
+    throw new Error("browser_launch_aborted: crawler is shutting down");
+  }
+  return browser;
+}
+
+async function withBrowser<T>(fn: (browser: PlaywrightBrowser) => Promise<T>): Promise<T> {
+  const browser = await setupBrowser();
+  activeBrowsers.add(browser);
+  try {
+    return await fn(browser);
+  } finally {
+    activeBrowsers.delete(browser);
+    await browser.close().catch(() => {});
+  }
 }
 
 /** 创建带桌面浏览器指纹伪装的 Playwright Context，降低 Headless 特征被风控概率 */
@@ -674,13 +927,7 @@ function normalizeCommentImage(
 }
 
 export async function runScraper() {
-  const browser = await setupBrowser();
-  try {
-    await runScraperBody(browser);
-  } finally {
-    // 异常/中止退出也必须关闭 Chromium，否则本地脚本反复跑会残留僵尸浏览器进程
-    await browser.close().catch(() => {});
-  }
+  await withBrowser(browser => runScraperBody(browser));
 }
 
 async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
@@ -689,7 +936,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
   const context = await createStealthContext(browser);
   await context.addCookies(getCookiesArray());
 
-  const pendingCommentsQueue: Array<{ answerId: string; url: string; commentCount: number }> = [];
+  const pendingCommentsQueue: Array<{ answerId: string; url: string; commentCount: number; explicitCommentCount?: number }> = [];
 
   let isEnd = false;
   let existingCount = 0;
@@ -764,7 +1011,9 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       const finalVoteup = trueStats?.voteupCount ?? item.voteup_count ?? item.reaction?.statistics?.like_count ?? 0;
       const finalFavorite = item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0;
       const finalVisit = trueStats?.visitCount ?? item.visit_count ?? 0;
-      const finalCommentCount = trueStats?.commentCount ?? item.comment_count ?? 0;
+      const rawCommentCount = trueStats?.commentCount ?? item.comment_count;
+      const explicitCount = explicitCommentCount(rawCommentCount);
+      const finalCommentCount = explicitCount ?? 0;
 
 
       const { sourceUrl: answerSourceUrl, question: normalizedQuestion } = resolveAnswerQuestionMeta(item.question, item.id);
@@ -809,7 +1058,8 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           pendingCommentsQueue.push({
             answerId: String(item.id),
             url: contentInput.sourceUrl,
-            commentCount: contentInput.commentCount
+            commentCount: contentInput.commentCount,
+            explicitCommentCount: explicitCount
           });
           existingCount = 0;
         } else if (!dbRes.created && !dbRes.changed) {
@@ -868,11 +1118,18 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       const contentPk = `answer:${task.answerId}`;
       // 评论被彻底删光（comment_count === 0 且此前 > 0）：无须再请求知乎评论接口，
       // 直接发一次空 roots 的全量对账，让 Worker 软删旧根、清零 comment_count 与线程索引。
-      if ((task.commentCount || 0) === 0) {
+      if (task.explicitCommentCount === 0) {
         try {
-          await postCommentsByRoot(contentPk, [], { partial: false, allRootIds: [] });
-          console.log(`🧹 评论已清零，完成删除对账 (回答 ID: ${task.answerId})`);
+          const res = await postCommentsByRoot(contentPk, [], { partial: false, allRootIds: [] });
+          if (!res.aborted) {
+            commentSyncIncomplete.delete(contentPk);
+            console.log(`🧹 评论已清零，完成删除对账 (回答 ID: ${task.answerId})`);
+          } else {
+            commentSyncIncomplete.add(contentPk);
+            console.warn(`⚠️ 评论清零对账未完成（断路器中止，回答 ${task.answerId}）`);
+          }
         } catch (e: any) {
+          commentSyncIncomplete.add(contentPk);
           console.warn(`⚠️ 评论清零对账失败 (回答 ${task.answerId}): ${sanitizeErrorForLog(e)}`);
         }
         continue;
@@ -914,17 +1171,39 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       // answers/root_comment 才返回完整游标分页，与文章链路对齐。
       // full 必须用 order_by=ts：score 排序实测在约 200 根处同样假 is_end。
       // comment_v5 answers 每页固定 10 条，offset 是游标字符串，需跟随 paging.next。
-      const buildRootCommentsUrl = (offset: number) =>
-        `https://www.zhihu.com/api/v4/comment_v5/answers/${task.answerId}/root_comment?order_by=${
-          cfg.commentsMyAnswers === "full" ? "ts" : "score"
-        }&limit=20&offset=${offset === 0 ? "" : offset}`;
-      let cNextUrl = buildRootCommentsUrl(0);
+      const buildRootCommentsUrl = (offset: number, orderByOverride?: "ts" | "score") => {
+        const orderBy = orderByOverride ?? (cfg.commentsMyAnswers === "full" ? "ts" : "score");
+        return `https://www.zhihu.com/api/v4/comment_v5/answers/${task.answerId}/root_comment?order_by=${orderBy}&limit=20&offset=${offset === 0 ? "" : offset}`;
+      };
+      let currentOrderBy: "ts" | "score" = cfg.commentsMyAnswers === "full" ? "ts" : "score";
+      let fellBackToScore = false;
+      let cNextUrl = buildRootCommentsUrl(0, currentOrderBy);
       while (!cIsEnd && rootPages < MAX_COMMENT_PAGES && !stats.riskExhausted && !stats.circuitBroken) {
         let cJson: any;
+        const canFallbackScore = cfg.commentsMyAnswers === "full" && rootPages === 0 && currentOrderBy === "ts";
         try {
           cJson = (await zhihuJson(context, cNextUrl, {
-            label: `回答 ${task.answerId} 根评论`
+            label: `回答 ${task.answerId} 根评论`,
+            ...(canFallbackScore ? { allowEmptyPage: true } : {})
           })).json;
+          if (
+            canFallbackScore &&
+            Array.isArray(cJson?.data) &&
+            cJson.data.length === 0 &&
+            cJson.paging?.is_end !== true
+          ) {
+            console.log(`ℹ️ answer ${task.answerId} order_by=ts 首页空页（is_end=false），回退改用 order_by=score`);
+            await jitterSleep(400, 750);
+            fellBackToScore = true;
+            cIncomplete = true;
+            currentOrderBy = "score";
+            cNextUrl = buildRootCommentsUrl(0, "score");
+            cJson = (
+              await zhihuJson(context, cNextUrl, {
+                label: `回答 ${task.answerId} 根评论(score)`
+              })
+            ).json;
+          }
         } catch (e: any) {
           const errMsg = sanitizeErrorForLog(e);
           if (/已关闭评论/.test(errMsg)) {
@@ -942,10 +1221,67 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           cFailed = true;
           break;
         }
+        // P1-4: 响应缺失 data 数组（畸形响应）直接判定失败，绝不能误判为空页清零
+        if (!Array.isArray(cJson?.data)) {
+          console.warn(`⚠️ 回答 ${task.answerId} 根评论响应缺少 data 数组，本轮标记失败`);
+          cIncomplete = true;
+          cFailed = true;
+          break;
+        }
         // 知乎风控会返回 200 + 空数组；该形态已在 zhihuJson 内重试并计数。
-        // 能走到这里的是 is_end 的合法空页。
-        if (!cJson.data || cJson.data.length === 0) {
-          rootEnded = true;
+        // 能走到这里的是 is_end 的合法空页（或第 0 页空页）。
+        if (cJson.data.length === 0) {
+          const emptyIsEnd = cJson.paging?.is_end === true;
+          if (rootPages === 0 && emptyIsEnd && !fellBackToScore && cfg.commentsMyAnswers === "full") {
+            let confirmedEmpty = task.explicitCommentCount === 0;
+            if (!confirmedEmpty) {
+              // task.commentCount > 0 时必须复用爬虫请求封装二次确认，防止偶发空响应清空历史评论
+              try {
+                await jitterSleep(300, 600);
+                const confirmJson = (
+                  await zhihuJson(context, buildRootCommentsUrl(0, "ts"), {
+                    label: `回答 ${task.answerId} 根评论空页二次确认`,
+                    allowEmptyPage: true
+                  })
+                ).json;
+                confirmedEmpty =
+                  Array.isArray(confirmJson?.data) &&
+                  confirmJson.data.length === 0 &&
+                  confirmJson.paging?.is_end === true;
+              } catch (confirmErr: any) {
+                console.warn(`⚠️ 回答 ${task.answerId} 空页二次确认失败: ${sanitizeErrorForLog(confirmErr)}`);
+                confirmedEmpty = false;
+              }
+            }
+            if (!confirmedEmpty) {
+              console.warn(`⚠️ 回答 ${task.answerId} commentCount=${task.commentCount} 但空页二次确认未通过，保留既有历史`);
+              cIncomplete = true;
+              cFailed = true;
+              break;
+            }
+            rootEnded = true;
+            cIsEnd = true;
+            try {
+              const res = await postCommentsByRoot(contentPk, [], { partial: false, allRootIds: [] });
+              if (res.aborted) {
+                cIncomplete = true;
+                cFailed = true;
+              }
+            } catch (e: any) {
+              cIncomplete = true;
+              cFailed = true;
+              console.warn(`⚠️ 回答 ${task.answerId} 空页清零对账失败: ${sanitizeErrorForLog(e)}`);
+            }
+          } else if (emptyIsEnd && !fellBackToScore) {
+            rootEnded = true;
+            cIsEnd = true;
+          } else if (emptyIsEnd && fellBackToScore) {
+            cIncomplete = true;
+            cIsEnd = true;
+          } else {
+            cIncomplete = true;
+            cFailed = true;
+          }
           break;
         }
         rootPages++;
@@ -977,9 +1313,11 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
           }
 
           let childrenComplete: boolean;
+          let childrenClosed = false;
           if (childCount > children.length) {
             let chOffset = 0;
             let chIsEnd = false;
+            let chClosed = false;
             let chPages = 0;
               while (!chIsEnd && chPages < MAX_COMMENT_PAGES && !stats.riskExhausted && !stats.circuitBroken) {
                 // 必须复用带 cookie 的 context.request：裸 fetch 不带登录态，知乎直接 401，
@@ -995,7 +1333,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
                   const errMsg = sanitizeErrorForLog(e);
                   if (/已关闭评论/.test(errMsg)) {
                     console.log(`ℹ️ 评论 ${c.id} 子评论已关闭，跳过 (${errMsg})`);
-                    chIsEnd = true;
+                    chClosed = true;
                     break;
                   }
                   console.warn(`⚠️ 评论 ${c.id} 子评论中断: ${errMsg}`);
@@ -1017,17 +1355,18 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
                 chOffset += 20;
                 await jitterSleep(900, 1700);
               }
-            if (!chIsEnd && chPages >= MAX_COMMENT_PAGES) {
+            if (!chIsEnd && !chClosed && chPages >= MAX_COMMENT_PAGES) {
               cIncomplete = true;
               console.warn(`⚠️ 评论 ${c.id} 子评论达到 ${MAX_COMMENT_PAGES} 页上限，本轮标记 partial`);
             }
-            // 翻到 is_end 或已补齐 child_comment_count 才算子评论完整
-            childrenComplete = chIsEnd || children.length >= childCount;
+            // 翻到 is_end 或已补齐 child_comment_count 才算子评论完整；遇闭评一律不覆盖 R2 历史楼中楼
+            childrenComplete = !chClosed && (chIsEnd || children.length >= childCount);
+            childrenClosed = chClosed;
           } else {
             childrenComplete = children.length >= childCount;
           }
 
-          await enqueueRoot(toRootCommentGroup(c, children, childrenComplete));
+          await enqueueRoot(toRootCommentGroup(c, children, childrenComplete, childrenClosed));
         }
         
         if (stats.riskExhausted || stats.circuitBroken) {
@@ -1071,15 +1410,17 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
       }
       
       if (pendingRoots.length > 0) {
-        // 最后一批：全量且完整时 partial=false 并带完整 allRootIds 供删除对账；
-        // 抓取中断时保持 partial=true，绝不能按不完整列表删数据
+        // 最后一批：全量且完整且未回退 score 排序时才 partial=false 并带完整 allRootIds 供删除对账；
+        // score 排序会在约 200 根处假 is_end，回退后一律强制 partial=true 仅增量保存。
         const batch = pendingRoots;
         pendingRoots = [];
         try {
-          const res = await postCommentsByRoot(contentPk, batch, {
-            partial: cIncomplete,
-            allRootIds
-          });
+          const partialSubmit = cfg.commentsMyAnswers !== "full" || cIncomplete || fellBackToScore;
+          const res = await postCommentsByRoot(
+            contentPk,
+            batch,
+            partialSubmit ? { partial: true } : { partial: false, allRootIds }
+          );
           submittedRoots += res.roots;
           submittedChildren += res.children;
           if (res.aborted) {
@@ -1095,13 +1436,29 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
             break;
           }
         }
+      } else if (cfg.commentsMyAnswers === "full" && !cIncomplete && !fellBackToScore && allRootIds.length > 0) {
+        try {
+          const res = await postCommentsByRoot(contentPk, [], { partial: false, allRootIds });
+          if (res.aborted) {
+            cIncomplete = true;
+            cFailed = true;
+          }
+        } catch (err: any) {
+          cIncomplete = true;
+          cFailed = true;
+          console.error(`❌ 评论全量对账失败: ${sanitizeErrorForLog(err)}`);
+          if (stats.circuitBroken) {
+            commentSyncIncomplete.add(contentPk);
+            break;
+          }
+        }
       }
       if (submittedRoots > 0) {
         console.log(`✅ 保存评论: 根 ${submittedRoots} 条 / 子 ${submittedChildren} 条 (回答 ID: ${task.answerId})${cIncomplete ? " [partial]" : ""}`);
       } else if (cIncomplete) {
         console.warn(`⚠️ 回答 ${task.answerId} 评论抓取中断且无数据，跳过本轮提交`);
       }
-      if (cFailed) {
+      if (cFailed || (cfg.commentsMyAnswers === "full" && fellBackToScore)) {
         commentSyncIncomplete.add(contentPk);
       } else if (!cIncomplete) {
         commentSyncIncomplete.delete(contentPk);
@@ -1125,12 +1482,7 @@ async function runScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>)
  * runScraper 内一旦请求 /articles 会直接抛 "unexpected crawler URL" 让回归测试挂掉。
  */
 export async function runArticleScraper() {
-  const browser = await setupBrowser();
-  try {
-    await runArticleScraperBody(browser);
-  } finally {
-    await browser.close().catch(() => {});
-  }
+  await withBrowser(browser => runArticleScraperBody(browser));
 }
 
 async function runArticleScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
@@ -1181,6 +1533,7 @@ async function runArticleScraperBody(browser: Awaited<ReturnType<typeof setupBro
       if (seenArticleIds.has(articleIdStr)) continue;
       seenArticleIds.add(articleIdStr);
 
+      const articleExplicitCommentCount = explicitCommentCount(art.comment_count);
       // 自有文章不做风险/价值过滤：用户自己写的内容必须全部无条件存档
       const contentInput = {
         sourceType: "article" as const,
@@ -1196,11 +1549,11 @@ async function runArticleScraperBody(browser: Awaited<ReturnType<typeof setupBro
           headline: art.author?.headline || ""
         },
         voteupCount: Number(art.voteup_count ?? 0) || 0,
-        commentCount: Number(art.comment_count ?? 0) || 0,
+        commentCount: articleExplicitCommentCount ?? 0,
         favoriteCount: Number(art.favorite_count ?? art.reaction?.statistics?.favorites ?? 0) || 0,
         visitCount: Number(art.visit_count ?? 0) || 0,
-        isCollapsed: false,
-        isLabeled: Boolean(art.is_labeled),
+        isCollapsed: typeof art.is_collapsed === "boolean" ? art.is_collapsed : undefined,
+        isLabeled: typeof art.is_labeled === "boolean" ? art.is_labeled : undefined,
         createdTime: toIsoOrNull(art.created ?? art.created_time),
         updatedTime: toIsoOrNull(art.updated ?? art.updated_time),
         sourceUrl: `https://zhuanlan.zhihu.com/p/${art.id}`
@@ -1221,7 +1574,7 @@ async function runArticleScraperBody(browser: Awaited<ReturnType<typeof setupBro
           !stats.circuitBroken &&
           !stats.riskExhausted
         ) {
-          await syncHotCommentsForContent(context, "article", articleIdStr, cfg.commentsMyAnswers);
+          await syncHotCommentsForContent(context, "article", articleIdStr, cfg.commentsMyAnswers, articleExplicitCommentCount);
         }
         // 极速模式的连续无变化计数：res?.changed === false 才算无变化
         if (isFast && res?.changed === false) {
@@ -1281,7 +1634,8 @@ export async function syncHotCommentsForContent(
   context: any,
   sourceType: "answer" | "article" | "pin",
   sourceId: string,
-  mode: "full" | "hot" | "none" = "hot"
+  mode: "full" | "hot" | "none" = "hot",
+  expectedCommentCount?: number
 ): Promise<"ok" | "closed" | "failed"> {
   if (mode === "none") return "ok";
   if (sourceType !== "answer" && sourceType !== "article") return "closed";
@@ -1308,6 +1662,7 @@ export async function syncHotCommentsForContent(
     let cOffset = 0;
     let cIsEnd = false;
     let currentOrderBy: "ts" | "score" = mode === "full" ? "ts" : "score";
+    let fellBackToScore = false;
     let nextUrl = buildUrl(cOffset, currentOrderBy);
     const maxPages = mode === "full" ? MAX_COMMENT_PAGES : 1;
     const seenRootIds = new Set<string>();
@@ -1315,12 +1670,12 @@ export async function syncHotCommentsForContent(
     let rootsBuffer: RootCommentGroup[] = [];
 
     // 每 20 根一批提交（服务端每根 2 个子请求，仍在 Workers 50 子请求限制内）。
-    // 非最后一批一律 partial=true；最后一批是否对账由调用点按 full + 完整性决定。
+    // 非最后一批或已回退 score 排序一律 partial=true；最后一批是否对账由调用点按 full + 完整性决定。
     const flushRoots = async (isLast: boolean) => {
       if (rootsBuffer.length === 0) return;
       const batch = rootsBuffer;
       rootsBuffer = [];
-      const canReconcile = isLast && mode === "full" && !cIncomplete;
+      const canReconcile = isLast && mode === "full" && !cIncomplete && !fellBackToScore;
       const res = await postCommentsByRoot(
         contentPk,
         batch,
@@ -1353,6 +1708,8 @@ export async function syncHotCommentsForContent(
         ) {
           console.log(`ℹ️ ${sourceType} ${sourceId} order_by=ts 首页空页（is_end=false），回退改用 order_by=score`);
           await jitterSleep(400, 750);
+          fellBackToScore = true;
+          cIncomplete = true;
           currentOrderBy = "score";
           nextUrl = buildUrl(0, "score");
           cJson = (
@@ -1378,16 +1735,59 @@ export async function syncHotCommentsForContent(
         break;
       }
 
-      const pageData: any[] = Array.isArray(cJson.data) ? cJson.data : [];
+      if (!Array.isArray(cJson?.data)) {
+        console.warn(`⚠️ 抓取评论响应缺少 data 数组 (${sourceType}:${sourceId})，本轮标记失败`);
+        cIncomplete = true;
+        cFailed = true;
+        break;
+      }
+      const pageData: any[] = cJson.data;
       if (pageData.length === 0) {
         // 合法空页：知乎明确 is_end 才可信（风控空页已在 zhihuJson 内重试并计数）
         const emptyIsEnd = cJson.paging?.is_end === true;
-        if (pagesFetched === 0 && emptyIsEnd && mode === "full") {
+        if (pagesFetched === 0 && emptyIsEnd && !fellBackToScore && mode === "full") {
+          let confirmedEmpty = expectedCommentCount === 0;
+          if (!confirmedEmpty) {
+            // 未明确预期评论数为 0 时必须二次确认，防止偶发空响应清空历史评论
+            try {
+              await jitterSleep(300, 600);
+              const confirmJson = (
+                await zhihuJson(context, buildUrl(0, "ts"), {
+                  label: `${sourceType} ${sourceId} 根评论空页二次确认`,
+                  ...(isArticle ? { allow404: true } : {}),
+                  allowEmptyPage: true
+                })
+              ).json;
+              confirmedEmpty =
+                Array.isArray(confirmJson?.data) &&
+                confirmJson.data.length === 0 &&
+                confirmJson.paging?.is_end === true;
+            } catch (confirmErr: any) {
+              console.warn(`⚠️ ${sourceType} ${sourceId} 空页二次确认失败: ${sanitizeErrorForLog(confirmErr)}`);
+              confirmedEmpty = false;
+            }
+          }
+          if (!confirmedEmpty) {
+            console.warn(`⚠️ ${sourceType} ${sourceId} 空页二次确认未通过，保留既有历史`);
+            cIncomplete = true;
+            cFailed = true;
+            break;
+          }
           // 评论被整体删光/关闭评论：空 roots 全量对账，让 Worker 软删旧根并清零计数
-          await postCommentsByRoot(contentPk, [], { partial: false, allRootIds: [] });
-        } else if (!emptyIsEnd) {
+          try {
+            const res = await postCommentsByRoot(contentPk, [], { partial: false, allRootIds: [] });
+            if (res.aborted) {
+              cIncomplete = true;
+              cFailed = true;
+            }
+          } catch (e: any) {
+            cIncomplete = true;
+            cFailed = true;
+            console.warn(`⚠️ ${sourceType} ${sourceId} 空页清零对账失败: ${sanitizeErrorForLog(e)}`);
+          }
+        } else if (!emptyIsEnd || fellBackToScore) {
           cIncomplete = true;
-          cFailed = true;
+          if (!emptyIsEnd) cFailed = true;
         }
         cIsEnd = emptyIsEnd;
         break;
@@ -1418,6 +1818,7 @@ export async function syncHotCommentsForContent(
         // full 模式：楼中楼必须翻页抓全（知乎根评论接口只内联前几条）。
         // hot 模式（赞同内容）保持轻量：只取 1 页根评论 + 内联楼中楼，不额外翻子评论页。
         let childrenComplete = children.length >= childCount;
+        let childrenClosed = false;
         if (mode === "full" && childCount > children.length) {
           const buildChildUrl = (offset: number) =>
             isArticle
@@ -1425,6 +1826,7 @@ export async function syncHotCommentsForContent(
               : `https://www.zhihu.com/api/v4/comments/${c.id}/child_comments?offset=${offset}&limit=20`;
           let chOffset = 0;
           let chIsEnd = false;
+          let chClosed = false;
           let chPages = 0;
           let chNextUrl = buildChildUrl(chOffset);
           while (!chIsEnd && chPages < MAX_COMMENT_PAGES && !stats.riskExhausted && !stats.circuitBroken) {
@@ -1440,7 +1842,7 @@ export async function syncHotCommentsForContent(
               const errMsg = sanitizeErrorForLog(e);
               if (/已关闭评论/.test(errMsg)) {
                 console.log(`ℹ️ 评论 ${c.id} 楼中楼已关闭，跳过 (${errMsg})`);
-                chIsEnd = true;
+                chClosed = true;
                 break;
               }
               console.warn(
@@ -1487,14 +1889,15 @@ export async function syncHotCommentsForContent(
           if (chPages > 0 && chIsEnd && !stats.riskExhausted && !stats.circuitBroken) {
             await jitterSleep(550, 950);
           }
-          if (!chIsEnd && chPages >= MAX_COMMENT_PAGES) {
+          if (!chIsEnd && !chClosed && chPages >= MAX_COMMENT_PAGES) {
             cIncomplete = true;
             console.warn(`⚠️ 评论 ${c.id} 楼中楼达到 ${MAX_COMMENT_PAGES} 页上限，本轮标记 partial`);
           }
-          // 翻到 is_end 或已补齐 child_comment_count 才算子评论完整；中途异常/风控一律不完整
-          childrenComplete = chIsEnd || children.length >= childCount;
+          // 翻到 is_end 或已补齐 child_comment_count 才算子评论完整；遇闭评或中途异常一律不覆盖历史楼中楼
+          childrenComplete = !chClosed && (chIsEnd || children.length >= childCount);
+          childrenClosed = chClosed;
         }
-        rootsBuffer.push(toRootCommentGroup(c, children, childrenComplete));
+        rootsBuffer.push(toRootCommentGroup(c, children, childrenComplete, childrenClosed));
         if (rootsBuffer.length >= 20) await flushRoots(false);
       }
 
@@ -1541,9 +1944,9 @@ export async function syncHotCommentsForContent(
     }
 
     if (rootsBuffer.length > 0) {
-      // 最后一批：只有 full 且完整翻到 is_end 才做删除对账
+      // 最后一批：只有 full 且完整翻到 is_end 且未回退 score 才做删除对账
       await flushRoots(true);
-    } else if (mode === "full" && !cIncomplete && allRootIds.length > 0) {
+    } else if (mode === "full" && !cIncomplete && !fellBackToScore && allRootIds.length > 0) {
       // 根评论恰好是 20 的整数倍：最后一批已作为中间批发出，这里补一次空 roots 的全量对账
       const res = await postCommentsByRoot(contentPk, [], { partial: false, allRootIds });
       if (res.aborted) {
@@ -1585,12 +1988,7 @@ export async function syncHotCommentsForContent(
  * 目标由编排脚本按「根评论数明显少于评论总数」从本地 D1 查出后分批传入。
  */
 export async function runCommentRepairScraper() {
-  const browser = await setupBrowser();
-  try {
-    await runCommentRepairScraperBody(browser);
-  } finally {
-    await browser.close().catch(() => {});
-  }
+  await withBrowser(browser => runCommentRepairScraperBody(browser));
 }
 
 async function runCommentRepairScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
@@ -1663,12 +2061,7 @@ async function runCommentRepairScraperBody(browser: Awaited<ReturnType<typeof se
 }
 
 export async function runCollectionScraper() {
-  const browser = await setupBrowser();
-  try {
-    await runCollectionScraperBody(browser);
-  } finally {
-    await browser.close().catch(() => {});
-  }
+  await withBrowser(browser => runCollectionScraperBody(browser));
 }
 
 async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
@@ -1787,6 +2180,7 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
               const rawContent = Array.isArray(item.content)
                 ? (item.content as any[]).map(b => (typeof b?.content === "string" ? b.content : "")).filter(Boolean).join("\n")
                 : item.content;
+              const itemExplicitCommentCount = explicitCommentCount(item.comment_count);
               const contentInput = {
                 sourceType: item.type as "answer" | "article" | "pin",
                 sourceId: String(item.id),
@@ -1799,7 +2193,7 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
                 // 收藏夹里的专栏文章没有 excerpt，摘要只在 excerpt_title（13-live-collections 实测）
                 excerpt: item.excerpt || item.excerpt_title || "",
                 voteupCount: item.voteup_count || item.reaction?.statistics?.like_count || 0,
-                commentCount: item.comment_count || 0,
+                commentCount: itemExplicitCommentCount ?? 0,
                 favoriteCount: item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0,
                 visitCount: item.visit_count ?? 0,
                 isCollapsed: item.is_collapsed,
@@ -1822,7 +2216,7 @@ async function runCollectionScraperBody(browser: Awaited<ReturnType<typeof setup
                     cfg.commentsCollections
                   );
                 if (needHotComments && !stats.circuitBroken) {
-                  await syncHotCommentsForContent(context, item.type as "answer" | "article" | "pin", String(item.id), cfg.commentsCollections);
+                  await syncHotCommentsForContent(context, item.type as "answer" | "article" | "pin", String(item.id), cfg.commentsCollections, itemExplicitCommentCount);
                   // 每抓完一篇带新评论的条目额外缓冲：收藏夹是「条目 → 评论 → 楼中楼」
                   // 三连请求最密集的链路，最容易连续高频触发 40352
                   await jitterSleep(600, 1200);
@@ -1999,12 +2393,7 @@ function isUpvotesTargetTruncated(target: any, cleanedHtml: string): boolean {
 }
 
 export async function runUpvotesScraper() {
-  const browser = await setupBrowser();
-  try {
-    await runUpvotesScraperBody(browser);
-  } finally {
-    await browser.close().catch(() => {});
-  }
+  await withBrowser(browser => runUpvotesScraperBody(browser));
 }
 
 async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>) {
@@ -2030,12 +2419,15 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
     try {
       const u1 = new URL(candidateUrl);
       const u2 = new URL(savedCursor);
+      const o1 = Number(u1.searchParams.get("offset"));
+      const o2 = Number(u2.searchParams.get("offset"));
+      // 双方均含有效时间游标 offset 时只按时间维度判定；仅无 offset 时才退回比较相对页码 page_num
+      if (Number.isFinite(o1) && Number.isFinite(o2) && o1 > 0 && o2 > 0) {
+        return o1 <= o2;
+      }
       const p1 = Number(u1.searchParams.get("page_num"));
       const p2 = Number(u2.searchParams.get("page_num"));
       if (Number.isFinite(p1) && Number.isFinite(p2) && p1 > 0 && p2 > 0 && p1 >= p2) return true;
-      const o1 = Number(u1.searchParams.get("offset"));
-      const o2 = Number(u2.searchParams.get("offset"));
-      if (Number.isFinite(o1) && Number.isFinite(o2) && o1 > 0 && o2 > 0 && o1 <= o2) return true;
     } catch { /* ignore */ }
     return false;
   }
@@ -2103,7 +2495,8 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
       let contentHtml = cleanHtml(target.content);
       let effectiveExcerpt = target.excerpt || "";
       let voteupCount = target.voteup_count || target.reaction?.statistics?.like_count || 0;
-      let commentCount = target.comment_count || 0;
+      let explicitCount = explicitCommentCount(target.comment_count);
+      let commentCount = explicitCount ?? 0;
       let favoriteCount = target.favorite_count ?? target.reaction?.statistics?.favorites ?? 0;
       let visitCount = target.visit_count ?? 0;
 
@@ -2113,7 +2506,12 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
           contentHtml = detail.contentHtml;
           if (detail.excerpt) effectiveExcerpt = detail.excerpt;
           if (typeof detail.voteupCount === "number" && detail.voteupCount > 0) voteupCount = detail.voteupCount;
-          if (typeof detail.commentCount === "number" && detail.commentCount > 0) commentCount = detail.commentCount;
+          if (typeof detail.commentCount === "number" && detail.commentCount > 0) {
+            commentCount = detail.commentCount;
+            explicitCount = detail.commentCount;
+          } else if (explicitCount === undefined) {
+            explicitCount = explicitCommentCount(detail.commentCount);
+          }
           if (typeof detail.favoriteCount === "number" && detail.favoriteCount > 0) favoriteCount = detail.favoriteCount;
           if (typeof detail.visitCount === "number" && detail.visitCount > 0) visitCount = detail.visitCount;
         }
@@ -2157,7 +2555,7 @@ async function runUpvotesScraperBody(browser: Awaited<ReturnType<typeof setupBro
              !stats.circuitBroken &&
              !stats.riskExhausted
            ) {
-             await syncHotCommentsForContent(context, sourceType, sourceId, cfg.commentsUpvotes);
+             await syncHotCommentsForContent(context, sourceType, sourceId, cfg.commentsUpvotes, explicitCount);
            }
            const upvoteTime = toIsoOrNull(item.created_time);
            // created_time 缺失时为空串：/ingest/upvote 对空串返回 400，
@@ -2261,6 +2659,7 @@ type FollowingAiCandidate = {
   excerpt: string;
   voteupCount: number;
   commentCount: number;
+  explicitCommentCount?: number;
   favoriteCount: number;
   isCollapsed: boolean;
   isLabeled: boolean;
@@ -2364,12 +2763,7 @@ async function evaluateFollowingCandidatesWithAI(
 }
 
 export async function runFollowingScraper(onlyList = false) {
-  const browser = await setupBrowser();
-  try {
-    await runFollowingScraperBody(browser, onlyList);
-  } finally {
-    await browser.close().catch(() => {});
-  }
+  await withBrowser(browser => runFollowingScraperBody(browser, onlyList));
 }
 
 async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupBrowser>>, onlyList: boolean) {
@@ -2569,12 +2963,14 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
    * 被规则跳过的成千上万条水贴不额外打详情接口（否则每条 250~550ms 节流会拖垮整轮同步），
    * 只有 forceSave 前 60 篇 / 规则通过 / AI 复核通过的回答才值得多一次详情请求。
    */
-  async function fillTrueAnswerStats(contentInput: any, answerId: string): Promise<void> {
+  async function fillTrueAnswerStats(contentInput: any, answerId: string): Promise<number | undefined> {
     const trueStats = await fetchAnswerTrueStats(context, answerId);
-    if (!trueStats) return;
+    if (!trueStats) return undefined;
     contentInput.voteupCount = trueStats.voteupCount;
     contentInput.visitCount = trueStats.visitCount;
-    if (trueStats.commentCount !== undefined) contentInput.commentCount = trueStats.commentCount;
+    const explicit = explicitCommentCount(trueStats.commentCount);
+    if (explicit !== undefined) contentInput.commentCount = explicit;
+    return explicit;
   }
 
   const reportUserProgress = (urlToken: string, resumeOffset: number, historyDone: boolean, lastCheckedAnswerId?: string) =>
@@ -2767,6 +3163,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             }
 
             const { sourceUrl: answerSourceUrl, question: normalizedQuestion } = resolveAnswerQuestionMeta(item.question, item.id);
+            const answerExplicitCommentCount = explicitCommentCount(item.comment_count);
             const contentInput = {
               sourceType: "answer" as const,
               sourceId: String(item.id),
@@ -2787,7 +3184,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               // 真正入库前会由 fillTrueAnswerStats 用 /api/v4/answers/{id} 覆盖成
               // 真实 voteup_count 与真实 visit_count（like_count 是「喜欢数」不是赞同数）。
               voteupCount: item.voteup_count ?? item.reaction?.statistics?.like_count ?? 0,
-              commentCount: item.comment_count || 0,
+              commentCount: answerExplicitCommentCount ?? 0,
               favoriteCount: item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0,
               visitCount: item.visit_count ?? 0,
               isCollapsed: item.is_collapsed,
@@ -2816,7 +3213,8 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
                       questionTitle: item.question?.title || "",
                       excerpt: item.excerpt || "",
                       voteupCount: voteup,
-                      commentCount: Number(item.comment_count) || 0,
+                      commentCount: answerExplicitCommentCount ?? 0,
+                      explicitCommentCount: answerExplicitCommentCount,
                       favoriteCount: Number(item.favorite_count ?? item.reaction?.statistics?.favorites) || 0,
                       isCollapsed: Boolean(item.is_collapsed),
                       isLabeled: Boolean(item.is_labeled) || Boolean(item.label_info),
@@ -2834,7 +3232,8 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
 
             try {
               // 入库前补真实赞同数/真实浏览量：列表里的 like_count 只是「❤️ 喜欢数」
-              await fillTrueAnswerStats(contentInput, String(item.id));
+              const trueCommentCount = await fillTrueAnswerStats(contentInput, String(item.id));
+              const finalExplicitCommentCount = trueCommentCount ?? answerExplicitCommentCount;
               const dbRes = await sendContent(contentInput);
               if (
                 cfg.commentsFollowing !== "none" &&
@@ -2847,7 +3246,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
                 !stats.circuitBroken &&
                 !stats.riskExhausted
               ) {
-                await syncHotCommentsForContent(context, "answer", String(item.id), cfg.commentsFollowing);
+                await syncHotCommentsForContent(context, "answer", String(item.id), cfg.commentsFollowing, finalExplicitCommentCount);
               }
               savedForUser++;
               if (!dbRes.created && !dbRes.changed) {
@@ -2902,7 +3301,10 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
           if (stats.circuitBroken) break;
           try {
             // AI 复核通过、真正要入库的回答：补真实赞同数与真实浏览量后再提交
-            if (cand.sourceType === "answer") await fillTrueAnswerStats(cand.contentInput, cand.sourceId);
+            const trueCommentCount = cand.sourceType === "answer"
+              ? await fillTrueAnswerStats(cand.contentInput, cand.sourceId)
+              : undefined;
+            const finalExplicitCommentCount = trueCommentCount ?? cand.explicitCommentCount;
             const dbRes = await sendContent(cand.contentInput);
             if (
               cfg.commentsFollowing !== "none" &&
@@ -2915,7 +3317,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               !stats.circuitBroken &&
               !stats.riskExhausted
             ) {
-              await syncHotCommentsForContent(context, "answer", cand.sourceId, cfg.commentsFollowing);
+              await syncHotCommentsForContent(context, "answer", cand.sourceId, cfg.commentsFollowing, finalExplicitCommentCount);
             }
             savedForUser++;
           } catch (err) {
@@ -2983,6 +3385,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
           seenArticleIds.add(articleIdStr);
           const cleanedHtml = cleanHtml(item.content);
           const evalRes = isUserFull ? null : evaluateForAutoBackup(item, cleanedHtml);
+          const articleExplicitCommentCount = explicitCommentCount(item.comment_count);
           const contentInput = {
             sourceType: "article" as const,
             sourceId: String(item.id),
@@ -3003,11 +3406,12 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
             // visit_count 在文章列表/详情都拿不到，reaction.statistics.visit_count 也不存在，缺失即 0。
             // 注意：文章 reaction.statistics.like_count 是伪值（恒 0，不是赞同数），仅作兜底。
             voteupCount: item.voteup_count ?? item.reaction?.statistics?.like_count ?? 0,
-            commentCount: item.comment_count || 0,
+            commentCount: articleExplicitCommentCount ?? 0,
             favoriteCount: item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0,
             visitCount: item.visit_count ?? 0,
-            // 与回答链路对齐补传：include 里已带 is_labeled，缺失时 Boolean(undefined)=false
-            isLabeled: Boolean(item.is_labeled),
+            // 仅在接口显式下发布尔值时透传；缺省保持 undefined，避免覆盖库中既有折叠/黄标标记
+            isCollapsed: typeof item.is_collapsed === "boolean" ? item.is_collapsed : undefined,
+            isLabeled: typeof item.is_labeled === "boolean" ? item.is_labeled : undefined,
             createdTime: toIsoOrNull(item.created || item.created_time),
             updatedTime: toIsoOrNull(item.updated || item.updated_time)
           };
@@ -3029,7 +3433,8 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
                     questionTitle: "",
                     excerpt: item.excerpt || "",
                     voteupCount: voteup,
-                    commentCount: Number(item.comment_count) || 0,
+                    commentCount: articleExplicitCommentCount ?? 0,
+                    explicitCommentCount: articleExplicitCommentCount,
                     favoriteCount: Number(item.favorite_count ?? item.reaction?.statistics?.favorites) || 0,
                     isCollapsed: Boolean(item.is_collapsed),
                     isLabeled: Boolean(item.is_labeled) || Boolean(item.label_info),
@@ -3059,7 +3464,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               !stats.circuitBroken &&
               !stats.riskExhausted
             ) {
-              await syncHotCommentsForContent(context, "article", articleIdStr, cfg.commentsFollowing);
+              await syncHotCommentsForContent(context, "article", articleIdStr, cfg.commentsFollowing, articleExplicitCommentCount);
             }
             savedForUser++;
             if (!dbRes.created && !dbRes.changed) {
@@ -3109,7 +3514,7 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
               !stats.circuitBroken &&
               !stats.riskExhausted
             ) {
-              await syncHotCommentsForContent(context, "article", cand.sourceId, cfg.commentsFollowing);
+              await syncHotCommentsForContent(context, "article", cand.sourceId, cfg.commentsFollowing, cand.explicitCommentCount);
             }
             savedForUser++;
           } catch (err) {
@@ -3141,7 +3546,6 @@ async function runFollowingScraperBody(browser: Awaited<ReturnType<typeof setupB
 
   console.log("🎉 关注答主同步完成！");
 }
-
 
 // --- Apify Entry Point ---
 // 失败必须让 run 状态可见。之前所有异常都被吞掉后正常 exit，
@@ -3193,8 +3597,12 @@ try {
     }
   }
 } catch (e) {
+  if (abortRequested) {
+    await handleAbortExitBeforeExit();
+  }
   const errMsg = sanitizeErrorForLog(e);
   log.error(errMsg);
+  await releaseSyncLockBeforeExit();
   await Actor.fail(`crawler_error: ${errMsg}`);
   process.exit(1);
 }
@@ -3205,13 +3613,19 @@ try {
 const repairSummary = repairState.summary;
 const savedForTerminal = repairSummary ? repairSummary.ok : stats.saved;
 
+if (abortRequested) {
+  await handleAbortExitBeforeExit();
+}
+
 if (stats.circuitBroken) {
   log.warning(`本轮触发连续失败断路器暂停（已保存 ${savedForTerminal} 条数据，失败 ${stats.failed} 次），断点已保留供下次继续`);
+  await releaseSyncLockBeforeExit();
   await Actor.exit({ exitCode: 2 });
   process.exit(2);
 }
 
 if ((stats.authRejected > 0 || stats.riskEmpty > 0 || stats.riskExhausted) && savedForTerminal === 0) {
+  await releaseSyncLockBeforeExit();
   await Actor.fail(
     `zhihu_auth_failed: 被知乎 401/403 拒绝 ${stats.authRejected} 次、疑似风控空页 ${stats.riskEmpty} 次、` +
       `风控暂停重试耗尽 ${stats.riskExhausted ? "是" : "否"}（cookie 可能已失效或被风控），本轮零数据入库`
@@ -3220,10 +3634,12 @@ if ((stats.authRejected > 0 || stats.riskEmpty > 0 || stats.riskExhausted) && sa
 }
 if (savedForTerminal === 0 && stats.failed > 0) {
   // failed 只统计 Worker 入库失败；知乎侧 429/5xx 已独立计入 zhihuRejected
+  await releaseSyncLockBeforeExit();
   await Actor.fail(`ingest_failed: Worker 回传 ${stats.failed} 次全部失败（检查 API_SECRET / WORKER_URL），本轮零数据入库`);
   process.exit(1);
 }
 if (savedForTerminal === 0 && stats.zhihuRejected > 0) {
+  await releaseSyncLockBeforeExit();
   await Actor.fail(`zhihu_request_failed: 知乎侧请求失败 ${stats.zhihuRejected} 次（429/5xx/非 JSON/网络错误），本轮零数据入库`);
   process.exit(1);
 }
@@ -3256,6 +3672,9 @@ if (stats.failed > 0 || stats.zhihuRejected > 0 || stats.riskExhausted) {
   );
 }
 
+await releaseSyncLockBeforeExit();
+process.off("SIGINT", handleCrawlerSignal);
+process.off("SIGTERM", handleCrawlerSignal);
 if (finalStatusMessage) {
   await Actor.exit({ statusMessage: finalStatusMessage });
 } else {

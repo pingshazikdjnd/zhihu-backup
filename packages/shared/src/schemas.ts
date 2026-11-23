@@ -117,7 +117,8 @@ export const IngestCommentsByRootSchema = z.object({
       likes: z.number(),
       isAuthor: z.boolean().optional()
     })).default([]),
-    isChildrenComplete: z.boolean().default(false)
+    isChildrenComplete: z.boolean().default(false),
+    isChildrenClosed: z.boolean().optional()
   })).max(20),  // ≤20 根/请求，避免超 50 子请求限制
   // 全量 root id 列表（分批时用于删除对账）
   allRootIds: z.array(z.string()).optional(),

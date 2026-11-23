@@ -70,8 +70,12 @@ app.use("/api/*", async (c, next) => {
   const auth = c.req.header("authorization") || "";
   if (auth.startsWith("Bearer ")) {
     if (c.env.API_SECRET && auth === `Bearer ${c.env.API_SECRET}`) return next();
-    const writeToken = await getActiveWriteToken(c);
-    if (writeToken && auth === `Bearer ${writeToken}`) return next();
+    try {
+      const writeToken = await getActiveWriteToken(c);
+      if (writeToken && auth === `Bearer ${writeToken}`) return next();
+    } catch {
+      return c.json({ error: "Auth storage unavailable" }, 503);
+    }
   }
   return c.json({ error: "Read authentication required", needToken: true }, 401);
 });

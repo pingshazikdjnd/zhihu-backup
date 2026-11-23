@@ -303,8 +303,8 @@ function buildContentPayloadFromDetail(sourceType, sourceId, item) {
     commentCount: Number(item.comment_count ?? 0) || 0,
     favoriteCount: Number(item.favorite_count ?? item.reaction?.statistics?.favorites ?? 0) || 0,
     visitCount: Number(item.visit_count ?? 0) || 0,
-    isCollapsed: Boolean(item.is_collapsed),
-    isLabeled: Boolean(item.is_labeled),
+    isCollapsed: typeof item.is_collapsed === "boolean" ? item.is_collapsed : undefined,
+    isLabeled: typeof item.is_labeled === "boolean" ? item.is_labeled : undefined,
     labelInfo: item.label_info ? JSON.stringify(item.label_info) : "",
     createdTime: toIsoOrNull(item.created ?? item.created_time),
     updatedTime: toIsoOrNull(item.updated ?? item.updated_time)
