@@ -1,0 +1,114 @@
+name: Deploy
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: startsWith(github.ref, 'refs/tags/v')
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: https://zhihu-backup.pages.dev
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Cloudflare deploy credentials
+        id: cf-check
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 CLOUDFLARE_API_TOKEN 或 CLOUDFLARE_ACCOUNT_ID，跳过 Cloudflare Worker 与 D1 部署。"
+          fi
+
+      - if: steps.cf-check.outputs.enabled == 'true'
+        uses: pnpm/action-setup@v4
+
+      - if: steps.cf-check.outputs.enabled == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install dependencies
+        if: steps.cf-check.outputs.enabled == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Deploy Worker and apply D1 migrations
+        if: steps.cf-check.outputs.enabled == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm --filter worker run deploy
+
+      - name: Trigger Cloudflare Pages deploy hook
+        env:
+          CF_PAGES_DEPLOY_HOOK: ${{ secrets.CF_PAGES_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$CF_PAGES_DEPLOY_HOOK" ]; then
+            echo "::notice::未配置 CF_PAGES_DEPLOY_HOOK，已跳过手动触发（Pages 仍通过 Git 集成自动部署）。"
+            exit 0
+          fi
+          curl -fsS -X POST "$CF_PAGES_DEPLOY_HOOK"
+
+      - name: Push Apify Actor
+        if: vars.APIFY_DEPLOY == 'true'
+        working-directory: apps/apify-crawler
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+        run: |
+          if [ -z "$APIFY_TOKEN" ]; then
+            echo "::error::已启用 APIFY_DEPLOY=true，但未配置 APIFY_TOKEN secret。"
+            exit 1
+          fi
+          npx --yes apify-cli@1.14.0 login -t "$APIFY_TOKEN"
+          npx --yes apify-cli@1.14.0 push
+
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    name: Publish GitHub Release
+    needs: deploy
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Extract release notes
+        run: |
+          node .github/scripts/release-notes.mjs "${GITHUB_REF_NAME#v}" \
+            apps/worker/CHANGELOG.md \
+            apps/web/CHANGELOG.md \
+            apps/apify-crawler/CHANGELOG.md \
+            packages/shared/CHANGELOG.md > notes.md
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh .github/scripts/publish-release.sh "$GITHUB_REF_NAME" notes.md

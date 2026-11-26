@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: "即使版本未变化也强制打 tag（需远端不存在同名 tag）"
+        type: boolean
+        required: false
+        default: false
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # 发版相关的写操作（创建/更新 Version Packages PR、推送 tag）必须使用 GitHub App Token，
+      # 不能使用默认的 GITHUB_TOKEN。因为 GITHUB_TOKEN 产生的事件不会触发其他 workflow，
+      # 否则机器人打开的 PR 不会自动跑 CI，推送的 v* tag 也不会触发 deploy.yml。
+      # 放到依赖安装之后生成，避免外部 postinstall/lifecycle 脚本接触到写权限凭据。
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Configure bot git identity
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          id=$(gh api "users/${SLUG}[bot]" --jq .id)
+          git config --global user.name "${SLUG}[bot]"
+          git config --global user.email "${id}+${SLUG}[bot]@users.noreply.github.com"
+
+      - name: Create or update Version Packages PR
+        id: changesets
+        uses: changesets/action@v2
+        with:
+          version-script: pnpm run version-packages
+          commit-message: "chore(release): version packages"
+          pr-title: "chore(release): version packages"
+          create-github-releases: false
+          github-token: ${{ steps.app-token.outputs.token }}
+
+      # 无待处理 changeset 时（包括刚合并 Version Packages PR 后），检查并推送 vX.Y.Z tag，
+      # 从而触发 deploy.yml 执行生产部署与 GitHub Release 发布。
+      - name: Tag release
+        if: steps.changesets.outputs.has-changesets == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          FORCE_TAG: ${{ inputs.force_tag || 'false' }}
+        run: node .github/scripts/tag-release.mjs
