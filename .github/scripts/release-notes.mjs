@@ -60,8 +60,8 @@ function cleanUpdatedDependencies(lines) {
   let fence = { char: "", len: 0, inFence: false };
 
   for (const line of lines) {
-    fence = updateFenceState(line, fence);
-    if (fence.inFence) {
+    if (fence.char) {
+      fence = updateFenceState(line, fence);
       if (!skippingUpdatedDeps) {
         filtered.push(line);
       }
@@ -70,9 +70,16 @@ function cleanUpdatedDependencies(lines) {
 
     if (skippingUpdatedDeps) {
       if (/^[ \t]+/.test(line) || line.trim() === "") {
+        fence = updateFenceState(line, fence);
         continue;
       }
       skippingUpdatedDeps = false;
+    }
+
+    fence = updateFenceState(line, fence);
+    if (fence.inFence) {
+      filtered.push(line);
+      continue;
     }
 
     if (/^[-*]\s+Updated dependencies\b/.test(line)) {
