@@ -6,10 +6,6 @@ on:
       - "v*"
   workflow_dispatch:
 
-concurrency:
-  group: deploy-production
-  cancel-in-progress: false
-
 permissions:
   contents: read
 
@@ -18,6 +14,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     name: Deploy to Production
     runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
     environment:
       name: production
       url: https://zhihu-backup.pages.dev
@@ -88,6 +87,9 @@ jobs:
     name: Publish GitHub Release
     needs: deploy
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
 

@@ -9,35 +9,68 @@ function readRootVersion() {
   return pkg.version.trim();
 }
 
-function readParentVersion() {
-  const res = spawnSync("git", ["show", "HEAD^1:package.json"], {
+function readAdoptionBaselineVersion() {
+  const logRes = spawnSync(
+    "git",
+    [
+      "log",
+      "--reverse",
+      "--diff-filter=A",
+      "--format=%H",
+      "--",
+      ".changeset/config.json",
+    ],
+    { encoding: "utf8" },
+  );
+  if (logRes.status !== 0) {
+    return null;
+  }
+  const firstSha = logRes.stdout
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .find(Boolean);
+  if (!firstSha) {
+    return null;
+  }
+
+  const pkgRes = spawnSync("git", ["show", `${firstSha}:package.json`], {
     encoding: "utf8",
   });
-  if (res.status !== 0) {
+  if (pkgRes.status !== 0) {
     return null;
   }
   try {
-    const pkg = JSON.parse(res.stdout);
+    const pkg = JSON.parse(pkgRes.stdout);
     return typeof pkg.version === "string" ? pkg.version.trim() : null;
   } catch {
     return null;
   }
 }
 
-function hasParentAdoptedChangesets() {
-  const res = spawnSync(
-    "git",
-    ["cat-file", "-e", "HEAD^1:.changeset/config.json"],
-    { stdio: "ignore" },
-  );
-  return res.status === 0;
+function gitAuthEnv() {
+  const token = process.env.GH_TOKEN;
+  if (!token) {
+    return process.env;
+  }
+  const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
+  const authHeader = `AUTHORIZATION: basic ${basic}`;
+  const count = Number(process.env.GIT_CONFIG_COUNT ?? "0");
+  const baseCount = Number.isInteger(count) && count >= 0 ? count : 0;
+  return {
+    ...process.env,
+    GIT_CONFIG_COUNT: String(baseCount + 2),
+    [`GIT_CONFIG_KEY_${baseCount}`]: "http.https://github.com/.extraheader",
+    [`GIT_CONFIG_VALUE_${baseCount}`]: "",
+    [`GIT_CONFIG_KEY_${baseCount + 1}`]: "http.https://github.com/.extraheader",
+    [`GIT_CONFIG_VALUE_${baseCount + 1}`]: authHeader,
+  };
 }
 
 function remoteTagState(tag) {
   const res = spawnSync(
     "git",
     ["ls-remote", "--exit-code", "--tags", "origin", `refs/tags/${tag}`],
-    { encoding: "utf8" },
+    { encoding: "utf8", env: gitAuthEnv() },
   );
   if (res.status === 0) return "exists";
   if (res.status === 2) return "missing";
@@ -58,33 +91,27 @@ if (state === "exists") {
   process.exit(0);
 }
 
-const parentVersion = readParentVersion();
-const parentAdopted = hasParentAdoptedChangesets();
-const versionChanged =
-  parentAdopted && parentVersion !== null && parentVersion !== version;
+const baselineVersion = readAdoptionBaselineVersion() ?? version;
+const versionChanged = baselineVersion !== version;
 
 if (!versionChanged && !forceTag) {
-  if (!parentAdopted && parentVersion !== null && parentVersion !== version) {
-    console.log(
-      `::notice::Parent commit predates Changesets adoption (no .changeset/config.json); treating version ${parentVersion} -> ${version} as baseline, not tagging ${tag}.`,
-    );
-  } else {
-    console.log(
-      `::notice::Version ${version} unchanged vs parent (${parentVersion ?? "none"}), not tagging ${tag}.`,
-    );
-  }
+  console.log(
+    `::notice::Version ${version} matches Changesets adoption baseline (${baselineVersion}); not tagging ${tag}.`,
+  );
   process.exit(0);
 }
 
 if (dryRun) {
   console.log(
-    `::notice::[DRY_RUN] Would create and push tag ${tag} (parent=${parentVersion ?? "none"}, force=${forceTag}).`,
+    `::notice::[DRY_RUN] Would create and push tag ${tag} (baseline=${baselineVersion}, force=${forceTag}).`,
   );
   process.exit(0);
 }
 
+const authEnv = gitAuthEnv();
 execFileSync("git", ["tag", "-a", tag, "-m", tag], { stdio: "inherit" });
 execFileSync("git", ["push", "origin", `refs/tags/${tag}`], {
   stdio: "inherit",
+  env: authEnv,
 });
 console.log(`::notice::Created and pushed tag ${tag}.`);

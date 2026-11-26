@@ -19,28 +19,17 @@ permissions:
 
 jobs:
   release:
+    if: github.ref == 'refs/heads/main'
     name: Release
     runs-on: ubuntu-latest
     permissions:
       contents: read
 
     steps:
-      # 发版相关的写操作（创建/更新 Version Packages PR、推送 tag）必须使用 GitHub App Token，
-      # 不能使用默认的 GITHUB_TOKEN。因为 GITHUB_TOKEN 产生的事件不会触发其他 workflow，
-      # 否则机器人打开的 PR 不会自动跑 CI，推送的 v* tag 也不会触发 deploy.yml。
-      - name: Create GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v3
-        with:
-          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: write
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
           fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
@@ -52,6 +41,19 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # 发版相关的写操作（创建/更新 Version Packages PR、推送 tag）必须使用 GitHub App Token，
+      # 不能使用默认的 GITHUB_TOKEN。因为 GITHUB_TOKEN 产生的事件不会触发其他 workflow，
+      # 否则机器人打开的 PR 不会自动跑 CI，推送的 v* tag 也不会触发 deploy.yml。
+      # 放到依赖安装之后生成，避免外部 postinstall/lifecycle 脚本接触到写权限凭据。
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Configure bot git identity
         env:
@@ -77,5 +79,6 @@ jobs:
       - name: Tag release
         if: steps.changesets.outputs.has-changesets == 'false'
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           FORCE_TAG: ${{ inputs.force_tag || 'false' }}
         run: node .github/scripts/tag-release.mjs

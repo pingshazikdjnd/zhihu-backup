@@ -36,7 +36,22 @@ writeJsonPreservingEol("apps/apify-crawler/package-lock.json", (lock) => {
 });
 
 writeJsonPreservingEol("apps/apify-crawler/.actor/actor.json", (actor) => {
-  actor.version = actorVersion;
+  const curMatch = String(actor.version ?? "").match(/^(\d+)\.(\d+)$/);
+  if (!curMatch) {
+    actor.version = actorVersion;
+    return;
+  }
+  const curMajor = Number(curMatch[1]);
+  const curMinor = Number(curMatch[2]);
+  const nextMajor = Number(semverMatch[1]);
+  const nextMinor = Number(semverMatch[2]);
+  if (nextMajor > curMajor || (nextMajor === curMajor && nextMinor > curMinor)) {
+    actor.version = actorVersion;
+  } else {
+    console.log(
+      `Keeping apps/apify-crawler/.actor/actor.json version at ${actor.version} (skipping downgrade/repeat to ${actorVersion}).`,
+    );
+  }
 });
 
 console.log(`Synced version ${version} (actor=${actorVersion}) across manifests.`);
