@@ -87,6 +87,14 @@ function cleanUpdatedDependencies(lines) {
       continue;
     }
 
+    if (
+      /^[-*]\s+(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*@\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\s*$/.test(
+        line,
+      )
+    ) {
+      continue;
+    }
+
     filtered.push(line);
   }
 

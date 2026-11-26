@@ -51,29 +51,70 @@ function higherBump(a, b) {
   return BUMP_RANK[a] >= BUMP_RANK[b] ? a : b;
 }
 
+/** Remove fenced code blocks before scanning commit/PR text for footers. */
+function stripFencedCodeBlocks(text) {
+  if (!text) return "";
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const kept = [];
+  let fenceChar = "";
+  let fenceLen = 0;
+
+  for (const line of lines) {
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fenceChar) {
+      if (
+        fenceMatch &&
+        fenceMatch[1][0] === fenceChar &&
+        fenceMatch[1].length >= fenceLen &&
+        fenceMatch[2].trim() === ""
+      ) {
+        fenceChar = "";
+        fenceLen = 0;
+      }
+      continue;
+    }
+    if (fenceMatch) {
+      fenceChar = fenceMatch[1][0];
+      fenceLen = fenceMatch[1].length;
+      continue;
+    }
+    kept.push(line);
+  }
+
+  return kept.join("\n");
+}
+
+function hasBreakingChangeNotice(text) {
+  return /^BREAKING[ -]CHANGE:/m.test(stripFencedCodeBlocks(text));
+}
+
 function classifyHeader(subject, extraText = "") {
-  const m = subject
-    .trim()
-    .match(
-      /^(feat|fix|perf|revert|refactor|docs|chore|ci|build|test|style)(?:\(([^)]+)\))?(!)?\s*[:：]\s*(.+)$/i,
-    );
-  const hasBreakingBody = /^BREAKING[ -]CHANGE:/m.test(extraText);
+  const trimmed = subject.trim();
+  const hasBreakingBody = hasBreakingChangeNotice(extraText);
+
+  if (/^Revert\s+".+"/.test(trimmed)) {
+    return { matched: true, bump: hasBreakingBody ? "major" : "patch" };
+  }
+
+  const m = trimmed.match(
+    /^(feat|fix|perf|revert|refactor|docs|chore|ci|build|test|style)(?:\(([^)]+)\))?(!)?\s*[:：]\s*(.+)$/i,
+  );
   if (!m) {
-    return hasBreakingBody ? "major" : null;
+    return { matched: false, bump: hasBreakingBody ? "major" : null };
   }
 
   const type = m[1].toLowerCase();
   const bang = Boolean(m[3]);
   if (bang || hasBreakingBody) {
-    return "major";
+    return { matched: true, bump: "major" };
   }
   if (type === "feat") {
-    return "minor";
+    return { matched: true, bump: "minor" };
   }
   if (type === "fix" || type === "perf" || type === "revert") {
-    return "patch";
+    return { matched: true, bump: "patch" };
   }
-  return null;
+  return { matched: true, bump: null };
 }
 
 function fetchPrMeta(prNum) {
@@ -166,19 +207,14 @@ function analyzeCommit(sha) {
       .find(Boolean);
     const rawTitle =
       prMeta?.title || bodyTitle || prCommits[0]?.subject || subject;
-    const combinedBody = [
-      prMeta?.body || "",
-      body,
-      ...prCommits.map((c) => `${c.subject}\n${c.body}`),
-    ].join("\n");
+    const prBody = [prMeta?.body || "", body].join("\n");
 
-    let bump = classifyHeader(rawTitle, combinedBody);
-    if (!bump) {
+    const header = classifyHeader(rawTitle, prBody);
+    let bump = header.bump;
+    // Only fall back to branch commits when the PR title lacks a Conventional Commit prefix
+    if (!header.matched) {
       for (const c of prCommits) {
-        bump = higherBump(bump, classifyHeader(c.subject, c.body));
-      }
-      if (!bump && /^BREAKING[ -]CHANGE:/m.test(combinedBody)) {
-        bump = "major";
+        bump = higherBump(bump, classifyHeader(c.subject, c.body).bump);
       }
     }
     if (!bump) return null;
@@ -190,7 +226,7 @@ function analyzeCommit(sha) {
     return { bump, summary };
   }
 
-  const bump = classifyHeader(subject, body);
+  const { bump } = classifyHeader(subject, body);
   if (!bump) return null;
   return { bump, summary: subject };
 }
