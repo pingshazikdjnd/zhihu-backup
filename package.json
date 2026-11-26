@@ -5,7 +5,9 @@
   "scripts": {
     "dev:web": "pnpm --filter web dev",
     "sync:local": "node scripts/local-sync.mjs",
-    "sync:upvotes": "node scripts/local-sync.mjs --type=upvotes"
+    "sync:upvotes": "node scripts/local-sync.mjs --type=upvotes",
+    "changeset": "changeset",
+    "version-packages": "changeset version && node .github/scripts/sync-version.mjs && pnpm install --lockfile-only"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
@@ -18,5 +20,8 @@
     "playwright": "^1.49.1"
   },
   "version": "0.1.0",
-  "description": "知乎个人内容备份：回答/文章/想法/评论/收藏/赞同 → Cloudflare Workers + D1 + R2，Apify 抓取"
+  "description": "知乎个人内容备份：回答/文章/想法/评论/收藏/赞同 → Cloudflare Workers + D1 + R2，Apify 抓取",
+  "devDependencies": {
+    "@changesets/cli": "^3.0.3"
+  }
 }

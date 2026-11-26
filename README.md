@@ -330,6 +330,7 @@ bash scripts/smoke-test.sh
 - [系统架构设计与数据契约](docs/ARCHITECTURE.md) — D1/R2 存储结构、双层评论与防删归档状态机、图片异步管线、R2 两层边缘缓存、外部多云联邦、AI 路由预算、风控与安全边界
 - [运维与本地采集手册](docs/OPERATIONS.md) — 日常增量同步、全新全量重扒、存量评论/图片/赞同补采、只读体检、三阶段打包上云与常见排障
 - [更新日志](CHANGELOG.md) — 版本演进与主要架构/安全性改进记录
+- [发版与自动部署指南](docs/RELEASING.md) — GitHub App 机器人 + Changesets 自动发版、production 审批部署与配置清单
 - [知乎字段审计（2026-11-01）](docs/知乎字段审计-2026-11-01/README.md) — 知乎各接口真实返回字段实测证据与对比分析
 
 ---
