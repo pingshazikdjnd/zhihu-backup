@@ -16,8 +16,12 @@ if [ ! -f "$notes" ] || ! grep -q '[^[:space:]]' "$notes"; then
 fi
 
 lookup_state() {
-  if ! raw=$(gh api --paginate "repos/{owner}/{repo}/releases" --jq ".[] | select(.tag_name == \"$tag\") | .draft"); then
+  if ! api_json=$(gh api --paginate "repos/{owner}/{repo}/releases"); then
     echo "::error::Failed to query GitHub releases for $tag" >&2
+    return 1
+  fi
+  if ! raw=$(printf '%s\n' "$api_json" | jq -r --arg tag "$tag" '.[] | select(.tag_name == $tag) | .draft'); then
+    echo "::error::Failed to parse GitHub releases for $tag" >&2
     return 1
   fi
   case "$raw" in

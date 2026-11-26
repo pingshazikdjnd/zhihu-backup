@@ -1,33 +1,39 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
+function updateFenceState(line, state) {
+  const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+  if (state.char) {
+    if (
+      fenceMatch &&
+      fenceMatch[1][0] === state.char &&
+      fenceMatch[1].length >= state.len &&
+      fenceMatch[2].trim() === ""
+    ) {
+      return { char: "", len: 0, inFence: true };
+    }
+    return { ...state, inFence: true };
+  }
+  if (fenceMatch) {
+    return {
+      char: fenceMatch[1][0],
+      len: fenceMatch[1].length,
+      inFence: true,
+    };
+  }
+  return { char: "", len: 0, inFence: false };
+}
+
 function extractSection(markdown, version) {
   const lines = markdown.replace(/\r\n/g, "\n").split("\n");
   const targetHeading = `## ${version}`;
-  let fenceChar = "";
-  let fenceLen = 0;
+  let fence = { char: "", len: 0, inFence: false };
   let capturing = false;
   const captured = [];
 
   for (const line of lines) {
-    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-    if (fenceChar) {
-      if (
-        fenceMatch &&
-        fenceMatch[1][0] === fenceChar &&
-        fenceMatch[1].length >= fenceLen &&
-        fenceMatch[2].trim() === ""
-      ) {
-        fenceChar = "";
-        fenceLen = 0;
-      }
-      if (capturing) captured.push(line);
-      continue;
-    }
-
-    if (fenceMatch) {
-      fenceChar = fenceMatch[1][0];
-      fenceLen = fenceMatch[1].length;
+    fence = updateFenceState(line, fence);
+    if (fence.inFence) {
       if (capturing) captured.push(line);
       continue;
     }
@@ -51,8 +57,17 @@ function extractSection(markdown, version) {
 function cleanUpdatedDependencies(lines) {
   const filtered = [];
   let skippingUpdatedDeps = false;
+  let fence = { char: "", len: 0, inFence: false };
 
   for (const line of lines) {
+    fence = updateFenceState(line, fence);
+    if (fence.inFence) {
+      if (!skippingUpdatedDeps) {
+        filtered.push(line);
+      }
+      continue;
+    }
+
     if (skippingUpdatedDeps) {
       if (/^[ \t]+/.test(line) || line.trim() === "") {
         continue;
@@ -72,6 +87,7 @@ function cleanUpdatedDependencies(lines) {
   const blocks = [];
   let currentSubheading = null;
   let currentBody = [];
+  let pruneFence = { char: "", len: 0, inFence: false };
 
   const flush = () => {
     if (currentSubheading === null) {
@@ -82,7 +98,8 @@ function cleanUpdatedDependencies(lines) {
   };
 
   for (const line of filtered) {
-    if (/^### /.test(line)) {
+    pruneFence = updateFenceState(line, pruneFence);
+    if (!pruneFence.inFence && /^### /.test(line)) {
       flush();
       currentSubheading = line;
       currentBody = [];

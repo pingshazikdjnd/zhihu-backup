@@ -18,7 +18,9 @@ if (!version) {
   throw new Error("apps/worker/package.json is missing version");
 }
 
-const semverMatch = version.match(/^(\d+)\.(\d+)\.\d+/);
+const semverMatch = version.match(
+  /^(\d+)\.(\d+)\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/,
+);
 if (!semverMatch) {
   throw new Error(`Invalid semver version in apps/worker/package.json: ${version}`);
 }

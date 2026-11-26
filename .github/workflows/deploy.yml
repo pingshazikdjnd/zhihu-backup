@@ -45,7 +45,7 @@ jobs:
       - if: steps.cf-check.outputs.enabled == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: pnpm
 
       - name: Install dependencies
@@ -79,8 +79,8 @@ jobs:
             echo "::error::已启用 APIFY_DEPLOY=true，但未配置 APIFY_TOKEN secret。"
             exit 1
           fi
-          npx --yes apify-cli login -t "$APIFY_TOKEN"
-          npx --yes apify-cli push
+          npx --yes apify-cli@1.14.0 login -t "$APIFY_TOKEN"
+          npx --yes apify-cli@1.14.0 push
 
   github-release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -98,7 +98,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Extract release notes
         run: |
