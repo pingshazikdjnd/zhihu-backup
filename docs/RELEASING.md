@@ -6,8 +6,8 @@
 
 ```mermaid
 flowchart LR
-  A["开发分支运行 pnpm changeset"] --> B["合并 PR 到 main"]
-  B --> C["release.yml：App Token 驱动 Changesets"]
+  A["按规范写 PR 标题（或手动 pnpm changeset）"] --> B["合并 PR 到 main"]
+  B --> C["release.yml：auto-changeset + Changesets"]
   C --> D{"存在未消费的 .changeset/*.md?"}
   D -- 是 --> E["机器人创建/更新 Version Packages PR"]
   E --> F["PR 自动触发 CI 检查"]
@@ -37,7 +37,7 @@ flowchart LR
    - 若尚未合并 `Version Packages` PR，后续继续合并的 `feat:` / `fix:` PR 会自动汇总追加到同一个 `Version Packages` PR 中。
    - 该 PR 会同步更新各包版本、根 `package.json` 版本、`apps/apify-crawler/package-lock.json`、`apps/apify-crawler/.actor/actor.json`（不低于现有 `1.0`）以及各包 `CHANGELOG.md`。
 3. 需要正式发版时，只需**合并 `Version Packages` PR** 到 `main`：
-   - `release.yml` 再次运行，检测到无待处理 changeset 且根版本号相对上一父提交发生变化，即自动打 `vX.Y.Z` tag 并推送。
+   - `release.yml` 再次运行，检测到无待处理 changeset 且远端尚无当前版本号对应的 tag（且非基线版本），即自动打 `vX.Y.Z` tag 并推送。
 4. `deploy.yml` 被 `v*` tag 触发，并在 `production` 环境暂停等待审批：
    - 在 GitHub Actions 运行页批准 `production` 部署后，自动执行 D1 远端迁移、Worker 部署，以及可选的 Pages Deploy Hook 与 Apify Push。
    - 部署成功后自动发布对应 `vX.Y.Z` 的 GitHub Release。

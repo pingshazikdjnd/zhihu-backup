@@ -159,6 +159,8 @@ function readPrCommitLog(sha) {
 
 function getCommitChangedFiles(sha, diffFilter = "") {
   const args = [
+    "-c",
+    "core.quotePath=false",
     "diff-tree",
     "--no-commit-id",
     "--name-only",
@@ -226,7 +228,10 @@ function analyzeCommit(sha) {
     return { bump, summary };
   }
 
-  const { bump } = classifyHeader(subject, body);
+  const squashPrMatch = subject.match(/\(#(\d+)\)$/);
+  const prMeta = squashPrMatch ? fetchPrMeta(squashPrMatch[1]) : null;
+  const extraText = prMeta?.body ? `${prMeta.body}\n${body}` : body;
+  const { bump } = classifyHeader(subject, extraText);
   if (!bump) return null;
   return { bump, summary: subject };
 }
